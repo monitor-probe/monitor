@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -1298,6 +1298,25 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
   )
 }
 
+// A channel's form, collapsed until needed. The summary carries whether the
+// channel is configured, so the closed card still answers the common question.
+function ChannelCard({ title, configured, children }: { title: string; configured: boolean; children: React.ReactNode }) {
+  return (
+    <Card className="p-5">
+      <details className="group">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+          <span className="flex items-center gap-2 text-sm font-medium">
+            <ChevronRight className="size-4 text-muted-foreground transition-transform group-open:rotate-90" />
+            {title}
+          </span>
+          <Badge variant={configured ? "secondary" : "outline"}>{configured ? "已配置" : "未配置"}</Badge>
+        </summary>
+        <div className="mt-4 space-y-4">{children}</div>
+      </details>
+    </Card>
+  )
+}
+
 // Offline alerts are opt-in per node, so turning them on for a fleet needs one
 // place rather than one dialog per node.
 function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
@@ -1383,8 +1402,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         </div>
       </Card>
 
-      <Card className="gap-4 p-5">
-        <h3 className="text-sm font-medium">Telegram</h3>
+      <ChannelCard title="Telegram" configured={!!s.notify_telegram_token_set && text("notify_telegram_chat") !== ""}>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Bot Token" hint={secretHint("notify_telegram_token")}>
             <Input
@@ -1422,10 +1440,9 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             </Button>
           )}
         </div>
-      </Card>
+      </ChannelCard>
 
-      <Card className="gap-4 p-5">
-        <h3 className="text-sm font-medium">Webhook</h3>
+      <ChannelCard title="Webhook" configured={!!s.notify_webhook_url_set}>
         <Field label="URL" hint={secretHint("notify_webhook_url")}>
           <Input
             type="password"
@@ -1466,7 +1483,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             </Button>
           )}
         </div>
-      </Card>
+      </ChannelCard>
 
       <OfflineNodes nodes={nodes} refresh={refresh} />
 
