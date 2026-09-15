@@ -31,7 +31,7 @@ export function uptime(seconds: number): string {
  */
 export const FOREVER = "∞"
 
-const SYMBOLS: Record<string, string> = { USD: "$", CNY: "¥", EUR: "€", GBP: "£", JPY: "¥" }
+const SYMBOLS: Record<string, string> = { USD: "$", CNY: "¥", EUR: "€", GBP: "£", JPY: "¥", CAD: "C$" }
 
 export function money(amount: number, currency: string): string {
   return `${SYMBOLS[currency] ?? ""}${amount.toFixed(2)}${SYMBOLS[currency] ? "" : ` ${currency}`}`

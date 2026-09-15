@@ -1,6 +1,7 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
 import { changes, GIB, provisioningSite, trafficCorrection } from "./api.ts"
+import { money } from "./format.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -17,4 +18,5 @@ assert.deepEqual(trafficCorrection(shown, { ...shown, total_rx: "   " }), {})
 assert.deepEqual(trafficCorrection(shown, { ...shown, total_rx: "0" }), { total_rx: 0 })
 assert.deepEqual(trafficCorrection(shown, { ...shown, total_tx: "3" }), { total_tx: 3 * GIB })
 assert.deepEqual(trafficCorrection(shown, shown), {})
+assert.equal(money(19.99, "CAD"), "C$19.99")
 console.log("partial edits, traffic corrections and provisioning checks passed")

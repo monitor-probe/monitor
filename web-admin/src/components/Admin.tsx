@@ -328,7 +328,7 @@ function BillingForm({ node, onClose, onSaved }: {
               <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => (
+                  {["USD", "CNY", "EUR", "GBP", "JPY", "CAD"].map((c) => (
                     <SelectItem key={c} value={c}>{c}</SelectItem>
                   ))}
                 </SelectContent>

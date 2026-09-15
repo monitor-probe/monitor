@@ -110,8 +110,10 @@
   /* Tailwind v4 leaves `button` and `input` on the browser's default cursor,
      where v3 made buttons a pointer. Radix renders Switch as a button, so without
      this a clickable row loses its pointer exactly where the control sits. The
-     component's own `disabled:cursor-not-allowed` is more specific and wins. */
-  [data-slot="switch"], input[type="checkbox"] { cursor: pointer; }
+     component's own `disabled:cursor-not-allowed` is more specific and wins.
+     `button` 兜住所有普通按钮——`cursor-zoom-in` 这类 class 特异性更高，会盖过
+     这里继续生效。 */
+  [data-slot="switch"], input[type="checkbox"], button { cursor: pointer; }
 }
 
 /* Tabular figures keep live numbers from shifting as they update. */
