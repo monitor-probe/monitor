@@ -61,6 +61,8 @@ export type Node = {
   remark?: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
   token?: string
+  /** Panel only. Whether going offline and returning are announced. */
+  notify?: boolean
 }
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[] }

@@ -146,6 +146,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["ipv6"] = json!(node.ipv6);
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
+        view["notify"] = json!(node.notify);
     }
     view
 }
@@ -1395,6 +1396,7 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     for key in ["register_key", "register_until"] {
         out.insert(key.into(), json!(app.db.get(key).unwrap_or_default()));
     }
+    crate::notify::settings(&app, &mut out);
     Json(Value::Object(out))
 }
 
@@ -1432,6 +1434,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
+        k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
@@ -2549,6 +2552,13 @@ mod tests {
             "retention_days": read["retention_days"],
             "github_proxy": read["github_proxy"],
             "public_page": "on",
+            "notify_grace": read["notify_grace"],
+            "notify_traffic": read["notify_traffic"],
+            "notify_expiry": read["notify_expiry"],
+            "notify_login": read["notify_login"],
+            "notify_telegram_chat": read["notify_telegram_chat"],
+            "notify_telegram_text": read["notify_telegram_text"],
+            "notify_webhook_body": read["notify_webhook_body"],
         });
         assert_eq!(
             save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(echoed)).await.status(),
@@ -2559,15 +2569,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_never_hand_back_the_github_secret() {
+    async fn settings_never_hand_back_a_secret() {
         let app = app();
         app.db.set("github_client_secret", "super-secret").unwrap();
         app.db.set("github_client_id", "public-id").unwrap();
+        app.db.set("notify_telegram_token", "123:bot-secret").unwrap();
+        app.db.set("notify_webhook_url", "https://hooks.example/url-secret").unwrap();
+        app.db.set("notify_webhook_headers", "Authorization: header-secret").unwrap();
 
         let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
         assert_eq!(body["github_client_id"], "public-id");
         assert_eq!(body["github_secret_set"], true);
+        assert_eq!(body["notify_webhook_url_set"], true);
         assert!(body.get("github_client_secret").is_none());
-        assert!(!body.to_string().contains("super-secret"));
+        for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
+            assert!(!body.to_string().contains(secret), "{secret}");
+        }
     }
 }

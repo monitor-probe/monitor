@@ -183,7 +183,10 @@ pub async fn login(
     }
     app.throttle.clear(ip);
     match issue_session(&app, &headers) {
-        Ok(cookie) => with_cookies(Json(serde_json::json!({"ok": true})), [cookie]),
+        Ok(cookie) => {
+            crate::notify::signed_in(&app, "应急密码", ip);
+            with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -228,6 +231,7 @@ pub struct Callback {
 
 pub async fn github_callback(
     State(app): State<crate::Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<Callback>,
 ) -> Response {
@@ -248,13 +252,15 @@ pub async fn github_callback(
     let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
         return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
     };
-    if let Err(e) = github_login(&app, code).await {
-        return sign_in_failed(&app, &headers, &e.to_string());
-    }
+    let user = match github_login(&app, code).await {
+        Ok(user) => user,
+        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
+    };
     let session = match issue_session(&app, &headers) {
         Ok(cookie) => cookie,
         Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
     };
+    crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&headers, peer.ip()));
     with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
 }
 
@@ -303,8 +309,9 @@ fn urlencode(value: &str) -> String {
         .collect()
 }
 
-/// Exchanges the code for a token and checks the login against the allow list.
-async fn github_login(app: &App, code: &str) -> Result<()> {
+/// Exchanges the code for a token and checks the login against the allow list,
+/// returning the accepted login.
+async fn github_login(app: &App, code: &str) -> Result<String> {
     let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
     else {
         bail!("not configured");
@@ -365,7 +372,7 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
         bail!("GitHub user {} is not on the allowed list", user.login);
     }
     info!("GitHub sign-in accepted for {}", user.login);
-    Ok(())
+    Ok(user.login)
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived

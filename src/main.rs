@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod notify;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -55,10 +56,12 @@ pub struct App {
     pub site: String,
     /// Parent directory containing one folder per installed public theme.
     pub themes: PathBuf,
+    /// Alerts on their way out; see `notify::send`.
+    pub notes: tokio::sync::mpsc::Sender<notify::Note>,
 }
 
 impl App {
-    fn new(db: Db, site: String, themes: PathBuf) -> Self {
+    fn new(db: Db, site: String, themes: PathBuf, notes: tokio::sync::mpsc::Sender<notify::Note>) -> Self {
         Self {
             db,
             agents: RwLock::default(),
@@ -71,12 +74,14 @@ impl App {
                 .expect("http client"),
             site,
             themes,
+            notes,
         }
     }
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
-        Self::new(db, String::new(), PathBuf::from("themes"))
+        // Nothing delivers in tests; `notify::send` drops into the closed channel.
+        Self::new(db, String::new(), PathBuf::from("themes"), tokio::sync::mpsc::channel(1).0)
     }
 
     pub fn public_page(&self) -> bool {
@@ -324,7 +329,8 @@ async fn main() -> Result<()> {
 
     let args = parse_args()?;
     std::fs::create_dir_all(&args.themes)?;
-    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes));
+    let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
+    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
@@ -369,6 +375,8 @@ async fn main() -> Result<()> {
     }
 
     tokio::spawn(housekeeping(app.clone()));
+    tokio::spawn(notify::deliver(app.clone(), inbox));
+    tokio::spawn(notify::watch(app.clone()));
 
     let router = Router::new()
         // Agents.
@@ -398,6 +406,7 @@ async fn main() -> Result<()> {
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
+        .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
@@ -580,7 +589,9 @@ fn renew_online_nodes(app: &App) -> Result<()> {
     // until 08:00 while the panel already shows it expired.
     let today = Local::now().date_naive();
     let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-    for node in app.db.nodes()? {
+    let nodes = app.db.nodes()?;
+    let mut rolled = Vec::new();
+    for node in &nodes {
         if !online.contains(&node.id) {
             continue;
         }
@@ -590,11 +601,14 @@ fn renew_online_nodes(app: &App) -> Result<()> {
         let Some(next) = renewed(expires, &node.billing_cycle, today) else { continue };
         app.db.set_expiry(node.id, &next.to_string())?;
         info!("node {} is still up past {expires}, expiry rolled to {next}", node.name);
+        rolled.push((node.name.as_str(), format!("{expires} → {next}")));
     }
+    notify::renewed(app, rolled);
     Ok(())
 }
 
-/// Expires sessions, trims history and rolls over expiry dates once an hour.
+/// Expires sessions, trims history, rolls over expiry dates and sends the daily
+/// expiry digest, once an hour.
 async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
     loop {
@@ -609,6 +623,12 @@ async fn housekeeping(app: Shared) {
         if let Err(e) = renew_online_nodes(&app) {
             warn!("rolling expiry dates failed: {e:#}");
         }
+        // After the roll-over, so the digest lists dates as they now stand.
+        match notify::expiry_digest(&app, Local::now()) {
+            Ok(Some(note)) => notify::send(&app, note),
+            Ok(None) => {}
+            Err(e) => warn!("expiry digest failed: {e:#}"),
+        }
     }
 }
 
@@ -618,7 +638,12 @@ mod tests {
     use axum::http::{StatusCode, Uri};
 
     fn app(site: &str) -> App {
-        App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"))
+        App::new(
+            Db::open(":memory:").unwrap(),
+            site.into(),
+            PathBuf::from("themes"),
+            tokio::sync::mpsc::channel(1).0,
+        )
     }
 
     /// A request as a reverse proxy would forward it, or as it arrives with none
