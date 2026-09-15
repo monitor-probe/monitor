@@ -224,6 +224,16 @@ RC
 	exit 0
 fi
 
+# A fixed user rather than DynamicUser=: when the mount namespace cannot be
+# created, as in an LXC container without nesting, systemd skips ProtectSystem=
+# and the other mount sandboxing for a unit with a static User=, but refuses to
+# start one with DynamicUser= and exits 226/NAMESPACE.
+id -u monitor-agent >/dev/null 2>&1 ||
+	useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent || {
+	echo "cannot create the system user monitor-agent" >&2
+	exit 1
+}
+
 cat >/etc/systemd/system/monitor-agent.service <<UNIT
 [Unit]
 Description=monitor agent
@@ -236,7 +246,7 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
-DynamicUser=yes
+User=monitor-agent
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
