@@ -93,6 +93,28 @@ export function trafficCorrection(
   )
 }
 
+/** Private, carrier-grade NAT, loopback or link-local: unreachable from outside the machine's own network. */
+function isLocalV4(ip: string): boolean {
+  const [a, b] = ip.split(".").map(Number)
+  return a === 10 || a === 127 || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b < 128) || (a === 169 && b === 254)
+}
+
+/**
+ * The addresses shown for a node. The agent reports its interfaces; `ip` is
+ * where its connection arrived from, which the hub canonicalizes to dotted form
+ * for IPv4. Behind NAT the interface holds only a private IPv4 while the
+ * connection arrives from the public one, so that address leads. `ip` alone is
+ * also the fallback for an agent too old to report its interfaces.
+ */
+export function addresses(node: Pick<Node, "ip" | "ipv4" | "ipv6">): string[] {
+  const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
+  const { ip } = node
+  if (!ip) return reported
+  if (node.ipv4 && isLocalV4(node.ipv4) && ip.includes(".") && !isLocalV4(ip)) return [ip, ...reported]
+  return reported.length ? reported : [ip]
+}
+
 /** Installation commands require a TLS origin with a domain, never an IP. */
 export function provisioningSite(site: string): string {
   try {
