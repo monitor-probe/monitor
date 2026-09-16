@@ -3,6 +3,10 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --token TOKEN [options]
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --register KEY [options]
 set -eu
+# useradd and rc-update reside in sbin, which a root shell entered through `su`
+# without `-` lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH
+# is set, and Debian does not set it.
+PATH="$PATH:/usr/sbin:/sbin"
 
 # Binary and token in one directory, the same one the hub uses, giving a node a
 # single path to inspect and a single path to remove.
