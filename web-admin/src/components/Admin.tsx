@@ -1374,7 +1374,7 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
         </div>
       </div>
       {nodes.length > 0 && (
-        <div className="grid gap-x-6 gap-y-2 sm:grid-cols-2">
+        <div className="grid max-h-64 gap-x-6 gap-y-2 overflow-y-auto sm:grid-cols-2">
           {nodes.map((node) => (
             <label key={node.id} className="flex cursor-pointer items-center justify-between gap-3 text-sm">
               <span className="truncate">{node.name}</span>
