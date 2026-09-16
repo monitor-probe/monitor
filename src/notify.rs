@@ -400,7 +400,7 @@ pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
 
 pub fn signed_in(app: &App, how: &str, ip: IpAddr) {
     if app.db.get("notify_login").as_deref() != Some("off") {
-        let message = format!("{how} · 来自 {}", ip.to_canonical());
+        let message = format!("{how} · 来自 {ip}");
         send(app, Note { event: "login", title: "🔑 面板登录".into(), message, ..Default::default() });
     }
 }
@@ -415,11 +415,17 @@ pub fn renewed(app: &App, items: Vec<(&str, String)>) {
 }
 
 /// Once a day from 09:00 hub time, the nodes expiring within the configured
-/// window. The date is stored once sent, so a restart does not repeat it.
+/// window. The date is stored once sent, so a restart does not repeat it, and
+/// not while no channel is configured, so one configured later that day still
+/// receives the digest.
 pub fn expiry_digest(app: &App, now: DateTime<Local>) -> Result<Option<Note>> {
     let days = number(app, "notify_expiry");
     let today = now.date_naive();
-    if days == 0 || now.hour() < 9 || app.db.get("notify_expiry_sent") == Some(today.to_string()) {
+    if days == 0
+        || now.hour() < 9
+        || app.db.get("notify_expiry_sent") == Some(today.to_string())
+        || channels(app).is_empty()
+    {
         return Ok(None);
     }
     let mut soon: Vec<(NaiveDate, String)> = app
@@ -507,11 +513,21 @@ pub async fn watch(app: Shared) {
 ///
 /// A return is announced only after an offline alert, whether or not the node
 /// still has alerts enabled: brief disconnections within the grace period stay
-/// silent in both directions. No node is marked as announced while no channel is
-/// configured, so configuring one afterwards still reports nodes already down.
+/// silent in both directions. Nothing is recorded as announced while no channel
+/// is configured, so configuring one afterwards still reports nodes already down
+/// and traffic already past a step.
 fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let online: HashSet<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     let nodes = app.db.nodes()?;
+    // Node ids are rowids, which SQLite hands to the next node created once the
+    // newest is deleted; state kept under a deleted id would pass that node's
+    // absence, return and traffic step to the new one.
+    // ponytail: a delete and a create within one SWEEP still inherit; key by
+    // creation time if that ever matters.
+    let ids: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+    watch.absent.retain(|id, _| ids.contains(id));
+    watch.returned.retain(|id, _| ids.contains(id));
+    watch.traffic.retain(|id, _| ids.contains(id));
     let grace = number(app, "notify_grace") * 60;
     let armed = !channels(app).is_empty();
     let (mut down, mut up) = (Vec::new(), Vec::new());
@@ -526,10 +542,15 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
             }
             continue;
         }
+        // A node that has never reported cannot be announced, and tracking its
+        // absence would count its first connection as a return from an outage.
+        if node.last_seen == 0 {
+            continue;
+        }
         let since = *watch.absent.entry(node.id).or_insert(now);
         let flapping = watch.returned.get(&node.id).is_some_and(|back| since - back < FLAP_WINDOW);
         let wait = if flapping { grace.max(FLAP_GRACE) } else { grace };
-        if armed && node.notify && node.down_since == 0 && node.last_seen > 0 && now - since >= wait {
+        if armed && node.notify && node.down_since == 0 && now - since >= wait {
             app.db.set_down_since(node.id, node.last_seen)?;
             down.push((node.name.as_str(), format!("最后上报 {}", clock(node.last_seen))));
         }
@@ -541,7 +562,7 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
 
     let percent = number(app, "notify_traffic");
     let mut metered = Vec::new();
-    let traffic = if percent > 0 { app.db.all_traffic() } else { HashMap::new() };
+    let traffic = if percent > 0 && armed { app.db.all_traffic() } else { HashMap::new() };
     for node in nodes.iter().filter(|n| n.traffic_limit > 0) {
         let Some(t) = traffic.get(&node.id) else { continue };
         let used = match node.traffic_mode.as_str() {
@@ -794,6 +815,44 @@ mod tests {
         assert_eq!(at(t + 11_180), ["offline"], "the next absence keeps the ordinary grace period");
     }
 
+    /// A deleted node's id goes to the next node created, and a node's first
+    /// connection is not a return from an outage: either would put a new node on
+    /// the flapping grace period or suppress its first traffic alert.
+    #[test]
+    fn a_new_node_starts_with_no_absence_return_or_traffic_step() {
+        let app = app();
+        with_channel(&app);
+        let (t, gb) = (1_000_000, 1i64 << 30);
+        let metered = |id: i64| {
+            app.db
+                .update_node(id, &NodePatch { traffic_limit: Some(100 * gb), ..Default::default() })
+                .unwrap();
+            let patch = TrafficPatch { month_rx: Some(90 * gb), month_tx: Some(0), ..Default::default() };
+            app.db.set_traffic(id, &patch).unwrap();
+        };
+        let mut watch = Watch { primed: true, ..Default::default() };
+        let mut at = |now: i64| -> Vec<&'static str> {
+            sweep(&app, &mut watch, now).unwrap().into_iter().map(|n| n.event).collect()
+        };
+
+        let old = node(&app, "old", false, t);
+        metered(old);
+        assert_eq!(at(t), ["traffic"]);
+        app.db.delete_node(old).unwrap();
+        assert!(at(t + 30).is_empty());
+
+        let new = node(&app, "new", true, 0);
+        assert_eq!(new, old, "the id is reused");
+        metered(new);
+        assert_eq!(at(t + 60), ["traffic"]);
+        connect(&app, new);
+        app.db.touch_seen(new, t + 600).unwrap();
+        assert!(at(t + 600).is_empty());
+        app.agents.write().unwrap().remove(&new);
+        assert!(at(t + 630).is_empty());
+        assert_eq!(at(t + 810), ["offline"], "the ordinary grace period");
+    }
+
     #[test]
     fn traffic_is_announced_at_the_threshold_and_at_the_allowance_once_each() {
         let app = app();
@@ -813,6 +872,15 @@ mod tests {
         };
 
         used(85 * gb).unwrap();
+        assert!(titles(&mut watch).is_empty());
+        assert!(titles(&mut watch).is_empty(), "no channel");
+        with_channel(&app);
+        assert_eq!(
+            titles(&mut watch),
+            ["⚠️ t 流量提醒 已用 85%"],
+            "a crossing made before the channel existed"
+        );
+        let mut watch = Watch::default();
         assert!(titles(&mut watch).is_empty(), "the first sweep after a start records, it does not repeat");
         used(10 * gb).unwrap();
         assert!(titles(&mut watch).is_empty(), "below the threshold");
@@ -840,6 +908,8 @@ mod tests {
             app.db.set_expiry(id, date).unwrap();
         }
         assert!(expiry_digest(&app, at(8)).unwrap().is_none(), "not before nine");
+        assert!(expiry_digest(&app, at(9)).unwrap().is_none(), "no channel, and the day is not spent");
+        with_channel(&app);
         let note = expiry_digest(&app, at(9)).unwrap().unwrap();
         assert_eq!(note.title, "⏳ 2 台节点即将到期");
         assert_eq!(note.message, "today · 2026-09-15 今天到期\nsoon · 2026-09-20 还剩 5 天");
