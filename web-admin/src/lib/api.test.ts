@@ -27,5 +27,7 @@ assert.deepEqual(addresses({ ip: "127.0.0.1", ipv4: "172.16.0.5" }), ["172.16.0.
 assert.deepEqual(addresses({ ip: "198.51.100.1", ipv4: "203.0.113.7" }), ["203.0.113.7"])
 assert.deepEqual(addresses({ ip: "2001:db8::2", ipv4: "10.0.0.2", ipv6: "2001:db8::2" }), ["10.0.0.2", "2001:db8::2"])
 assert.deepEqual(addresses({ ip: "203.0.113.7" }), ["203.0.113.7"])
+// Without a recorded connection the list holds only what the agent reported.
+assert.deepEqual(addresses({ ipv4: "10.0.0.2" }), ["10.0.0.2"])
 assert.deepEqual(addresses({}), [])
 console.log("partial edits, traffic corrections, provisioning and address checks passed")
