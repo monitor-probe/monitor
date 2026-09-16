@@ -1325,9 +1325,13 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
   async function apply(targets: Node[], on: boolean) {
     setBusy(true)
     try {
-      for (const node of targets.filter((n) => !!n.notify !== on)) {
-        await api(`/nodes/${node.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })
-      }
+      // Awaited in turn, the requests would cost one round trip per node, and
+      // the two-second stream would render each one as it lands.
+      await Promise.all(
+        targets
+          .filter((n) => !!n.notify !== on)
+          .map((n) => api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })),
+      )
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
