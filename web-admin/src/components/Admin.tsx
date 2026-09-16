@@ -566,6 +566,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
   const [manualOrder, setManualOrder] = useState<number[]>([])
+  const [query, setQuery] = useState("")
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
   const byId = new Map(nodes.map((node) => [node.id, node]))
@@ -574,6 +575,12 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
     ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
     ...nodes.filter((node) => !orderedIds.has(node.id)),
   ]
+  // Name and address, the two things a row is looked up by. `order` itself stays
+  // whole, because the order sent on drop is the order of every node.
+  const needle = query.trim().toLowerCase()
+  const visible = needle
+    ? order.filter((n) => [n.name, n.ip, n.ipv4, n.ipv6].some((v) => v?.toLowerCase().includes(needle)))
+    : order
 
   async function remove() {
     if (!deleting) return
@@ -621,7 +628,14 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   return (
     <div className="space-y-4">
       {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
-      <div className="flex justify-end gap-2">
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <Input
+          className="mr-auto w-full sm:w-64"
+          placeholder="搜索名称或地址"
+          aria-label="搜索节点"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
         <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
@@ -648,7 +662,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
             </TableRow>
           </TableHeader>
           <TableBody>
-            {order.map((n, index) => (
+            {visible.map((n, index) => (
               <TableRow
                 key={n.id}
                 style={{ viewTransitionName: `node-${n.id}` }}
@@ -662,9 +676,13 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      draggable
-                      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing"
-                      title="拖动排序"
+                      draggable={!needle}
+                      // A drop sends the order of every node, and a filtered list
+                      // offers only its own rows to drop onto, so the index below
+                      // is the full one exactly while nothing is filtered out.
+                      disabled={!!needle}
+                      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+                      title={needle ? "清空搜索后可拖动排序" : "拖动排序"}
                       aria-label={`拖动 ${n.name} 排序`}
                       onDragStart={(e) => {
                         orderBeforeDrag.current = order.map((node) => node.id)
@@ -743,6 +761,11 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
                   还没有节点，右上角添加
                 </TableCell>
+              </TableRow>
+            )}
+            {needle && !visible.length && (
+              <TableRow>
+                <TableCell colSpan={7} className="py-6 text-center text-sm text-muted-foreground">没有匹配的节点</TableCell>
               </TableRow>
             )}
           </TableBody>
