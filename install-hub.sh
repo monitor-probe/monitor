@@ -222,6 +222,7 @@ User=$USER_NAME
 WorkingDirectory=$ROOT
 ReadWritePaths=$DATA
 NoNewPrivileges=yes
+RestrictSUIDSGID=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
