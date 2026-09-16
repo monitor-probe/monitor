@@ -763,9 +763,11 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 </TableCell>
               </TableRow>
             )}
-            {needle && !visible.length && (
+            {needle && nodes.length > 0 && !visible.length && (
               <TableRow>
-                <TableCell colSpan={7} className="py-6 text-center text-sm text-muted-foreground">没有匹配的节点</TableCell>
+                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                  没有匹配的节点
+                </TableCell>
               </TableRow>
             )}
           </TableBody>
