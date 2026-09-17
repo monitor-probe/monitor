@@ -1478,6 +1478,22 @@ impl Db {
     }
 
     /// Invalidates every login. Used when the admin password changes.
+    /// Replaces the admin password hash and signs every session out, both or
+    /// neither: a reset that stored the hash and then failed would report failure
+    /// while the old password no longer works.
+    pub fn replace_password(&self, hash: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO setting (key, value) VALUES ('admin_password_hash', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [hash],
+        )?;
+        tx.execute("DELETE FROM session", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn drop_all_sessions(&self) -> Result<()> {
         self.conn().execute("DELETE FROM session", [])?;
         Ok(())

@@ -308,8 +308,7 @@ fn parse_args() -> Result<Args> {
                      hub answers on whatever ip:port it is asked, and the panel builds\n\
                      install commands from the address in the browser's bar.\n\
                      --reset-password replaces the emergency password, signs every session\n\
-                     out, prints the new password and exits. Run it as the user the hub\n\
-                     runs as, so any file SQLite creates stays readable by the hub.",
+                     out, prints the new password and exits. The database must exist.",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -342,11 +341,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
-    // Delivered on the terminal rather than through the service log, so a
-    // password missing from the journal is still recoverable. A running hub
-    // reads the hash and its sessions from the database on every request, so
-    // the change applies to it without a restart.
+    // Delivered on the terminal rather than through the service log, which some
+    // hosts do not keep. A running hub reads the hash and its sessions from the
+    // database on every request, so the change applies without a restart.
     if args.reset_password {
+        // A mistyped path would otherwise create an empty database and print a
+        // password no running hub reads.
+        anyhow::ensure!(std::path::Path::new(&args.database).is_file(), "no database at {}", args.database);
+        // install-hub.sh extracts the password by this exact line prefix.
         println!("Emergency password: {}", new_password(&Db::open(&args.database)?)?);
         return Ok(());
     }
@@ -583,8 +585,7 @@ fn first_run(app: &App, url: &str) -> Result<()> {
 /// Sets a random 24-character admin password and signs every session out.
 fn new_password(db: &Db) -> Result<String> {
     let password = auth::random_token()[..24].to_owned();
-    db.set("admin_password_hash", &auth::hash_password(&password)?)?;
-    db.drop_all_sessions()?;
+    db.replace_password(&auth::hash_password(&password)?)?;
     Ok(password)
 }
 

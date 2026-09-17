@@ -1466,8 +1466,7 @@ pub async fn save_settings(
         // receives a replacement.
         if key == "admin_password" {
             match hash_password(value).and_then(|h| {
-                app.db.set("admin_password_hash", &h)?;
-                app.db.drop_all_sessions()?;
+                app.db.replace_password(&h)?;
                 issue_session(&app, &headers)
             }) {
                 Ok(cookie) => reissued = cookie,

@@ -240,9 +240,14 @@ UNIT
 
 	# Taken from the binary's stdout rather than the journal, which some hosts
 	# keep nowhere. Set before the service starts, so the hub finds a password in
-	# place and does not generate a second one.
+	# place and does not generate a second one. A reset refuses a missing
+	# database, so the file is created first under the service user; SQLite reads
+	# an empty file as an empty database.
 	pw=""
-	[ -z "$first" ] || pw="$(new_password)"
+	if [ -n "$first" ]; then
+		install -m 0600 -o "$USER_NAME" /dev/null "$DATA/monitor.db"
+		pw="$(new_password)"
+	fi
 
 	systemctl daemon-reload
 	systemctl enable "$SERVICE" >/dev/null 2>&1 || true
@@ -251,10 +256,17 @@ UNIT
 	# would exit here with a raw systemd error and leave the hub down on the
 	# binary that just failed.
 	systemctl restart "$SERVICE" || true
-	# is-active answers before a unit that exits immediately has done so, and the
-	# first run also computes an argon2 hash. Wait, then query.
+	# is-active answers before a unit that exits immediately has done so. Wait,
+	# then query.
 	sleep 3
 	if ! systemctl is-active --quiet "$SERVICE"; then
+		# The new database holds nothing but a password never shown. Removed, with
+		# the service stopped so no restart recreates it, so that a rerun is again
+		# a first install and shows one.
+		if [ -n "$first" ]; then
+			systemctl stop "$SERVICE" 2>/dev/null || true
+			rm -f "$DATA/monitor.db" "$DATA/monitor.db-wal" "$DATA/monitor.db-shm"
+		fi
 		if [ -n "$backup" ]; then
 			install -m 0755 "$backup" "$BIN"
 			rm -f "$backup"
@@ -274,7 +286,7 @@ UNIT
 	if [ -n "$first" ]; then
 		if [ -n "$pw" ]; then
 			field "密码" "$pw"
-			field "    " "${D}记下来，登录后到「设置」里改掉${N}"
+			field "    " "${D}记下来，登录后到「安全」里改掉${N}"
 		else
 			field "密码" "没取到，重跑安装器选「重置密码」"
 		fi
@@ -349,19 +361,22 @@ CFD
 }
 
 # ---- password ----
-# Prints nothing on failure; the hub's own error reaches stderr. Runs as the
-# service user because SQLite creates -wal and -shm beside the database, and
-# root-owned ones would leave the hub unable to open it.
+# Prints nothing on failure; the hub's own error reaches stderr. Running as root
+# is safe: SQLite gives the -wal and -shm files it creates the database file's
+# owner.
 new_password() {
-	runuser -u "$USER_NAME" -- "$BIN" --db "$DATA/monitor.db" --reset-password |
-		sed -n 's/^Emergency password: //p'
+	"$BIN" --db "$DATA/monitor.db" --reset-password | sed -n 's/^Emergency password: //p'
 }
 
 reset_password() {
-	[ -f "$DATA/monitor.db" ] || die "这台机器上没有 hub 的数据库：$DATA/monitor.db"
+	# The data outlives --uninstall, so the database alone does not mean a hub.
+	if [ ! -f "$BIN" ] || [ ! -f "$DATA/monitor.db" ]; then
+		die "这台机器上没有装 monitor hub"
+	fi
 	confirm "重置面板密码？所有已登录的会话都会被登出" || return 0
 	pw="$(new_password)"
-	[ -n "$pw" ] || die "重置失败"
+	# Versions without the flag report "unknown argument" on stderr.
+	[ -n "$pw" ] || die "重置失败。上面提示 unknown argument 的话是 hub 版本太旧，先升级"
 	field "密码" "$pw"
 }
 
