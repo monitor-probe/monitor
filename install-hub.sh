@@ -152,8 +152,8 @@ install_hub() {
 	# depends on useradd having created one.
 	install -d -m 0700 -o "$USER_NAME" "$DATA"
 
-	# A first run prints the one-time password, and only a missing database
-	# constitutes one. Checked before anything is installed.
+	# Only a missing database makes this a first install, which sets the
+	# password. Checked before anything is installed.
 	first=""
 	[ -f "$DATA/monitor.db" ] || first=1
 
@@ -238,6 +238,12 @@ MemoryMax=256M
 WantedBy=multi-user.target
 UNIT
 
+	# Taken from the binary's stdout rather than the journal, which some hosts
+	# keep nowhere. Set before the service starts, so the hub finds a password in
+	# place and does not generate a second one.
+	pw=""
+	[ -z "$first" ] || pw="$(new_password)"
+
 	systemctl daemon-reload
 	systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 	# Not left to set -e: a binary that cannot exec fails the job itself, which is
@@ -266,13 +272,11 @@ UNIT
 	printf '\n'
 	field "面板" "${SITE:-http://127.0.0.1:$PORT}/admin"
 	if [ -n "$first" ]; then
-		pw="$(journalctl -u "$SERVICE" --since '-2 min' --no-pager 2>/dev/null |
-			sed -n 's/.*Emergency password: //p' | tail -1)"
 		if [ -n "$pw" ]; then
 			field "密码" "$pw"
-			field "    " "${D}只显示这一次，登录后到「设置」里改掉${N}"
+			field "    " "${D}记下来，登录后到「设置」里改掉${N}"
 		else
-			field "密码" "journalctl -u $SERVICE | grep Emergency"
+			field "密码" "没取到，重跑安装器选「重置密码」"
 		fi
 	fi
 	field "数据" "$DATA/monitor.db"
@@ -344,6 +348,23 @@ ingress:
 CFD
 }
 
+# ---- password ----
+# Prints nothing on failure; the hub's own error reaches stderr. Runs as the
+# service user because SQLite creates -wal and -shm beside the database, and
+# root-owned ones would leave the hub unable to open it.
+new_password() {
+	runuser -u "$USER_NAME" -- "$BIN" --db "$DATA/monitor.db" --reset-password |
+		sed -n 's/^Emergency password: //p'
+}
+
+reset_password() {
+	[ -f "$DATA/monitor.db" ] || die "这台机器上没有 hub 的数据库：$DATA/monitor.db"
+	confirm "重置面板密码？所有已登录的会话都会被登出" || return 0
+	pw="$(new_password)"
+	[ -n "$pw" ] || die "重置失败"
+	field "密码" "$pw"
+}
+
 # ---- uninstall ----
 uninstall_hub() {
 	if [ ! -f "$BIN" ] && [ ! -f "$UNIT" ]; then
@@ -384,6 +405,7 @@ menu() {
 		printf '    2  卸载\n'
 		printf '    3  状态\n'
 		printf '    4  日志\n'
+		printf '    5  重置密码\n'
 		printf '    q  退出\n\n'
 		printf '  %s›%s ' "$B" "$N"
 		read -r choice || exit 0
@@ -405,6 +427,7 @@ menu() {
 		2) uninstall_hub; press ;;
 		3) systemctl status "$SERVICE" --no-pager || true; press ;;
 		4) journalctl -u "$SERVICE" -f --no-pager ;;
+		5) reset_password; press ;;
 		q | Q | exit | "") exit 0 ;;
 		*) ;;
 		esac
@@ -419,6 +442,8 @@ monitor hub 安装器
   sudo ./install-hub.sh --port 8443    指定端口安装
   sudo ./install-hub.sh --uninstall    卸载，保留数据
   sudo ./install-hub.sh --purge        卸载并删除数据库
+  sudo ./install-hub.sh --reset-password
+                                       重置面板密码，登出所有会话
 
   --port <n>     本机监听端口，默认 $PORT
   --site <url>   一般不用填。面板拼安装命令用的是浏览器地址栏，配好反代
@@ -446,6 +471,7 @@ while [ $# -gt 0 ]; do
 	--site) [ $# -ge 2 ] || die "--site 后面要跟地址"; SITE="$2"; SITE_SET=1; shift 2 ;;
 	--uninstall) ACTION=uninstall; shift ;;
 	--purge) ACTION=uninstall; PURGE=1; shift ;;
+	--reset-password) ACTION=reset; shift ;;
 	--yes | -y) YES=1; shift ;;
 	-h | --help) usage; exit 0 ;;
 	*) die "未知参数：$1（--help 看用法）" ;;
@@ -486,6 +512,7 @@ command -v systemctl >/dev/null 2>&1 ||
 
 case "$ACTION" in
 uninstall) banner; uninstall_hub ;;
+reset) banner; reset_password ;;
 *)
 	if [ -t 0 ]; then
 		menu

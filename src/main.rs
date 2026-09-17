@@ -262,6 +262,7 @@ struct Args {
     database: String,
     site: String,
     themes: PathBuf,
+    reset_password: bool,
 }
 
 /// The default listen address. A v6 wildcard also accepts IPv4 through
@@ -284,6 +285,7 @@ fn parse_args() -> Result<Args> {
     let mut database = "monitor.db".to_owned();
     let mut site = String::new();
     let mut themes = None;
+    let mut reset_password = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_default();
@@ -292,17 +294,22 @@ fn parse_args() -> Result<Args> {
             "--db" => database = value(),
             "--site" => site = value(),
             "--themes" => themes = Some(PathBuf::from(value())),
+            "--reset-password" => reset_password = true,
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
-                     Usage: monitor-hub [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     Usage: monitor-hub [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n       \
+                     monitor-hub --db monitor.db --reset-password\n\n\
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
                      --site is only needed behind a reverse proxy, where the address the\n\
                      panel is reached on is not the one agents should use. Left out, the\n\
                      hub answers on whatever ip:port it is asked, and the panel builds\n\
-                     install commands from the address in the browser's bar.",
+                     install commands from the address in the browser's bar.\n\
+                     --reset-password replaces the emergency password, signs every session\n\
+                     out, prints the new password and exits. Run it as the user the hub\n\
+                     runs as, so any file SQLite creates stays readable by the hub.",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -315,7 +322,14 @@ fn parse_args() -> Result<Args> {
     let themes = themes.unwrap_or_else(|| {
         std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).join("themes")
     });
-    Ok(Args { listen, listen_defaulted, database, site: site.trim_end_matches('/').to_owned(), themes })
+    Ok(Args {
+        listen,
+        listen_defaulted,
+        database,
+        site: site.trim_end_matches('/').to_owned(),
+        themes,
+        reset_password,
+    })
 }
 
 #[tokio::main]
@@ -328,6 +342,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    // Delivered on the terminal rather than through the service log, so a
+    // password missing from the journal is still recoverable. A running hub
+    // reads the hash and its sessions from the database on every request, so
+    // the change applies to it without a restart.
+    if args.reset_password {
+        println!("Emergency password: {}", new_password(&Db::open(&args.database)?)?);
+        return Ok(());
+    }
     std::fs::create_dir_all(&args.themes)?;
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
@@ -548,8 +570,7 @@ fn first_run(app: &App, url: &str) -> Result<()> {
     if app.db.get("admin_password_hash").is_some() {
         return Ok(());
     }
-    let password = auth::random_token()[..24].to_owned();
-    app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
+    let password = new_password(&app.db)?;
     println!(
         "\n  Monitor hub is ready.\n\n  \
          Sign in at {url}/admin\n  \
@@ -557,6 +578,14 @@ fn first_run(app: &App, url: &str) -> Result<()> {
          This is shown once. Change it, and set up GitHub sign-in, under Security.\n"
     );
     Ok(())
+}
+
+/// Sets a random 24-character admin password and signs every session out.
+fn new_password(db: &Db) -> Result<String> {
+    let password = auth::random_token()[..24].to_owned();
+    db.set("admin_password_hash", &auth::hash_password(&password)?)?;
+    db.drop_all_sessions()?;
+    Ok(password)
 }
 
 /// Billing cycles as whole months. `once` has none, so it never rolls over.
@@ -857,5 +886,10 @@ mod tests {
         assert!(hash.starts_with("$argon2"));
         first_run(&app, "http://x").unwrap();
         assert_eq!(app.db.get("admin_password_hash").unwrap(), hash, "must not rotate on restart");
+
+        app.db.create_session("s", i64::MAX).unwrap();
+        new_password(&app.db).unwrap();
+        assert_ne!(app.db.get("admin_password_hash").unwrap(), hash, "a reset must rotate it");
+        assert!(!app.db.session_valid("s"), "a reset must sign every session out");
     }
 }
