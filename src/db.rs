@@ -470,7 +470,7 @@ impl Traffic {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct PingTask {
     #[serde(default)]
     pub id: i64,
@@ -1910,8 +1910,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![id],
-                auto_join: false,
-                base: None,
+                ..Default::default()
             })
             .unwrap();
         db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
@@ -2175,8 +2174,7 @@ mod tests {
             target: "1.1.1.1:443".into(),
             interval: 60,
             nodes,
-            auto_join: false,
-            base: None,
+            ..Default::default()
         };
         let task = db.save_ping_task(&probe(vec![id])).unwrap();
         db.accumulate(id, "b", Some((10, 10))).unwrap();
@@ -2210,8 +2208,7 @@ mod tests {
             target: "1.1.1.1:443".into(),
             interval: 60,
             nodes: vec![id],
-            auto_join: false,
-            base: None,
+            ..Default::default()
         };
         let old = db.save_ping_task(&probe("tokyo")).unwrap();
         db.insert_ping(id, old, 1, 999).unwrap();
@@ -2240,8 +2237,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![mine],
-                auto_join: false,
-                base: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -2603,8 +2599,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes,
-                auto_join: false,
-                base: None,
+                ..Default::default()
             })
             .unwrap()
         };
@@ -2642,8 +2637,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![a, b],
-                auto_join: false,
-                base: None,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(db.ping_tasks_for(a).unwrap().len(), 1);
@@ -2655,8 +2649,7 @@ mod tests {
             target: "1.1.1.1:443".into(),
             interval: 30,
             nodes: vec![a],
-            auto_join: false,
-            base: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(db.ping_tasks_for(b).unwrap().len(), 0);
@@ -2674,7 +2667,7 @@ mod tests {
             interval: 60,
             nodes: vec![],
             auto_join,
-            base: None,
+            ..Default::default()
         };
         let joining = db.save_ping_task(&probe(true)).unwrap();
         db.save_ping_task(&probe(false)).unwrap();
@@ -2757,8 +2750,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes,
-                auto_join: false,
-                base: None,
+                ..Default::default()
             })
         };
         for _ in 0..Db::MAX_PROBES_PER_NODE {

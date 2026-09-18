@@ -1631,8 +1631,7 @@ mod tests {
                 target: target.to_owned(),
                 interval: 60,
                 nodes: vec![],
-                auto_join: false,
-                base: None,
+                ..Default::default()
             };
             save_ping_task(Admin, State(app.clone()), Json(task))
         };
@@ -1660,8 +1659,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval,
                 nodes: vec![],
-                auto_join: false,
-                base: None,
+                ..Default::default()
             };
             save_ping_task(Admin, State(app.clone()), Json(task))
         };
@@ -1816,8 +1814,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes,
-                auto_join: false,
-                base: None,
+                ..Default::default()
             })
             .unwrap()
     }

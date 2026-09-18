@@ -862,8 +862,7 @@ mod tests {
                     target: "1.1.1.1:443".into(),
                     interval: 60,
                     nodes: vec![id],
-                    auto_join: false,
-                    base: None,
+                    ..Default::default()
                 })
                 .unwrap()
         };
