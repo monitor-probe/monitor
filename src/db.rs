@@ -130,7 +130,18 @@ CREATE TABLE IF NOT EXISTS session (
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
-/// database already in service.
+/// database already in service. Every migration must be:
+///
+/// - Additive: a new column carries a default, and no column an earlier build
+///   reads is renamed or dropped. install-hub.sh rolls a hub that fails to start
+///   back to the previous binary, which then runs on the migrated file.
+/// - Safe to run twice: an earlier build stamps its own, lower version into a
+///   newer file, and the next upgrade runs the migration again.
+///
+/// A new column goes into `SCHEMA` as well, for fresh files, but an index on it
+/// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
+/// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
+/// holds every migration to these rules, starting from v1.0.0's schema.
 const SCHEMA_VERSION: i64 = 5;
 
 /// Adds a column older databases lack. A duplicate column indicates the
@@ -192,16 +203,14 @@ fn migrate_to_1(conn: &Connection) -> Result<()> {
     // retention.
     if schema_mentions(conn, "ping_record", "(node_id, task_id, ts)")? {
         conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE ping_record_rekeyed (
+            "CREATE TABLE ping_record_rekeyed (
                node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
                ts INTEGER NOT NULL, latency INTEGER NOT NULL,
                PRIMARY KEY (node_id, ts, task_id)
              ) WITHOUT ROWID;
              INSERT INTO ping_record_rekeyed SELECT * FROM ping_record;
              DROP TABLE ping_record;
-             ALTER TABLE ping_record_rekeyed RENAME TO ping_record;
-             COMMIT;",
+             ALTER TABLE ping_record_rekeyed RENAME TO ping_record;",
         )?;
         info!("rebuilt ping_record on a key the latency chart can seek");
     }
@@ -247,25 +256,32 @@ fn migrate_to_5(conn: &Connection) -> Result<()> {
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
 ///
+/// One transaction covers every step and the stamp. SQLite rolls back schema
+/// changes and `user_version` alike, so a failure part-way -- a full disk, a
+/// killed process -- leaves the file at the version it started from rather than
+/// between two.
+///
 /// Restoring a backup also arrives here: the copy carries its own version and
 /// requires the same migrations a restart would have run.
 fn migrate(conn: &Connection, from: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
     if from < 1 {
-        migrate_to_1(conn)?;
+        migrate_to_1(&tx)?;
     }
     if from < 2 {
-        migrate_to_2(conn)?;
+        migrate_to_2(&tx)?;
     }
     if from < 3 {
-        migrate_to_3(conn)?;
+        migrate_to_3(&tx)?;
     }
     if from < 4 {
-        migrate_to_4(conn)?;
+        migrate_to_4(&tx)?;
     }
     if from < 5 {
-        migrate_to_5(conn)?;
+        migrate_to_5(&tx)?;
     }
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2311,6 +2327,96 @@ mod tests {
         drop(db);
         assert!(Db::open(path).is_ok());
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Every row of every table, comparable across two opens of one file.
+    fn dump(conn: &Connection) -> Vec<String> {
+        let mut rows = Vec::new();
+        for table in TABLES {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let width = stmt.column_count();
+            let read =
+                |r: &rusqlite::Row| (0..width).map(|i| r.get::<_, rusqlite::types::Value>(i)).collect();
+            let mut found: Vec<String> = stmt
+                .query_map([], |r| read(r))
+                .unwrap()
+                .map(|row: rusqlite::Result<Vec<_>>| format!("{table} {:?}", row.unwrap()))
+                .collect();
+            found.sort();
+            rows.extend(found);
+        }
+        rows
+    }
+
+    /// A file as the oldest release left it, one row in every table.
+    fn release_file(path: &str) {
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(include_str!("testdata/schema-v1.0.0.sql")).unwrap();
+        old.execute_batch(
+            "INSERT INTO setting VALUES ('site', 'https://hub.example.com');
+             INSERT INTO node (id, name, token, ip, country, created_at)
+               VALUES (1, 'n', 't', '198.51.100.4', 'US', 1);
+             INSERT INTO traffic (node_id, total_rx) VALUES (1, 5000);
+             INSERT INTO metric VALUES (1, 60, 12.5, 100, 0, 0, 0, 0, 0, 0, 0);
+             INSERT INTO ping_task (id, name, target) VALUES (1, 'cm', '1.1.1.1:443');
+             INSERT INTO ping_node VALUES (1, 1);
+             INSERT INTO ping_record VALUES (1, 1, 60, 42);
+             INSERT INTO session VALUES ('h', 9999999999);
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+    }
+
+    /// v1.0.0's schema, opened by this build through the startup path. Fails on
+    /// a column `SCHEMA` gained without a migration or the reverse, on an index
+    /// in `SCHEMA` over a column only a migration adds, and on a migration that
+    /// changes the data when it runs a second time.
+    #[test]
+    fn an_upgraded_release_matches_a_fresh_database() {
+        let scratch = Scratch::new();
+        release_file(&scratch.0);
+        let db = Db::open(&scratch.0).unwrap();
+        let fresh = Db::open(":memory:").unwrap();
+        for table in TABLES {
+            assert_eq!(
+                columns_of(&db.conn(), table).unwrap(),
+                columns_of(&fresh.conn(), table).unwrap(),
+                "{table}"
+            );
+        }
+        let upgraded = dump(&db.conn());
+        assert_eq!(upgraded.len(), TABLES.len(), "every row survives: {upgraded:#?}");
+
+        // An earlier build opening the file stamps its own version, so the next
+        // upgrade runs every migration again.
+        db.conn().execute_batch("PRAGMA user_version = 3").unwrap();
+        drop(db);
+        let db = Db::open(&scratch.0).unwrap();
+        assert_eq!(dump(&db.conn()), upgraded, "a second run changes nothing");
+        let version: i64 = db.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The trigger fails the UPDATE in `migrate_to_5` after `migrate_to_4` has
+    /// added its columns: a failure part-way through an upgrade.
+    #[test]
+    fn a_failed_upgrade_leaves_the_file_as_it_was() {
+        let scratch = Scratch::new();
+        release_file(&scratch.0);
+        let state = |c: &Connection| {
+            let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            (version, columns_of(c, "node").unwrap(), dump(c))
+        };
+        let before = {
+            let c = Connection::open(&scratch.0).unwrap();
+            c.execute_batch(
+                "CREATE TRIGGER fail BEFORE UPDATE ON node BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+            )
+            .unwrap();
+            state(&c)
+        };
+        assert!(Db::open(&scratch.0).is_err());
+        assert_eq!(state(&Connection::open(&scratch.0).unwrap()), before, "no step of the upgrade remains");
     }
 
     /// Dropping `metric.load1` under a database in service. The column is
