@@ -53,7 +53,7 @@ export type Node = {
   month_start: string
   /** Panel only. */
   hostname?: string
-  /** ISO 3166-1 alpha-2, derived from the address the agent connects from. */
+  /** ISO 3166-1 alpha-2, from a public interface address, else the address the agent connects from. */
   country: string
   ip?: string
   ipv4?: string
@@ -95,26 +95,48 @@ export function trafficCorrection(
   )
 }
 
-/** Private, carrier-grade NAT, loopback or link-local: unreachable from outside the machine's own network. */
-function isLocalV4(ip: string): boolean {
-  const [a, b] = ip.split(".").map(Number)
-  return a === 10 || a === 127 || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168) ||
-    (a === 100 && b >= 64 && b < 128) || (a === 169 && b === 254)
+/**
+ * Globally routable. v4 excludes RFC 1918, CGNAT, loopback, link-local, 0/8,
+ * 192.0.0/24, 198.18/15 (the fake-IP range of TUN-mode proxies), multicast and
+ * reserved; v6 counts 2000::/3 only, leaving out ULA and link-local. The agent
+ * ranks its interfaces and the hub picks the country's address by the same
+ * ranges; the three lists are to be changed together.
+ */
+export function isPublic(ip: string): boolean {
+  if (ip.includes(":")) return (parseInt(ip.split(":")[0] || "0", 16) & 0xe000) === 0x2000
+  const [a, b, c] = ip.split(".").map(Number)
+  return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b < 128) ||
+    (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 0 && c === 0) ||
+    (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)))
 }
 
 /**
- * The addresses shown for a node. The agent reports its interfaces; `ip` is
- * where its connection arrived from, which the hub canonicalizes to dotted form
- * for IPv4. Behind NAT the interface holds only a private IPv4 while the
- * connection arrives from the public one, so that address leads. `ip` alone is
- * also the fallback for an agent too old to report its interfaces.
+ * The addresses shown for a node, v4 before v6. The agent reports one address
+ * per family from its interfaces; `ip` is where its connection arrived from,
+ * which the hub canonicalizes to dotted form for IPv4.
+ *
+ * When the interface holds only a private address in the family the connection
+ * used, the machine sits behind NAT or a proxy and the connection's public
+ * address, its exit, leads that family. Where the interface already holds a
+ * public address, a different exit is a proxy in front of the machine; where
+ * the interface holds no address of that family, the exit is a translator such
+ * as NAT64 or WARP. Neither reaches the machine, so neither is shown. `ip`
+ * alone is the fallback for an agent too old to report its interfaces.
  */
 export function addresses(node: Pick<Node, "ip" | "ipv4" | "ipv6">): string[] {
-  const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
-  const { ip } = node
+  const { ip, ipv4 = "", ipv6 = "" } = node
+  const reported = [ipv4, ipv6].filter(Boolean)
   if (!ip) return reported
-  if (node.ipv4 && isLocalV4(node.ipv4) && ip.includes(".") && !isLocalV4(ip)) return [ip, ...reported]
-  return reported.length ? reported : [ip]
+  if (!reported.length) return [ip]
+  const v6 = ip.includes(":")
+  const held = v6 ? ipv6 : ipv4
+  if (!held || held === ip || isPublic(held) || !isPublic(ip)) return reported
+  return (v6 ? [ipv4, ip, ipv6] : [ip, ipv4, ipv6]).filter(Boolean)
+}
+
+/** An address the node does not hold: the exit its connection to the hub leaves by. */
+export function isExit(node: Pick<Node, "ip" | "ipv4" | "ipv6">, address: string): boolean {
+  return address === node.ip && address !== node.ipv4 && address !== node.ipv6
 }
 
 /** Installation commands require a TLS origin with a domain, never an IP. */

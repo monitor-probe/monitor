@@ -1976,7 +1976,7 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
-        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "").unwrap();
 
         // A live report, so the public view has metrics to strip. `hostname` is
         // what a node token in the wrong hands can insert, and what the agent
@@ -2139,7 +2139,7 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
-        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "").unwrap();
 
         let public = live_snapshot(&app, false);
         let admin = live_snapshot(&app, true);
@@ -2305,6 +2305,7 @@ mod tests {
                 id,
                 &json!({"mem_total": 1_000, "swap_total": 1i64 << 30, "disk_total": 30i64 << 30}),
                 "ip",
+                "",
             )
             .unwrap();
 

@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
+import { addresses, api, changes, GIB, isExit, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -44,24 +44,29 @@ function copy(text: string) {
 }
 
 // Every address a node has, each click-to-copy: pasting one into an ssh command
-// is why they are shown.
+// is why they are shown. The exit is labelled because it is not on the machine:
+// behind NAT it needs a port forward, behind a proxy it does not lead back at all.
 function Addresses({ node }: { node: Node }) {
   const list = addresses(node)
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
     <div className="flex flex-col items-start gap-y-0.5">
-      {list.map((address) => (
-        <button
-          key={address}
-          type="button"
-          onClick={() => copy(address)}
-          title="点击复制"
-          className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
-        >
-          {address}
-          <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
-        </button>
-      ))}
+      {list.map((address) => {
+        const exit = isExit(node, address)
+        return (
+          <button
+            key={address}
+            type="button"
+            onClick={() => copy(address)}
+            title={exit ? "出口：hub 看到的连接地址，不在节点网卡上（NAT 或代理的出口）。点击复制" : "点击复制"}
+            className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
+          >
+            {address}
+            {exit && <span className="text-xs text-muted-foreground">出口</span>}
+            <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+          </button>
+        )
+      })}
     </div>
   )
 }

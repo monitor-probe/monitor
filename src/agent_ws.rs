@@ -3,6 +3,7 @@
 //! first, with self-describing frames readable via curl or a browser console.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -181,6 +182,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.
     let mut last_frame = Instant::now();
+    // The address this node's country is still owed for. A lookup that failed,
+    // or was held back by `ASKED`, is retried on the heartbeat while the
+    // connection lasts; otherwise it would wait for the next hello, which on a
+    // steady link is days away.
+    let mut owed: Option<String> = None;
 
     let outcome = loop {
         tokio::select! {
@@ -198,6 +204,13 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 if quiet > SILENCE {
                     break Err(anyhow::anyhow!("silent for {}s", quiet.as_secs()));
                 }
+                if let Some(source) = &owed {
+                    match tokio::task::block_in_place(|| app.db.country_owed(node_id, source)) {
+                        Ok(true) => locate(app.clone(), node_id, source.clone()),
+                        Ok(false) => owed = None,
+                        Err(e) => debug!("node {node_id}: country check failed: {e:#}"),
+                    }
+                }
                 socket.send(Message::Ping(Vec::new().into())).await?;
             }
             inbound = socket.recv() => {
@@ -210,8 +223,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 // signal.
                 Some(Ok(Message::Text(text))) =>
                     match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text)) {
-                    Ok(true) => locate(app.clone(), node_id, ip.clone()),
-                    Ok(false) => {}
+                    Ok(Some(source)) => {
+                        locate(app.clone(), node_id, source.clone());
+                        owed = Some(source);
+                    }
+                    Ok(None) => {}
                     Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
                 },
                 Some(Ok(Message::Close(_))) | None => break Ok(()),
@@ -243,13 +259,19 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
     true
 }
 
-/// Handles one inbound frame and reports whether the node is now owed a country
-/// lookup. The lookup itself is an outbound request and happens off this path;
-/// see `locate`.
-fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
+/// Handles one inbound frame and returns the address a country lookup is now
+/// owed for, if any. The lookup itself is an outbound request and happens off
+/// this path; see `locate`.
+fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<Option<String>> {
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
-        "hello" => return app.db.save_facts(node_id, &rpc.params, ip),
+        "hello" => {
+            let field = |k: &str| rpc.params.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            let source =
+                country_source(ip, field("ipv4"), field("ipv6")).map_or_else(String::new, |a| a.to_string());
+            let owed = app.db.save_facts(node_id, &rpc.params, ip, &source)?;
+            return Ok(owed.then_some(source));
+        }
         "report" => report(app, node_id, rpc.params)?,
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -264,34 +286,80 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
         }
         other => debug!("node {node_id} sent unknown method {other}"),
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// Globally routable. Excluded on the v4 side: RFC 1918, CGNAT (100.64/10),
+/// loopback, link-local, 0/8, 192.0.0/24, 198.18/15 (the fake-IP range of
+/// TUN-mode proxies), multicast and reserved. On the v6 side only 2000::/3
+/// counts, which leaves out ULA, link-local and loopback.
+///
+/// The agent ranks its interface addresses by the same ranges and the panel
+/// decides by them which addresses to show; the three lists are to be changed
+/// together.
+fn public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || a == 0
+                || a >= 224
+                || (a == 100 && b & 0xc0 == 64)
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && b & 0xfe == 18))
+        }
+        IpAddr::V6(v6) => v6.segments()[0] & 0xe000 == 0x2000,
+    }
+}
+
+/// The address a node's country is looked up from: a public address on the
+/// node's own interface, v4 before v6, and failing both the address its
+/// connection arrived from. `None` when none of them is public, as where hub
+/// and node share a network; such an address has no country and is not sent to
+/// the lookup service.
+///
+/// An interface address belongs to the machine. The connection's source may
+/// belong to whatever stands in front of it, and on a home network behind a
+/// transparent proxy that is an exit in another country. v4 leads because a
+/// tunnelled v6, such as a tunnel broker's prefix, locates at the tunnel server
+/// rather than at the machine.
+///
+/// The interface addresses are the agent's word, so each must parse as an
+/// address of its own family before it can reach the lookup URL.
+fn country_source(ip: &str, ipv4: &str, ipv6: &str) -> Option<IpAddr> {
+    let v4 = ipv4.parse::<Ipv4Addr>().ok().map(IpAddr::V4);
+    let v6 = ipv6.parse::<Ipv6Addr>().ok().map(IpAddr::V6);
+    [v4, v6, ip.parse().ok()].into_iter().flatten().find(|a| public(*a))
 }
 
 /// When each node was last looked up.
 ///
 /// A failed lookup leaves the country column empty, so `save_facts` continues to
-/// report the node as owed one; without this gate an agent reconnecting every few
-/// seconds -- a poor link, or two machines sharing a token -- would issue one
-/// outbound request per reconnect indefinitely. Keying on the address cannot
-/// cover the second case: the two machines connect from different addresses, so
-/// every reconnect reads as a new question and the gate never closes. Only the
-/// time is recorded. The cost is that a node genuinely changing address within
-/// the hour waits for its next hello to acquire a badge, and an empty column is
-/// already a permitted state.
+/// report the node as owed one and `serve` retries it on every heartbeat; without
+/// this gate that would be an outbound request every 30 seconds, and an agent
+/// reconnecting every few seconds -- a poor link, or two machines sharing a
+/// token -- would add one per reconnect. Keying on the address cannot cover the
+/// second case: the two machines report different addresses, so every reconnect
+/// reads as a new question and the gate never closes. Only the time is
+/// recorded. The cost is that a node genuinely changing address within the hour
+/// acquires its badge when the hour is up, and an empty column is already a
+/// permitted state.
 static ASKED: OnceLock<Mutex<HashMap<i64, Instant>>> = OnceLock::new();
 const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 
-/// Resolves the address a node connects from to a country, at most once per hour
-/// per node.
+/// Resolves a node's lookup address (see [`country_source`]) to a country, at
+/// most once per hour per node.
 ///
 /// The answer comes from a third party and appears on the public page, so only
-/// two ASCII letters are ever stored. Anything else -- a private address where
-/// agent and hub share a network, an outage, a rate limit -- leaves the column
-/// empty and the badge hidden.
+/// two ASCII letters are ever stored. Anything else -- an outage, a rate limit,
+/// an address the service cannot place -- leaves the column empty and the badge
+/// hidden until the retry.
 ///
 /// ponytail: no backoff beyond that one window, and the record is per process. A
 /// hub restart repeats the lookup once per node.
-fn locate(app: Shared, node_id: i64, ip: String) {
+fn locate(app: Shared, node_id: i64, source: String) {
     let mut asked = ASKED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     if asked.get(&node_id).is_some_and(|at| at.elapsed() < LOCATE_RETRY) {
         return;
@@ -301,17 +369,17 @@ fn locate(app: Shared, node_id: i64, ip: String) {
 
     tokio::spawn(async move {
         let lookup = async {
-            let url = format!("https://ipinfo.io/{ip}/country");
+            let url = format!("https://ipinfo.io/{source}/country");
             anyhow::Ok(app.http.get(url).send().await?.error_for_status()?.text().await?)
         };
         let cc = match lookup.await {
             Ok(body) => body.trim().to_ascii_uppercase(),
-            Err(e) => return debug!("node {node_id}: no country for {ip}: {e:#}"),
+            Err(e) => return debug!("node {node_id}: no country for {source}: {e:#}"),
         };
         if cc.len() != 2 || !cc.bytes().all(|b| b.is_ascii_uppercase()) {
-            return debug!("node {node_id}: {ip} resolved to no country");
+            return debug!("node {node_id}: {source} resolved to no country");
         }
-        if let Err(e) = app.db.set_country(node_id, &cc, &ip) {
+        if let Err(e) = app.db.set_country(node_id, &cc, &source) {
             warn!("node {node_id}: storing country {cc} failed: {e:#}");
         }
     });
@@ -740,6 +808,44 @@ mod tests {
         assert_eq!(n.hostname, "vps-1");
         assert_eq!(n.cpu_cores, 4);
         assert_eq!(n.ip, "198.51.100.4");
+    }
+
+    /// The country follows the machine rather than whatever stands in front of
+    /// it. The two cases from the field: an LXC NAT guest connecting over v6,
+    /// and a home host whose gateway proxies the connection to the hub abroad.
+    #[test]
+    fn the_country_is_looked_up_from_an_address_the_machine_holds() {
+        let source = |ip, v4, v6| country_source(ip, v4, v6).map(|a| a.to_string());
+        let some = |s: &str| Some(s.to_owned());
+        // NAT: the private interface has no country, the connection does.
+        assert_eq!(source("203.0.113.7", "10.10.1.5", ""), some("203.0.113.7"));
+        // An old agent reporting the ULA ahead of the public /128.
+        assert_eq!(source("2401:b60:1c::5", "10.10.1.5", "fd42:43af::1"), some("2401:b60:1c::5"));
+        // Behind a transparent proxy: the machine's own v6 wins over the exit.
+        assert_eq!(source("198.51.100.77", "192.168.1.5", "2409:8a1e::5"), some("2409:8a1e::5"));
+        // A public v4 on the interface leads a tunnelled v6.
+        assert_eq!(source("2001:470::5", "198.51.100.4", "2001:470::5"), some("198.51.100.4"));
+        // Hub and node on one network: nothing to look up.
+        assert_eq!(source("192.168.1.2", "192.168.1.5", "fd00::5"), None);
+        assert_eq!(source("100.64.0.9", "198.18.0.1", ""), None, "CGNAT and a TUN proxy are not public");
+        // The agent's fields reach a URL, so each must be an address of its family.
+        assert_eq!(source("192.168.1.2", "2409:8a1e::5", "198.51.100.4"), None, "families swapped");
+        assert_eq!(source("192.168.1.2", "1.1.1.1/../x", "2409:8a1e::5/x"), None);
+    }
+
+    #[test]
+    fn a_hello_owes_a_lookup_only_for_a_public_source_without_a_country() {
+        let app = app();
+        let id = node(&app);
+        let hello = |ipv4: &str, ipv6: &str| {
+            json!({"jsonrpc": "2.0", "method": "hello", "params": {"ipv4": ipv4, "ipv6": ipv6}}).to_string()
+        };
+        let owed = dispatch(&app, id, "198.51.100.77", &hello("192.168.1.5", "2409:8a1e::5")).unwrap();
+        assert_eq!(owed.as_deref(), Some("2409:8a1e::5"));
+        app.db.set_country(id, "CN", "2409:8a1e::5").unwrap();
+        assert_eq!(dispatch(&app, id, "198.51.100.88", &hello("192.168.1.5", "2409:8a1e::5")).unwrap(), None);
+        assert_eq!(app.db.node(id).unwrap().unwrap().country, "CN", "a new proxy exit changes nothing");
+        assert_eq!(dispatch(&app, id, "192.168.1.2", &hello("192.168.1.5", "")).unwrap(), None);
     }
 
     #[test]
