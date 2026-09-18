@@ -218,38 +218,78 @@ function NodeForm({ node, onClose, onSaved }: {
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-5">
-          <Field label="名称">
-            <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
-          </Field>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="每月流量额度 (GB)" hint="留空或 0 不限">
-              <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
-            </Field>
-            <Field label="流量计算方式">
-              <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
-                    <SelectItem key={k} value={k}>{v}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </Field>
-          </div>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="每月重置日" hint="1–31。本月流量按新周期重算，总流量不变">
-              <Input type="number" min={1} max={31} value={form.traffic_reset_day} onChange={(e) => set("traffic_reset_day", Number(e.target.value))} />
-            </Field>
-            <Field label="备注" hint="仅管理员可见">
-              <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途" />
-            </Field>
-          </div>
-          <div className="space-y-2">
+        <div className="space-y-6">
+          <section className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="名称">
+                <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
+              </Field>
+              <Field label="备注">
+                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途，仅管理员可见" />
+              </Field>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+                <span>
+                  <span className="block font-medium">公开显示</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">关闭后只在管理后台可见</span>
+                </span>
+                <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
+              </label>
+              <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+                <span>
+                  <span className="block font-medium">离线通知</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期、恢复时各推一条</span>
+                </span>
+                <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
+              </label>
+            </div>
+          </section>
+          <section className="space-y-3 border-t pt-5">
+            <h3 className="text-sm font-medium">流量</h3>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field label="每月额度 (GB)" hint="留空或 0 不限">
+                <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
+              </Field>
+              <Field label="计算方式">
+                <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
+                      <SelectItem key={k} value={k}>{v}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field label="每月重置日" hint="1–31，改后本月重算，总量不变">
+                <Input type="number" min={1} max={31} value={form.traffic_reset_day} onChange={(e) => set("traffic_reset_day", Number(e.target.value))} />
+              </Field>
+            </div>
+            <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
+              <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
+              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                按 GB 填入需要校正的值，未修改的计数器继续正常累计。
+              </p>
+              <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                {TRAFFIC_FIELDS.map(([key, label]) => (
+                  <Field key={key} label={`${label} (GB)`}>
+                    <Input
+                      type="number"
+                      step="0.001"
+                      value={traffic[key]}
+                      onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
+                    />
+                  </Field>
+                ))}
+              </div>
+            </details>
+          </section>
+          <section className="space-y-3 border-t pt-5">
+            <h3 className="text-sm font-medium">地址与地区</h3>
             <div className="grid gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
               <Field label="IPv4">
                 <Input value={form.ipv4_pin ?? ""} onChange={(e) => set("ipv4_pin", e.target.value)} placeholder={`自动：${automatic(false)}`} />
@@ -267,41 +307,9 @@ function NodeForm({ node, onClose, onSaved }: {
               </Field>
             </div>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              留空为自动。自动判断不了时手动填写（国家/地区填两位代码，如 CN）；填了就一直显示这个值，IP 变了要自己改。
+              留空为自动。国家/地区填两位代码，如 CN；手填的值会一直显示，IP 变了要自己改。
             </p>
-          </div>
-          <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
-            <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
-            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              按 GB 填入需要校正的值，未修改的计数器继续正常累计。
-            </p>
-            <div className="mt-3 grid gap-4 sm:grid-cols-2">
-              {TRAFFIC_FIELDS.map(([key, label]) => (
-                <Field key={key} label={`${label} (GB)`}>
-                  <Input
-                    type="number"
-                    step="0.001"
-                    value={traffic[key]}
-                    onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
-                  />
-                </Field>
-              ))}
-            </div>
-          </details>
-          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-            <span>
-              <span className="block font-medium">公开显示</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">关闭后只在管理后台可见</span>
-            </span>
-            <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
-          </label>
-          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-            <span>
-              <span className="block font-medium">离线通知</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期推送一条，恢复在线时再推一条</span>
-            </span>
-            <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
-          </label>
+          </section>
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>取消</Button>
