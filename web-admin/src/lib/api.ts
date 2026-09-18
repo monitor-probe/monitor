@@ -134,9 +134,12 @@ export function addresses(node: Pick<Node, "ip" | "ipv4" | "ipv6">): string[] {
   return (v6 ? [ipv4, ip, ipv6] : [ip, ipv4, ipv6]).filter(Boolean)
 }
 
-/** An address the node does not hold: the exit its connection to the hub leaves by. */
+/**
+ * An address the node does not hold: the exit its connection to the hub leaves by.
+ * Unknown for a node that reported no interface address, where `ip` may well be its own.
+ */
 export function isExit(node: Pick<Node, "ip" | "ipv4" | "ipv6">, address: string): boolean {
-  return address === node.ip && address !== node.ipv4 && address !== node.ipv6
+  return !!(node.ipv4 || node.ipv6) && address === node.ip && address !== node.ipv4 && address !== node.ipv6
 }
 
 /** Installation commands require a TLS origin with a domain, never an IP. */

@@ -44,6 +44,7 @@ assert.deepEqual(addresses({ ip: "198.18.0.1", ipv4: "192.168.1.5" }), ["192.168
 assert.deepEqual(addresses({ ip: "203.0.113.7", ipv4: "198.18.0.1" }), ["203.0.113.7", "198.18.0.1"])
 // Without interface addresses `ip` is all there is; without a connection, the interfaces are.
 assert.deepEqual(addresses({ ip: "203.0.113.7" }), ["203.0.113.7"])
+assert.ok(!isExit({ ip: "203.0.113.7" }, "203.0.113.7"), "with no interface reported, nothing says the address is not the machine's")
 assert.deepEqual(addresses({ ipv4: "10.0.0.2" }), ["10.0.0.2"])
 assert.deepEqual(addresses({}), [])
 for (const ip of ["10.0.0.1", "172.31.0.1", "192.168.0.1", "100.64.0.1", "127.0.0.1", "169.254.0.1", "0.0.0.1", "192.0.0.4", "198.19.0.1", "224.0.0.1", "fd42::1", "fe80::1", "::1"]) {
