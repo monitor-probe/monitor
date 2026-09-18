@@ -456,7 +456,7 @@ pub struct Traffic {
     pub day_tx: i64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PingTask {
     #[serde(default)]
     pub id: i64,
@@ -1126,9 +1126,10 @@ impl Db {
     /// in step; the agent's copy is the backstop rather than the message.
     const MAX_PROBES_PER_NODE: i64 = 64;
 
-    /// The assignments are replaced wholesale, so they run in one transaction:
-    /// failing between the delete and the inserts would unassign every node from
-    /// a probe the panel still lists them under.
+    /// Replaces the assignments wholesale, or with `base` applies only what
+    /// changed from it. Either way in one transaction: failing between the
+    /// deletes and the inserts would unassign nodes from a probe the panel still
+    /// lists them under.
     pub fn save_ping_task(&self, t: &PingTask) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1175,7 +1176,7 @@ impl Db {
             .with_context(|| format!("节点 {node} 不存在"))?;
         }
         // Queried from the table after the rows are in rather than counted from
-        // the request: an update replaces this task's own assignments, so
+        // the request: an update changes this task's own assignments, so
         // arithmetic on the way in would have to subtract them again. The
         // transaction makes this atomic with the write, and bailing here rolls it
         // back.
