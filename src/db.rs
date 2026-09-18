@@ -882,9 +882,10 @@ impl Db {
 
     /// Folds one report's raw kernel counters into the node's running totals.
     ///
-    /// A changed boot_id, or a counter that moved backwards, means the kernel
-    /// restarted its counting; the total must not follow it downward. `None`
-    /// denotes a report carrying no readable counters at all -- see below.
+    /// A changed boot_id, or a counter that moved backwards, means the readings
+    /// no longer continue the previous ones; the total must not follow them
+    /// downward. `None` denotes a report carrying no readable counters at all --
+    /// see below.
     ///
     /// The billing reset day is read here rather than passed in: it is one join
     /// from a row this already reads, and fetching it separately would cost every
@@ -935,10 +936,11 @@ impl Db {
         // first report has none. A reading that shrank under the same boot lost
         // one -- an interface included in the sum has disappeared -- so the
         // reading is the remainder of that history and booking it would count it
-        // twice. A changed boot_id means the counters restarted or,
-        // indistinguishably from here, that a second machine shares the token.
-        // Realigning costs the seconds since the reboot; the alternative costs
-        // hundreds of gigabytes against a total that only increases.
+        // twice. A changed boot_id means the counters restarted, that the agent
+        // now sums a different set of interfaces (it appends its --iface list),
+        // or, indistinguishably from here, that a second machine shares the
+        // token. Realigning costs the seconds since the reboot; the alternative
+        // costs hundreds of gigabytes against a total that only increases.
         //
         // A fourth case: no reading at all. The row is left exactly as it was,
         // since writing zero would realign the baseline to zero and book the next

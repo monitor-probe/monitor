@@ -20,6 +20,8 @@ LOG_FILE="/var/log/monitor-agent.log"
 SERVER=""
 TOKEN=""
 REGISTER=""
+IFACE=""
+IFACE_SET=""
 INTERVAL=1
 INSECURE=""
 UNINSTALL=""
@@ -28,13 +30,14 @@ while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --interval)
+	--server | --token | --register | --iface | --interval)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
 	--server) SERVER="$2"; shift 2 ;;
 	--token) TOKEN="$2"; shift 2 ;;
 	--register) REGISTER="$2"; shift 2 ;;
+	--iface) IFACE="$2"; IFACE_SET=1; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
@@ -63,12 +66,26 @@ if [ -n "$UNINSTALL" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--insecure]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
 	echo "       install.sh --uninstall" >&2
 	exit 2
 }
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
 [ "$INTERVAL" -ge 1 ] && [ "$INTERVAL" -le 3600 ] || { echo "interval must be from 1 to 3600" >&2; exit 2; }
+# Which interfaces carry this machine's traffic is known only on the machine,
+# and the batch command a fleet shares cannot carry one value per machine. A
+# rerun without --iface, the documented upgrade, therefore keeps the value in
+# the env file; --iface '' clears it. That file is root-only: without root this
+# reads nothing, and the install stops at the root check regardless.
+if [ -z "$IFACE_SET" ]; then
+	IFACE=$(sed -n 's/^MONITOR_IFACE=//p' "$ENV_FILE" 2>/dev/null || true)
+	[ -z "$IFACE" ] || echo "keeping --iface $IFACE from the previous install"
+fi
+# OpenRC sources the env file as shell, so the value is held to what names,
+# commas, a leading `-` and a trailing `*` require.
+case "$IFACE" in
+*[!A-Za-z0-9._*,-]*) echo "--iface takes interface names separated by commas, not: $IFACE" >&2; exit 2 ;;
+esac
 # A bare host implies TLS, matching the upgrade the agent's ws_url() performs,
 # and the same reversal under --insecure where the hub has no TLS to upgrade to.
 # Without this the two diverge: the agent would dial wss:// while curl below
@@ -233,6 +250,7 @@ install -m 0755 "$TMP" "$BIN"
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 ENV
+	[ -z "$IFACE" ] || echo "MONITOR_IFACE=$IFACE" >>"$ENV_FILE"
 )
 
 if [ "$INIT" = openrc ]; then
