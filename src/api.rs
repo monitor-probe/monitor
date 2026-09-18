@@ -502,6 +502,16 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
 /// accepted a whole `Node` unchecked, leaving the values the update path refuses
 /// reachable by another route, and an out-of-range reset day remained harmless
 /// only because `period_start` clamps what it reads.
+fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -> Option<&'static str> {
+    if reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
+        return Some("reset day must be from 1 to 31");
+    }
+    if price.is_some_and(|v| !v.is_finite() || v < 0.0) || limit.is_some_and(|v| v < 0) {
+        return Some("price and traffic limit must be non-negative");
+    }
+    None
+}
+
 /// Normalizes the values set by hand, or names the one that cannot stand. Each
 /// takes the place of an automatic value, so it is held to what that value would
 /// have to be: the country to the rule a looked-up one passes, as both reach the
@@ -528,16 +538,6 @@ fn pins(node: &mut NodePatch) -> Option<&'static str> {
             Err(_) if v6 => return Some("IPv6 must be an IPv6 address, or empty"),
             Err(_) => return Some("IPv4 must be an IPv4 address, or empty"),
         };
-    }
-    None
-}
-
-fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -> Option<&'static str> {
-    if reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
-        return Some("reset day must be from 1 to 31");
-    }
-    if price.is_some_and(|v| !v.is_finite() || v < 0.0) || limit.is_some_and(|v| v < 0) {
-        return Some("price and traffic limit must be non-negative");
     }
     None
 }
