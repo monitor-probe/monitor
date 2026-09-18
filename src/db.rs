@@ -457,9 +457,10 @@ pub struct Traffic {
 }
 
 impl Traffic {
-    /// This period's usage as the node's plan meters it. The traffic alert and
-    /// every page showing usage against the limit read this one figure, so the
-    /// number an alert quotes is the number on screen.
+    /// This period's usage as the node's plan meters it. Summing both directions
+    /// regardless would hold a plan billed on upload alone against the wrong
+    /// figure. The traffic alert and `node_view` both read this, so the
+    /// percentage an alert quotes matches the usage the pages show.
     pub fn month_used(&self, traffic_mode: &str) -> i64 {
         match traffic_mode {
             "up" => self.month_tx,
