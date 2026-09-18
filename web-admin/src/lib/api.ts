@@ -50,6 +50,8 @@ export type Node = {
   total_tx: number
   month_rx: number
   month_tx: number
+  /** This period's usage as the plan meters it (`traffic_mode`), computed by the hub. */
+  month_used: number
   month_start: string
   /** Panel only. */
   hostname?: string

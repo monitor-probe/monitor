@@ -46,20 +46,3 @@ export const CYCLES: Record<string, string> = {
   triennial: "三年付",
   once: "一次性",
 }
-
-/**
- * Usage counted as the plan bills it: summing both directions unconditionally
- * would measure a node billed on upload alone against the wrong figure.
- */
-export function monthUsage(node: { month_rx: number; month_tx: number; traffic_mode: string }): number {
-  switch (node.traffic_mode) {
-    case "up":
-      return node.month_tx
-    case "down":
-      return node.month_rx
-    case "max":
-      return Math.max(node.month_rx, node.month_tx)
-    default:
-      return node.month_rx + node.month_tx
-  }
-}

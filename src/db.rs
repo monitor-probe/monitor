@@ -456,6 +456,20 @@ pub struct Traffic {
     pub day_tx: i64,
 }
 
+impl Traffic {
+    /// This period's usage as the node's plan meters it. The traffic alert and
+    /// every page showing usage against the limit read this one figure, so the
+    /// number an alert quotes is the number on screen.
+    pub fn month_used(&self, traffic_mode: &str) -> i64 {
+        match traffic_mode {
+            "up" => self.month_tx,
+            "down" => self.month_rx,
+            "max" => self.month_rx.max(self.month_tx),
+            _ => self.month_rx.saturating_add(self.month_tx),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PingTask {
     #[serde(default)]
@@ -2126,6 +2140,13 @@ mod tests {
         assert_eq!((t.month_rx, t.month_tx), (0, 0), "last period's bytes are not this period's");
         assert_eq!(t.month_start, period_start(Local::now().date_naive(), 1).to_string());
         assert_eq!((t.total_rx, t.total_tx), (8_000, 4_000), "the lifetime total never resets");
+    }
+
+    /// Received 3, sent 5. "up" is the node's upload, which it sends.
+    #[test]
+    fn usage_is_counted_the_way_the_plan_meters_it() {
+        let t = Traffic { month_rx: 3, month_tx: 5, ..Default::default() };
+        assert_eq!(["sum", "up", "down", "max"].map(|mode| t.month_used(mode)), [8, 5, 3, 5]);
     }
 
     #[test]

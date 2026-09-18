@@ -569,12 +569,7 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let traffic = if percent > 0 && armed { app.db.all_traffic() } else { HashMap::new() };
     for node in nodes.iter().filter(|n| n.traffic_limit > 0) {
         let Some(t) = traffic.get(&node.id) else { continue };
-        let used = match node.traffic_mode.as_str() {
-            "up" => t.month_tx,
-            "down" => t.month_rx,
-            "max" => t.month_rx.max(t.month_tx),
-            _ => t.month_rx.saturating_add(t.month_tx),
-        };
+        let used = t.month_used(&node.traffic_mode);
         // i128: 100 × a limit near i64::MAX would overflow.
         let reached = |p: i64| used as i128 * 100 >= node.traffic_limit as i128 * p as i128;
         let step = if reached(100) {
