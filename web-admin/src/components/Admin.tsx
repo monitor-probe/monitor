@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -862,31 +862,131 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   )
 }
 
-function Ping({ nodes }: { nodes: Node[] }) {
-  const [tasks, setTasks] = useState<PingTask[]>([])
-  const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
-  const [deleting, setDeleting] = useState<PingTask | null>(null)
+function PingForm({ task, nodes, onClose, onSaved }: {
+  task: Partial<PingTask>
+  nodes: Node[]
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [form, setForm] = useState(task)
+  const [query, setQuery] = useState("")
   const [saving, setSaving] = useState(false)
-  const [removing, setRemoving] = useState(false)
+  // The unfiltered list's height, held as its floor: the dialog is centred, so a
+  // shrinking list would move the search box out from under the cursor.
+  const [listHeight, setListHeight] = useState(0)
+  const chosen = new Set(form.nodes)
+  const needle = query.trim().toLowerCase()
+  const visible = needle ? nodes.filter((n) => n.name.toLowerCase().includes(needle)) : nodes
+  const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
 
-  const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
-  useEffect(() => { load() }, [])
+  // 全选 and 全不选 act on the rows in view, so a search narrows what they touch.
+  const pick = (list: Node[], on: boolean) =>
+    setForm((f) => {
+      const next = new Set(f.nodes)
+      for (const n of list) {
+        if (on) next.add(n.id)
+        else next.delete(n.id)
+      }
+      return { ...f, nodes: [...next] }
+    })
 
   async function save() {
-    if (!editing) return
-    if (!editing.name?.trim() || !editing.target?.trim()) return toast.error("请填写名称和目标")
+    if (!form.name?.trim() || !form.target?.trim()) return toast.error("请填写名称和目标")
     setSaving(true)
     try {
-      await api("/ping-tasks", { method: "POST", body: JSON.stringify(editing) })
+      await api("/ping-tasks", { method: "POST", body: JSON.stringify(form) })
       toast.success("已保存，正在下发")
-      setEditing(null)
-      load()
+      onClose()
+      onSaved()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       setSaving(false)
     }
   }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{task.id ? "编辑监控" : "添加监控"}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-6">
+          {/* Name and interval share a row on a phone, with the target below. */}
+          <section className="grid grid-cols-[1fr_6rem] gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
+            <Field label="名称">
+              {/* A new monitor starts empty, so the cursor belongs here;
+                  editing an existing one starts with nothing selected. */}
+              <Input autoFocus={!task.id} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
+            </Field>
+            <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接" className="order-last col-span-full sm:order-none sm:col-span-1">
+              <Input value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />
+            </Field>
+            <Field label="间隔（秒）" hint="5–3600">
+              {/* An emptied number box reads back as "", and Number("") is 0,
+                  which the hub refuses. */}
+              <Input type="number" min="5" max="3600" value={form.interval ?? 60} onChange={(e) => setForm({ ...form, interval: Number(e.target.value) || 60 })} />
+            </Field>
+          </section>
+          <section className="space-y-3 border-t pt-5">
+            <div className="flex items-baseline justify-between gap-2">
+              <h3 className="text-sm font-medium">运行节点</h3>
+              <span className="tnum text-xs text-muted-foreground">已选 {chosen.size} / {nodes.length}</span>
+            </div>
+            <div className="rounded-lg border">
+              <div className="flex items-center gap-1 border-b p-2">
+                <div className="relative min-w-0 flex-1">
+                  <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input className="h-8 pl-8" placeholder="搜索节点名称" aria-label="搜索节点" value={query} onChange={(e) => setQuery(e.target.value)} />
+                </div>
+                <Button size="sm" variant="ghost" disabled={visibleChosen === visible.length} onClick={() => pick(visible, true)}>全选</Button>
+                <Button size="sm" variant="ghost" disabled={visibleChosen === 0} onClick={() => pick(visible, false)}>全不选</Button>
+              </div>
+              {/* Three columns keep a few dozen nodes within one scroll; offline
+                  nodes are dimmed but remain assignable. */}
+              <div
+                ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
+                style={{ minHeight: listHeight || undefined }}
+                className="grid max-h-[min(16rem,40dvh)] grid-cols-2 content-start gap-0.5 overflow-y-auto p-1.5 sm:grid-cols-3"
+              >
+                {visible.map((n) => (
+                  <label key={n.id} title={n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+                    <input type="checkbox" checked={chosen.has(n.id)} onChange={(e) => pick([n], e.target.checked)} className="shrink-0 accent-primary" />
+                    <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
+                    {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
+                  </label>
+                ))}
+                {!visible.length && (
+                  <p className="col-span-full p-2 text-xs text-muted-foreground">{nodes.length ? "没有匹配的节点" : "先添加节点"}</p>
+                )}
+              </div>
+            </div>
+            <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+              <span>
+                <span className="block font-medium">新节点自动加入</span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">以后添加的节点自动运行此监控，已有节点按上面的勾选</span>
+              </span>
+              <Switch checked={!!form.auto_join} onCheckedChange={(v) => setForm({ ...form, auto_join: v })} />
+            </label>
+          </section>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button onClick={save} disabled={saving}>保存</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function Ping({ nodes }: { nodes: Node[] }) {
+  const [tasks, setTasks] = useState<PingTask[]>([])
+  const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
+  const [deleting, setDeleting] = useState<PingTask | null>(null)
+  const [removing, setRemoving] = useState(false)
+
+  const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
+  useEffect(() => { load() }, [])
 
   async function remove() {
     if (!deleting) return
@@ -903,17 +1003,10 @@ function Ping({ nodes }: { nodes: Node[] }) {
     }
   }
 
-  const toggle = (id: number) =>
-    setEditing((t) => {
-      if (!t) return t
-      const nodes = t.nodes ?? []
-      return { ...t, nodes: nodes.includes(id) ? nodes.filter((n) => n !== id) : [...nodes, id] }
-    })
-
   return (
     <div className="space-y-4">
       <div className="flex justify-end">
-        <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: [] })}>
+        <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: nodes.map((n) => n.id), auto_join: true })}>
           <Plus /> 添加监控
         </Button>
       </div>
@@ -922,10 +1015,10 @@ function Ping({ nodes }: { nodes: Node[] }) {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-[24%]">名称</TableHead>
-              <TableHead className="w-[40%]">目标</TableHead>
-              <TableHead className="w-[12%]">间隔</TableHead>
-              <TableHead className="w-[12%]">节点</TableHead>
+              <TableHead className="w-[22%]">名称</TableHead>
+              <TableHead className="w-[34%]">目标</TableHead>
+              <TableHead className="w-[10%]">间隔</TableHead>
+              <TableHead className="w-[22%]">节点</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -935,7 +1028,10 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 <TableCell className="font-medium">{t.name}</TableCell>
                 <TableCell className="tnum text-sm">{t.target}</TableCell>
                 <TableCell className="tnum text-sm">{t.interval}s</TableCell>
-                <TableCell className="text-sm text-muted-foreground">{t.nodes.length} 个</TableCell>
+                <TableCell className="text-sm whitespace-nowrap text-muted-foreground">
+                  {t.nodes.length > 0 && t.nodes.length === nodes.length ? "全部" : `${t.nodes.length} 个`}
+                  {t.auto_join && <Badge variant="outline" className="ml-2 font-normal">自动加入</Badge>}
+                </TableCell>
                 <TableCell className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" onClick={() => setEditing(t)} title="编辑监控" aria-label="编辑监控"><Pencil /></Button>
                   <Button variant="ghost" size="icon" onClick={() => setDeleting(t)} title="删除监控" aria-label="删除监控">
@@ -955,51 +1051,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
         </Table>
       </Card>
 
-      {editing && (
-        <Dialog open onOpenChange={(open) => !open && setEditing(null)}>
-          <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
-            <DialogHeader>
-              <DialogTitle>{editing.id ? "编辑监控" : "添加监控"}</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-5">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="名称">
-                  {/* A new monitor starts empty, so the cursor belongs here;
-                      editing an existing one starts with nothing selected. */}
-                  <Input autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
-                </Field>
-                <Field label="间隔（秒）" hint="5–3600">
-                  {/* `|| 60`, as the three other number boxes on this page do:
-                      an emptied `type="number"` reads back as "", and Number("")
-                      is 0 -- which the hub used to clamp into a 5-second probe on
-                      every assigned node. It refuses that now, so this keeps a
-                      cleared box from being a round trip to an error. */}
-                  <Input type="number" min="5" max="3600" value={editing.interval ?? 60} onChange={(e) => setEditing({ ...editing, interval: Number(e.target.value) || 60 })} />
-                </Field>
-              </div>
-              <Field label="目标地址" hint="host:port">
-                <Input value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
-              </Field>
-              <div className="space-y-2">
-                <Label className="text-sm font-medium">运行节点</Label>
-                <div className="max-h-48 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
-                  {nodes.map((n) => (
-                    <label key={n.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-background">
-                      <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="accent-primary" />
-                      {n.name}
-                    </label>
-                  ))}
-                  {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
-                </div>
-              </div>
-            </div>
-            <DialogFooter>
-              <Button variant="ghost" onClick={() => setEditing(null)}>取消</Button>
-              <Button onClick={save} disabled={saving}>保存</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      )}
+      {editing && <PingForm task={editing} nodes={nodes} onClose={() => setEditing(null)} onSaved={load} />}
       {deleting && (
         <ConfirmDialog
           title={`删除监控「${deleting.name}」？`}

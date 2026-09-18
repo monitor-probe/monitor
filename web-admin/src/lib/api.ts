@@ -72,7 +72,7 @@ export type Node = {
   notify?: boolean
 }
 
-export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[] }
+export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[]; auto_join: boolean }
 
 /** Form snapshots must never overwrite fields the user did not edit. */
 export function changes<T extends object>(initial: T, values: Partial<T>): Partial<T> {

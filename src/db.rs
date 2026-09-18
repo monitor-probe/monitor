@@ -110,7 +110,8 @@ CREATE TABLE IF NOT EXISTS ping_task (
   id       INTEGER PRIMARY KEY,
   name     TEXT    NOT NULL,
   target   TEXT    NOT NULL,
-  interval INTEGER NOT NULL DEFAULT 60
+  interval INTEGER NOT NULL DEFAULT 60,
+  auto_join INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ping_node (
@@ -148,7 +149,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -261,6 +262,10 @@ fn migrate_to_5(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_6(conn: &Connection) -> Result<()> {
+    add_column(conn, "ping_task", "auto_join INTEGER NOT NULL DEFAULT 0")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -288,6 +293,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 5 {
         migrate_to_5(&tx)?;
+    }
+    if from < 6 {
+        migrate_to_6(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -458,6 +466,10 @@ pub struct PingTask {
     pub interval: i64,
     #[serde(default)]
     pub nodes: Vec<i64>,
+    /// Nodes created later are assigned this probe as they are added. Existing
+    /// nodes follow `nodes` alone.
+    #[serde(default)]
+    pub auto_join: bool,
 }
 
 /// Restricts the database to its owner.
@@ -605,6 +617,10 @@ impl Db {
         )?;
         let id = tx.last_insert_rowid();
         tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
+        tx.execute(
+            "INSERT INTO ping_node (task_id, node_id) SELECT id, ?1 FROM ping_task WHERE auto_join",
+            [id],
+        )?;
         tx.commit()?;
         Ok(id)
     }
@@ -1063,7 +1079,8 @@ impl Db {
 
     pub fn ping_tasks(&self) -> Result<Vec<PingTask>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id, name, target, interval FROM ping_task ORDER BY id")?;
+        let mut stmt =
+            conn.prepare("SELECT id, name, target, interval, auto_join FROM ping_task ORDER BY id")?;
         let tasks: Vec<PingTask> = stmt
             .query_map([], |r| {
                 Ok(PingTask {
@@ -1072,6 +1089,7 @@ impl Db {
                     target: r.get(2)?,
                     interval: r.get(3)?,
                     nodes: Vec::new(),
+                    auto_join: r.get(4)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1107,14 +1125,14 @@ impl Db {
         let tx = conn.transaction()?;
         let id = if t.id > 0 {
             tx.execute(
-                "UPDATE ping_task SET name=?2, target=?3, interval=?4 WHERE id=?1",
-                params![t.id, t.name, t.target, t.interval],
+                "UPDATE ping_task SET name=?2, target=?3, interval=?4, auto_join=?5 WHERE id=?1",
+                params![t.id, t.name, t.target, t.interval, t.auto_join],
             )?;
             t.id
         } else {
             tx.execute(
-                "INSERT INTO ping_task (name, target, interval) VALUES (?1,?2,?3)",
-                params![t.name, t.target, t.interval],
+                "INSERT INTO ping_task (name, target, interval, auto_join) VALUES (?1,?2,?3,?4)",
+                params![t.name, t.target, t.interval, t.auto_join],
             )?;
             tx.last_insert_rowid()
         };
@@ -1140,6 +1158,15 @@ impl Db {
         if let Some(node) = crowded {
             anyhow::bail!(
                 "节点 {node} 会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
+                Self::MAX_PROBES_PER_NODE
+            );
+        }
+        // The next node created receives every auto-joining probe at once.
+        let joining: i64 =
+            tx.query_row("SELECT COUNT(*) FROM ping_task WHERE auto_join", [], |r| r.get(0))?;
+        if joining > Self::MAX_PROBES_PER_NODE {
+            anyhow::bail!(
+                "新节点会自动加入 {joining} 个探测任务，agent 最多只跑 {} 个",
                 Self::MAX_PROBES_PER_NODE
             );
         }
@@ -1835,6 +1862,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![id],
+                auto_join: false,
             })
             .unwrap();
         db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
@@ -2085,8 +2113,14 @@ mod tests {
     fn deleting_a_node_takes_its_data_with_it() {
         let db = db();
         let id = node(&db, 1);
-        let probe =
-            |nodes| PingTask { id: 0, name: "cm".into(), target: "1.1.1.1:443".into(), interval: 60, nodes };
+        let probe = |nodes| PingTask {
+            id: 0,
+            name: "cm".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes,
+            auto_join: false,
+        };
         let task = db.save_ping_task(&probe(vec![id])).unwrap();
         db.accumulate(id, "b", Some((10, 10))).unwrap();
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
@@ -2119,6 +2153,7 @@ mod tests {
             target: "1.1.1.1:443".into(),
             interval: 60,
             nodes: vec![id],
+            auto_join: false,
         };
         let old = db.save_ping_task(&probe("tokyo")).unwrap();
         db.insert_ping(id, old, 1, 999).unwrap();
@@ -2147,6 +2182,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![mine],
+                auto_join: false,
             })
             .unwrap();
 
@@ -2508,6 +2544,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes,
+                auto_join: false,
             })
             .unwrap()
         };
@@ -2545,6 +2582,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![a, b],
+                auto_join: false,
             })
             .unwrap();
         assert_eq!(db.ping_tasks_for(a).unwrap().len(), 1);
@@ -2556,10 +2594,42 @@ mod tests {
             target: "1.1.1.1:443".into(),
             interval: 30,
             nodes: vec![a],
+            auto_join: false,
         })
         .unwrap();
         assert_eq!(db.ping_tasks_for(b).unwrap().len(), 0);
         assert_eq!(db.ping_tasks().unwrap()[0].interval, 30);
+    }
+
+    #[test]
+    fn an_auto_joining_probe_is_assigned_to_nodes_created_after_it() {
+        let db = db();
+        let existing = node(&db, 1);
+        let probe = |auto_join| PingTask {
+            id: 0,
+            name: "p".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![],
+            auto_join,
+        };
+        let joining = db.save_ping_task(&probe(true)).unwrap();
+        db.save_ping_task(&probe(false)).unwrap();
+        assert!(db.ping_tasks_for(existing).unwrap().is_empty(), "existing nodes follow the list alone");
+
+        let added = node(&db, 1);
+        let assigned: Vec<i64> =
+            db.ping_tasks_for(added).unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
+        assert_eq!(assigned, [joining]);
+        assert!(db.ping_tasks().unwrap()[0].auto_join);
+
+        // A new node takes every auto-joining probe at once, so their count is
+        // held to what one agent runs.
+        for _ in 1..Db::MAX_PROBES_PER_NODE {
+            db.save_ping_task(&probe(true)).unwrap();
+        }
+        assert!(db.save_ping_task(&probe(true)).is_err());
+        assert_eq!(db.ping_tasks().unwrap().len() as i64, Db::MAX_PROBES_PER_NODE + 1);
     }
 
     /// The agent caps the probe list it will run and drops the remainder with
@@ -2577,6 +2647,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes,
+                auto_join: false,
             })
         };
         for _ in 0..Db::MAX_PROBES_PER_NODE {
