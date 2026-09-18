@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS node (
   -- The address `country` belongs to: a public interface address the agent
   -- reported, else `ip`. Empty when neither is public.
   country_ip TEXT NOT NULL DEFAULT '',
+  -- Set in the panel. When not empty it is the country shown, in place of the
+  -- looked-up one, which goes on updating underneath.
+  country_pin TEXT NOT NULL DEFAULT '',
+  -- Set in the panel, each replacing the address shown for its family. Empty
+  -- means automatic. Panel only, like the reported addresses.
+  ipv4_pin TEXT NOT NULL DEFAULT '', ipv6_pin TEXT NOT NULL DEFAULT '',
   -- Survives the disconnection it describes, unlike the in-memory live entry:
   -- an offline node's page is exactly where "since when" is worth reading.
   last_seen INTEGER NOT NULL DEFAULT 0,
@@ -245,9 +251,12 @@ fn migrate_to_4(conn: &Connection) -> Result<()> {
 /// Every country stored until now was looked up from `ip`. Recording that
 /// keeps the badge of a node whose lookup address is still `ip`, and has a node
 /// whose public interface address now takes precedence looked up again at its
-/// next hello.
+/// next hello. The columns set by hand start empty: automatic.
 fn migrate_to_5(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country_ip TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "country_pin TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "ipv4_pin TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "ipv6_pin TEXT NOT NULL DEFAULT ''")?;
     conn.execute("UPDATE node SET country_ip = ip WHERE country != ''", [])?;
     Ok(())
 }
@@ -352,6 +361,18 @@ pub struct Node {
     /// it appears on the status page beside the node's name.
     #[serde(default)]
     pub country: String,
+    /// Set in the panel: two uppercase letters, or empty for the looked-up
+    /// `country`. What the status page shows is this when present.
+    #[serde(default)]
+    pub country_pin: String,
+    /// Set in the panel, in canonical form, for what neither agent nor hub can
+    /// know: the home line behind a transparent proxy, or which of several public
+    /// addresses to show. Each replaces the address shown for its family; empty
+    /// is automatic. Panel only, like `ip`.
+    #[serde(default)]
+    pub ipv4_pin: String,
+    #[serde(default)]
+    pub ipv6_pin: String,
     /// Unix seconds of the node's last report, written once a minute alongside
     /// the metric row. Zero for a node that has never reported.
     #[serde(default)]
@@ -387,6 +408,9 @@ pub struct NodePatch {
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
     pub notify: Option<bool>,
+    pub country_pin: Option<String>,
+    pub ipv4_pin: Option<String>,
+    pub ipv6_pin: Option<String>,
 }
 
 fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
@@ -608,7 +632,8 @@ impl Db {
                              remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
                              traffic_mode=COALESCE(?12,traffic_mode),
                              traffic_reset_day=COALESCE(?13,traffic_reset_day),
-                             notify=COALESCE(?14,notify)
+                             notify=COALESCE(?14,notify), country_pin=COALESCE(?15,country_pin),
+                             ipv4_pin=COALESCE(?16,ipv4_pin), ipv6_pin=COALESCE(?17,ipv6_pin)
              WHERE id=?1",
             params![
                 id,
@@ -624,7 +649,10 @@ impl Db {
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
-                n.notify
+                n.notify,
+                n.country_pin,
+                n.ipv4_pin,
+                n.ipv6_pin
             ],
         )?;
         Ok(found > 0)
@@ -1611,6 +1639,9 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
         country: s("country"),
+        country_pin: s("country_pin"),
+        ipv4_pin: s("ipv4_pin"),
+        ipv6_pin: s("ipv6_pin"),
         last_seen: n("last_seen"),
         notify: n("notify") != 0,
         down_since: n("down_since"),

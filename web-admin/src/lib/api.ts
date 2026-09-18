@@ -53,11 +53,18 @@ export type Node = {
   month_start: string
   /** Panel only. */
   hostname?: string
-  /** ISO 3166-1 alpha-2, from a public interface address, else the address the agent connects from. */
+  /** ISO 3166-1 alpha-2 as shown: the one set by hand, else the one looked up from the node's address. */
   country: string
+  /** Panel only. Set by hand; empty is automatic. */
+  country_pin?: string
+  /** Panel only. The looked-up country, which a pin hides. */
+  country_auto?: string
   ip?: string
   ipv4?: string
   ipv6?: string
+  /** Panel only. Set by hand, each replacing the address shown for its family. */
+  ipv4_pin?: string
+  ipv6_pin?: string
   remark?: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
   token?: string
@@ -110,36 +117,37 @@ export function isPublic(ip: string): boolean {
     (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)))
 }
 
-/**
- * The addresses shown for a node, v4 before v6. The agent reports one address
- * per family from its interfaces; `ip` is where its connection arrived from,
- * which the hub canonicalizes to dotted form for IPv4.
- *
- * When the interface holds only a private address in the family the connection
- * used, the machine sits behind NAT or a proxy and the connection's public
- * address, its exit, leads that family. Where the interface already holds a
- * public address, a different exit is a proxy in front of the machine; where
- * the interface holds no address of that family, the exit is a translator such
- * as NAT64 or WARP. Neither reaches the machine, so neither is shown. `ip`
- * alone is the fallback for an agent too old to report its interfaces.
- */
-export function addresses(node: Pick<Node, "ip" | "ipv4" | "ipv6">): string[] {
-  const { ip, ipv4 = "", ipv6 = "" } = node
-  const reported = [ipv4, ipv6].filter(Boolean)
-  if (!ip) return reported
-  if (!reported.length) return [ip]
-  const v6 = ip.includes(":")
-  const held = v6 ? ipv6 : ipv4
-  if (!held || held === ip || isPublic(held) || !isPublic(ip)) return reported
-  return (v6 ? [ipv4, ip, ipv6] : [ip, ipv4, ipv6]).filter(Boolean)
-}
+/** Where a shown address comes from, which the panel gives as its tooltip. */
+export type Source = "manual" | "interface" | "exit" | "connection"
 
 /**
- * An address the node does not hold: the exit its connection to the hub leaves by.
- * Unknown for a node that reported no interface address, where `ip` may well be its own.
+ * The addresses shown for a node: at most one per family, v4 first, the one the
+ * machine is reached by. The agent reports its interfaces; `ip` is where its
+ * connection arrived from, which the hub canonicalizes to dotted form for IPv4.
+ *
+ * Per family an address set by hand comes first, then a public one on the
+ * interface. Failing both, where the interface holds only a private address of
+ * the family the connection used -- NAT, or a proxy in front -- the connection's
+ * public address, its exit, stands in. An exit in a family the interface does
+ * not hold is a translator such as NAT64 or WARP and is left out.
+ *
+ * Private addresses appear only when nothing public is known, as where hub and
+ * node share a network and they are all there is. `ip` alone is the fallback
+ * for an agent reporting no interface.
  */
-export function isExit(node: Pick<Node, "ip" | "ipv4" | "ipv6">, address: string): boolean {
-  return !!(node.ipv4 || node.ipv6) && address === node.ip && address !== node.ipv4 && address !== node.ipv6
+export function addresses(
+  node: Pick<Node, "ip" | "ipv4" | "ipv6" | "ipv4_pin" | "ipv6_pin">,
+): { address: string; source: Source }[] {
+  const { ip = "", ipv4 = "", ipv6 = "", ipv4_pin = "", ipv6_pin = "" } = node
+  const family = (pin: string, held: string, v6: boolean): { address: string; source: Source } | null =>
+    pin ? { address: pin, source: "manual" }
+      : held && isPublic(held) ? { address: held, source: "interface" }
+      : held && isPublic(ip) && ip.includes(":") === v6 ? { address: ip, source: "exit" }
+      : null
+  const shown = [family(ipv4_pin, ipv4, false), family(ipv6_pin, ipv6, true)].filter((a) => a !== null)
+  if (shown.length) return shown
+  if (ipv4 || ipv6) return [ipv4, ipv6].filter(Boolean).map((address) => ({ address, source: "interface" }))
+  return ip ? [{ address: ip, source: "connection" }] : []
 }
 
 /** Installation commands require a TLS origin with a domain, never an IP. */
