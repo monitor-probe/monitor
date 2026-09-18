@@ -153,33 +153,37 @@ curl -fsSL "$URL" -o "$TMP"
 # command to provision a batch of machines. The key is valid only within the
 # window the panel opened and never becomes the credential the agent runs with.
 if [ -z "$TOKEN" ]; then
-	# Re-running the same command must not add a second node. This machine's
-	# token is already present and outlives the window that issued it, so the env
-	# file answers before the hub is consulted.
+	# Re-running the same command must not add a second node, so the token this
+	# machine already holds travels with the key. The hub returns it unchanged
+	# while it still opens a node, also after the window has closed, and
+	# otherwise registers a new one: the env file alone cannot tell a node
+	# deleted from the panel, and trusting it would keep a revoked token while
+	# this installer reported success.
 	#
-	# Only for the same hub: a token issued by hub A means nothing to hub B, and
-	# retaining it would leave the agent authenticating indefinitely against a
-	# node that was never created, with this installer reporting success.
+	# Only for the same hub: a token issued by hub A means nothing to hub B.
+	HELD=""
 	CACHED=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
 	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
-		TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
-		if [ -n "$TOKEN" ]; then
-			echo "this machine is already registered; keeping its token"
-		fi
+		HELD=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	fi
-fi
-if [ -z "$TOKEN" ]; then
 	# The hub trims and bounds this as well; here it is restricted to characters
 	# a hostname may contain, so nothing unexpected travels in the body.
 	NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
-	echo "registering $NAME with the hub"
-	TOKEN=$(curl -fsS --max-time 30 -H "Authorization: Bearer $REGISTER" \
+	TOKEN=$(curl -fsS --max-time 30 -H "Authorization: Bearer $REGISTER" -H "X-Node-Token: $HELD" \
 		--data-binary "$NAME" "${SERVER%/}/api/agent/register") || {
+		[ -z "$HELD" ] || echo "the token this machine holds no longer opens a node, so it needs a new one." >&2
 		echo "the hub refused the registration key: the window may have closed," >&2
 		echo "the key may be wrong, or it has registered enough nodes already." >&2
 		echo "open a new one from the panel's node list." >&2
 		exit 1
 	}
+	if [ "$TOKEN" = "$HELD" ]; then
+		echo "this machine is already registered; keeping its token"
+	elif [ -n "$HELD" ]; then
+		echo "its node was deleted or its token reissued; registered $NAME as a new node"
+	else
+		echo "registered $NAME with the hub"
+	fi
 fi
 
 # Stop an agent already running here before replacing its binary. The service
