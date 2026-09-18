@@ -155,10 +155,10 @@ curl -fsSL "$URL" -o "$TMP"
 if [ -z "$TOKEN" ]; then
 	# Re-running the same command must not add a second node, so the token this
 	# machine already holds travels with the key. The hub returns it unchanged
-	# while it still opens a node, also after the window has closed, and
-	# otherwise registers a new one: the env file alone cannot tell a node
-	# deleted from the panel, and trusting it would keep a revoked token while
-	# this installer reported success.
+	# while it still opens a node, also after the window has closed; otherwise
+	# the request is a new registration, which needs an open window. The env file
+	# alone cannot tell a node deleted from the panel, and trusting it would keep
+	# a revoked token while this installer reported success.
 	#
 	# Only for the same hub: a token issued by hub A means nothing to hub B.
 	HELD=""
@@ -169,20 +169,25 @@ if [ -z "$TOKEN" ]; then
 	# The hub trims and bounds this as well; here it is restricted to characters
 	# a hostname may contain, so nothing unexpected travels in the body.
 	NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
+	echo "registering $NAME with the hub"
+	# curl sends no header at all for an empty $HELD.
 	TOKEN=$(curl -fsS --max-time 30 -H "Authorization: Bearer $REGISTER" -H "X-Node-Token: $HELD" \
 		--data-binary "$NAME" "${SERVER%/}/api/agent/register") || {
-		[ -z "$HELD" ] || echo "the token this machine holds no longer opens a node, so it needs a new one." >&2
+		# 22 is an HTTP error from the hub. Any other failure never reached it,
+		# and curl has already said why.
+		[ $? -eq 22 ] || exit 1
 		echo "the hub refused the registration key: the window may have closed," >&2
 		echo "the key may be wrong, or it has registered enough nodes already." >&2
 		echo "open a new one from the panel's node list." >&2
+		[ -z "$HELD" ] || echo "if this machine's node was deleted or its token reissued, the token it holds no longer counts." >&2
 		exit 1
 	}
+	[ -n "$TOKEN" ] || { echo "the hub answered without a token" >&2; exit 1; }
 	if [ "$TOKEN" = "$HELD" ]; then
 		echo "this machine is already registered; keeping its token"
 	elif [ -n "$HELD" ]; then
-		echo "its node was deleted or its token reissued; registered $NAME as a new node"
-	else
-		echo "registered $NAME with the hub"
+		echo "the token this machine held no longer opens a node; registered as a new node."
+		echo "if that token was reissued rather than its node deleted, delete the old node in the panel."
 	fi
 fi
 

@@ -614,10 +614,15 @@ const HELD_TOKEN: &str = "x-node-token";
 /// that has never contacted the hub. A key issued by the panel, valid only within
 /// [`REGISTER_WINDOW`], serves in place of a session.
 ///
-/// One request costs a lookup on the token's unique index, two setting reads, a
-/// `COUNT`, and one transaction inserting the `node` and `traffic` rows plus a
-/// `ping_node` row per `auto_join` probe, at most 64. It makes no outbound
-/// request, and the router's 64 KiB body limit bounds the name.
+/// One request costs at most a lookup on the token's unique index, two setting
+/// reads, a `COUNT`, and one transaction inserting the `node` and `traffic` rows
+/// plus a `ping_node` row per `auto_join` probe, at most 64. It makes no outbound
+/// request, and the router's 64 KiB body limit bounds the name. Requests in flight
+/// are not gated: each step is a point read or one small transaction under the
+/// database lock, as with the token lookup of the agent handshake, and an address
+/// locked out below reaches none of them. 120 concurrent callers with the window
+/// closed move the panel's median from 1.1 ms to 2.1-2.8 ms, with or without a
+/// held token, on three cores.
 pub async fn agent_register(
     State(app): State<Shared>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -628,16 +633,6 @@ pub async fn agent_register(
     // a POSIX `sh`.
     name: String,
 ) -> Response {
-    // A rerun on a registered machine sends the token it already holds, and
-    // receives it back while it still opens a node, so the rerun adds no second
-    // node. Answered ahead of every gate below: it creates nothing, returns only
-    // what the caller already has -- as the agent handshake's 401 already
-    // reveals -- and must succeed after the window has closed. A token whose node
-    // was deleted, or which was reissued, falls through to registration.
-    let held = headers.get(HELD_TOKEN).and_then(|v| v.to_str().ok()).filter(|t| !t.is_empty());
-    if let Some(held) = held.filter(|t| matches!(app.db.node_by_token(t), Ok(Some(_)))) {
-        return held.to_owned().into_response();
-    }
     if !provisioning_allowed(&app, &headers) {
         return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
     }
@@ -647,6 +642,21 @@ pub async fn agent_register(
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
     if app.registrations.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+    }
+    // A rerun on a registered machine sends the token it already holds and
+    // receives it back while that token still opens a node, so the rerun adds no
+    // second node. Ahead of the window and the key: it creates nothing, returns
+    // only what the caller already holds -- which the 401 of the agent handshake
+    // reveals as well -- and must still succeed once the window has closed. A
+    // token whose node was deleted, or which was reissued, falls through.
+    if let Some(held) = headers.get(HELD_TOKEN).and_then(|v| v.to_str().ok()).filter(|t| !t.is_empty()) {
+        match app.db.node_by_token(held) {
+            Ok(Some(_)) => return held.to_owned().into_response(),
+            Ok(None) => {}
+            // Read as "no node", a failed lookup would register a second node for
+            // a machine whose node is intact.
+            Err(e) => return fail(e),
+        }
     }
     // One answer for both "no window is open" and "that key is wrong": the
     // difference is only useful to someone who has neither.
@@ -2382,8 +2392,11 @@ mod tests {
         let register = |key: &str, held: &str| {
             let mut headers = domain_headers();
             headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
-            // Sent empty by a machine holding no token, as the script does.
-            headers.insert(HELD_TOKEN, held.parse().unwrap());
+            // curl omits a header whose value is empty, so a machine holding no
+            // token sends none.
+            if !held.is_empty() {
+                headers.insert(HELD_TOKEN, held.parse().unwrap());
+            }
             agent_register(
                 State(app.clone()),
                 ConnectInfo("198.51.100.7:40000".parse().unwrap()),
