@@ -74,10 +74,66 @@ function Addresses({ node }: { node: Node }) {
   )
 }
 
-// Name, address and country: what a node is looked up by, on the node list and
-// in the probe editor alike.
-function matches(n: Node, needle: string) {
-  return [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country].some((v) => v?.toLowerCase().includes(needle))
+// Name, address and country: what a node is looked up by, in every node list.
+function searchNodes(nodes: Node[], query: string) {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return nodes
+  return nodes.filter((n) =>
+    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country].some((v) => v?.toLowerCase().includes(needle)))
+}
+
+function NodeSearch({ value, onChange, className = "" }: { value: string; onChange: (value: string) => void; className?: string }) {
+  return (
+    <div className={`relative ${className}`}>
+      <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+      <Input className="pl-8" placeholder="名称/地址/地区" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
+    </div>
+  )
+}
+
+// Ticks nodes in a searchable grid. 全选 and 全不选 act on the rows in view, so a
+// search narrows what they touch: search JP, then 全选. Offline nodes are dimmed
+// but remain selectable.
+function NodePicker({ nodes, chosen, onPick, disabled = false }: {
+  nodes: Node[]
+  chosen: Set<number>
+  onPick: (list: Node[], on: boolean) => void
+  disabled?: boolean
+}) {
+  const [query, setQuery] = useState("")
+  // The unfiltered list's height, held as its floor: in a centred dialog a
+  // shrinking list would move the search box out from under the cursor.
+  const [listHeight, setListHeight] = useState(0)
+  const visible = searchNodes(nodes, query)
+  const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
+  return (
+    <div className="rounded-lg border">
+      <div className="flex items-center gap-1 border-b p-2">
+        <NodeSearch className="min-w-0 flex-1" value={query} onChange={setQuery} />
+        <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
+        <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
+      </div>
+      {/* Three columns keep a few dozen nodes within one scroll. */}
+      <div
+        ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
+        // Capped like the height itself, which a min-height would otherwise
+        // override once the viewport shrinks.
+        style={{ minHeight: listHeight ? `min(${listHeight}px, 16rem, 40dvh)` : undefined }}
+        className="grid max-h-[min(16rem,40dvh)] grid-cols-2 content-start gap-0.5 overflow-y-auto p-1.5 sm:grid-cols-3"
+      >
+        {visible.map((n) => (
+          <label key={n.id} title={n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+            <input type="checkbox" checked={chosen.has(n.id)} disabled={disabled} onChange={(e) => onPick([n], e.target.checked)} className="shrink-0 accent-primary" />
+            <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
+            {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
+          </label>
+        ))}
+        {!visible.length && (
+          <p className="col-span-full p-2 text-xs text-muted-foreground">{nodes.length ? "没有匹配的节点" : "先添加节点"}</p>
+        )}
+      </div>
+    </div>
+  )
 }
 
 function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
@@ -626,8 +682,8 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   ]
   // `order` itself stays whole, because the order sent on drop is the order of
   // every node.
-  const needle = query.trim().toLowerCase()
-  const visible = needle ? order.filter((n) => matches(n, needle)) : order
+  const visible = searchNodes(order, query)
+  const searching = query.trim() !== ""
 
   async function remove() {
     if (!deleting) return
@@ -676,13 +732,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
     <div className="space-y-4">
       {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <Input
-          className="mr-auto w-full sm:w-64"
-          placeholder="搜索名称、地址或地区"
-          aria-label="搜索节点"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
+        <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
         <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
@@ -723,13 +773,13 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      draggable={!needle}
+                      draggable={!searching}
                       // A drop sends the order of every node, and a filtered list
                       // offers only its own rows to drop onto, so the index below
                       // is the full one exactly while nothing is filtered out.
-                      disabled={!!needle}
+                      disabled={searching}
                       className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
-                      title={needle ? "清空搜索后可拖动排序" : "拖动排序"}
+                      title={searching ? "清空搜索后可拖动排序" : "拖动排序"}
                       aria-label={`拖动 ${n.name} 排序`}
                       onDragStart={(e) => {
                         orderBeforeDrag.current = order.map((node) => node.id)
@@ -814,7 +864,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 </TableCell>
               </TableRow>
             )}
-            {needle && nodes.length > 0 && !visible.length && (
+            {searching && nodes.length > 0 && !visible.length && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
                   没有匹配的节点
@@ -872,11 +922,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
   onSaved: () => void
 }) {
   const [form, setForm] = useState(task)
-  const [query, setQuery] = useState("")
   const [saving, setSaving] = useState(false)
-  // The unfiltered list's height, held as its floor: the dialog is centred, so a
-  // shrinking list would move the search box out from under the cursor.
-  const [listHeight, setListHeight] = useState(0)
   // The assignments as the hub holds them, as far as this dialog can tell: those
   // loaded, plus any node that registers while it is open, which an auto_join
   // probe takes at once. Shown ticked, so unticking one removes it.
@@ -890,14 +936,10 @@ function PingForm({ task, nodes, onClose, onSaved }: {
     setForm((f) => ({ ...f, nodes: [...(f.nodes ?? []), ...fresh] }))
   }, [nodes, task.auto_join])
   const chosen = new Set(form.nodes)
-  const needle = query.trim().toLowerCase()
-  const visible = needle ? nodes.filter((n) => matches(n, needle)) : nodes
-  const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
   // Counted against the live list: `form.nodes` can still name a node deleted
   // since the probes were loaded.
   const chosenCount = nodes.filter((n) => chosen.has(n.id)).length
 
-  // 全选 and 全不选 act on the rows in view, so a search narrows what they touch.
   const pick = (list: Node[], on: boolean) =>
     setForm((f) => {
       const next = new Set(f.nodes)
@@ -954,36 +996,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
               <h3 className="text-sm font-medium">运行节点</h3>
               <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
             </div>
-            <div className="rounded-lg border">
-              <div className="flex items-center gap-1 border-b p-2">
-                <div className="relative min-w-0 flex-1">
-                  <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input className="h-8 pl-8" placeholder="名称/地址/地区" aria-label="搜索节点" value={query} onChange={(e) => setQuery(e.target.value)} />
-                </div>
-                <Button size="sm" variant="ghost" className="px-2.5" disabled={visibleChosen === visible.length} onClick={() => pick(visible, true)}>全选</Button>
-                <Button size="sm" variant="ghost" className="px-2.5" disabled={visibleChosen === 0} onClick={() => pick(visible, false)}>全不选</Button>
-              </div>
-              {/* Three columns keep a few dozen nodes within one scroll; offline
-                  nodes are dimmed but remain assignable. */}
-              <div
-                ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
-                // Capped like the height itself, which a min-height would
-                // otherwise override once the viewport shrinks.
-                style={{ minHeight: listHeight ? `min(${listHeight}px, 16rem, 40dvh)` : undefined }}
-                className="grid max-h-[min(16rem,40dvh)] grid-cols-2 content-start gap-0.5 overflow-y-auto p-1.5 sm:grid-cols-3"
-              >
-                {visible.map((n) => (
-                  <label key={n.id} title={n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
-                    <input type="checkbox" checked={chosen.has(n.id)} onChange={(e) => pick([n], e.target.checked)} className="shrink-0 accent-primary" />
-                    <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
-                    {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
-                  </label>
-                ))}
-                {!visible.length && (
-                  <p className="col-span-full p-2 text-xs text-muted-foreground">{nodes.length ? "没有匹配的节点" : "先添加节点"}</p>
-                )}
-              </div>
-            </div>
+            <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
             <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
               <span>
                 <span className="block font-medium">新节点自动加入</span>
@@ -1487,29 +1500,14 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
     }
   }
 
-  const enabled = nodes.filter((n) => n.notify).length
+  const enabled = new Set(nodes.filter((n) => n.notify).map((n) => n.id))
   return (
     <Card className="gap-4 p-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <h3 className="text-sm font-medium">离线通知</h3>
-          <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled} / {nodes.length} 台</p>
-        </div>
-        <div className="flex gap-2">
-          <Button size="sm" variant="secondary" disabled={busy || enabled === nodes.length} onClick={() => apply(nodes, true)}>全部打开</Button>
-          <Button size="sm" variant="ghost" disabled={busy || enabled === 0} onClick={() => apply(nodes, false)}>全部关闭</Button>
-        </div>
+      <div>
+        <h3 className="text-sm font-medium">离线通知</h3>
+        <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled.size} / {nodes.length} 台</p>
       </div>
-      {nodes.length > 0 && (
-        <div className="grid max-h-64 gap-x-6 gap-y-2 overflow-y-auto sm:grid-cols-2">
-          {nodes.map((node) => (
-            <label key={node.id} className="flex cursor-pointer items-center justify-between gap-3 text-sm">
-              <span className="truncate">{node.name}</span>
-              <Switch checked={!!node.notify} disabled={busy} onCheckedChange={(v) => apply([node], v)} />
-            </label>
-          ))}
-        </div>
-      )}
+      <NodePicker nodes={nodes} chosen={enabled} onPick={apply} disabled={busy} />
     </Card>
   )
 }
