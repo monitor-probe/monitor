@@ -60,9 +60,12 @@ if [ -n "$UNINSTALL" ]; then
 		rc-update del monitor-agent default >/dev/null 2>&1 || true
 		rm -f "$RC_FILE" "$LOG_FILE"
 	else
+		# systemctl fails outright where systemd is not PID 1 (WSL, containers),
+		# and the install leaves its files there before failing the same way;
+		# they must still be removed.
 		systemctl disable --now monitor-agent 2>/dev/null || true
 		rm -f "$UNIT_FILE"
-		systemctl daemon-reload
+		systemctl daemon-reload 2>/dev/null || true
 		userdel monitor-agent 2>/dev/null || true
 	fi
 	rm -f "$BIN" "$ENV_FILE"
