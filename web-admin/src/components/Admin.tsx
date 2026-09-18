@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask, type Source } from "@/lib/api"
+import { addresses, api, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, provisioningSite, trafficCorrection, upload, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -505,16 +505,22 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, `--interval ${seconds}`])
+function installCommand(site: string, token: string, seconds: number, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, `--interval ${seconds}`, ...ifaceArg(iface)])
+}
+
+// Quoted for the `*` a pattern may end in. ifaceSpec admits no quote, and ''
+// is how install.sh is told to clear a value it would otherwise keep.
+function ifaceArg(iface: string | undefined) {
+  return iface === undefined ? [] : [`--iface '${iface}'`]
 }
 
 // One command for a batch of machines. The key belongs to the hub, is valid only
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // used directly in a loop.
-function registerCommand(site: string, key: string) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`])
+function registerCommand(site: string, key: string, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...ifaceArg(iface)])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -568,7 +574,8 @@ function RegisterDialog({ site, reg, onClose }: {
   reg: ReturnType<typeof useRegisterWindow>
   onClose: () => void
 }) {
-  const command = reg.left > 0 ? registerCommand(site, reg.key) : ""
+  const iface = useIfaceOption(undefined)
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, iface.flag) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -577,18 +584,26 @@ function RegisterDialog({ site, reg, onClose }: {
         <DialogHeader>
           <DialogTitle>批量添加</DialogTitle>
         </DialogHeader>
-        <div className="space-y-4">
+        <div className="space-y-5">
+          {/* One string: JSX turns a line break inside CJK text into a visible space. */}
           <p className="text-sm text-muted-foreground">
-            开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在
-            列表里，名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。
+            {"开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在列表里，" +
+              "名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。"}
           </p>
-          {command ? (
-            <Field label="安装命令">
-              <Command className="h-24">{command}</Command>
+          <section className="space-y-3">
+            <h3 className="text-sm font-medium">安装选项</h3>
+            <IfaceOption option={iface} batch />
+          </section>
+          {reg.left > 0 ? (
+            <section className="space-y-2 border-t pt-5">
+              <h3 className="text-sm font-medium">安装命令</h3>
+              <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
+                {command || "网卡名有误，改正后显示命令"}
+              </Command>
               <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
                 <Button variant="outline" size="sm" onClick={reg.close}>立即关闭</Button>
               </OptionRow>
-            </Field>
+            </section>
           ) : (
             <Button onClick={reg.open}>开启一小时窗口</Button>
           )}
@@ -604,6 +619,72 @@ function RegisterDialog({ site, reg, onClose }: {
   )
 }
 
+// The `--iface` part of an install command. Off leaves the flag out, and
+// install.sh then keeps whatever the machine already has; on with both lists
+// empty passes '' and restores the default rules. It opens on for a node whose
+// agent reports a list, so reinstalling from here repeats that list rather than
+// relying on the machine to remember it.
+function useIfaceOption(current: string | undefined) {
+  const [on, setOn] = useState(!!current)
+  const [choice, setChoice] = useState<IfaceChoice>(() => ifaceChoice(current ?? ""))
+  const bad = on ? badIfaceName(choice) : undefined
+  const spec = ifaceSpec(choice)
+  return { on, setOn, choice, setChoice, current, bad, valid: !bad, flag: on && spec !== null ? spec : undefined }
+}
+
+function describeIface(spec: string) {
+  const { only, skip } = ifaceChoice(spec)
+  const parts = [only && `只统计 ${only.replaceAll(",", "、")}`, skip && `不统计 ${skip.replaceAll(",", "、")}`]
+  return parts.filter(Boolean).join("；") || "默认规则"
+}
+
+function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useIfaceOption>; batch?: boolean }) {
+  const { on, setOn, choice, setChoice, current, bad } = option
+  const field = (list: keyof IfaceChoice, label: string, placeholder: string) => (
+    <Field label={label}>
+      <Input
+        value={choice[list]}
+        onChange={(e) => setChoice({ ...choice, [list]: e.target.value })}
+        placeholder={placeholder}
+        spellCheck={false}
+        aria-invalid={bad?.list === list}
+        className="bg-background font-mono text-xs"
+      />
+    </Field>
+  )
+  return (
+    <div className="rounded-lg border bg-muted/30 text-sm">
+      <label className="flex cursor-pointer items-center justify-between gap-4 px-3 py-2.5">
+        <span>
+          <span className="block font-medium">指定统计的网卡</span>
+          <span className="mt-0.5 block text-xs text-muted-foreground">
+            {on
+              ? batch ? "每台机器都按这里的设置统计" : "覆盖这台机器原有的设置"
+              : batch ? "关闭时各台机器沿用原有设置，新机器按默认规则" : "默认已排除虚拟网卡、隧道和网桥，转发流量的机器才需要指定"}
+          </span>
+          {current !== undefined && (
+            <span className="mt-0.5 block text-xs text-muted-foreground">当前：{describeIface(current)}</span>
+          )}
+        </span>
+        <Switch checked={on} onCheckedChange={setOn} />
+      </label>
+      {on && (
+        <div className="space-y-2.5 border-t px-3 pt-3 pb-3.5">
+          <div className="grid gap-3 sm:grid-cols-2">
+            {field("only", "只统计", "如 eth1 或 pppoe-wan")}
+            {field("skip", "不统计", "如 vxlan100, nebula*")}
+          </div>
+          <p className={`text-xs leading-relaxed ${bad ? "text-destructive" : "text-muted-foreground"}`}>
+            {bad
+              ? `「${bad.name}」不是有效的网卡名：多个用逗号分隔，* 只能放在末尾`
+              : "逗号分隔，末尾的 * 匹配前缀。两项都留空即恢复默认规则。"}
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function InstallDialog({ node, site, onClose, onRotated }: {
   node: Node
   site: string
@@ -614,9 +695,10 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [interval, setInterval] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
+  const iface = useIfaceOption(currentIface(node))
 
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const command = token ? installCommand(site, token, seconds) : ""
+  const command = token && iface.valid ? installCommand(site, token, seconds, iface.flag) : ""
 
   async function rotate() {
     setRotating(true)
@@ -640,16 +722,36 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
         <div className="space-y-5">
-          <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
-            <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
-          </Field>
-          <Field label="安装命令">
-            <Command className="h-28">
-              {/* A node added before the hub kept tokens has nothing to show
-                  until one is reissued. */}
-              {command || "旧版本创建的凭证不可读取，换发后显示"}
+          <section className="space-y-3">
+            <h3 className="text-sm font-medium">安装选项</h3>
+            <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+              <span>
+                <span className="block font-medium">上报间隔</span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">1–3600 秒，默认 1 秒</span>
+              </span>
+              <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
+                <Input
+                  type="number"
+                  min={1}
+                  max={3600}
+                  value={interval}
+                  onChange={(e) => setInterval(e.target.value)}
+                  aria-label="上报间隔（秒）"
+                  className="tnum h-8 w-20 bg-background text-right"
+                />
+                秒
+              </span>
+            </div>
+            <IfaceOption option={iface} />
+          </section>
+          <section className="space-y-2 border-t pt-5">
+            <h3 className="text-sm font-medium">安装命令</h3>
+            {/* A node added before the hub kept tokens has nothing to show
+                until one is reissued. */}
+            <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
+              {command || (token ? "网卡名有误，改正后显示命令" : "旧版本创建的凭证不可读取，换发后显示")}
             </Command>
-          </Field>
+          </section>
           <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
               换发

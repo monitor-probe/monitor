@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react"
 
 export type Metrics = {
+  /** The kernel's boot id, followed by `/` and the agent's `--iface` list when one is set. */
+  boot_id?: string
   uptime: number
   cpu: number
   load: [number, number, number]
@@ -162,6 +164,50 @@ export function provisioningSite(site: string): string {
   } catch {
     return ""
   }
+}
+
+/** The agent's `--iface` as the install dialogs edit it: names to count alone, names to leave out. */
+export type IfaceChoice = { only: string; skip: string }
+
+// What the agent accepts as a name, less the leading `-` that marks an exclusion
+// in the flag itself. Narrower than a kernel interface name, and within what
+// install.sh admits into the env file OpenRC sources as shell.
+const IFACE_NAME = /^[A-Za-z0-9._][A-Za-z0-9._-]*\*?$/
+
+const ifaceNames = (list: string) => list.split(",").map((n) => n.trim()).filter(Boolean)
+
+/** The first name the agent would refuse, or that would silently match nothing, and the list holding it. */
+export function badIfaceName(choice: IfaceChoice): { list: keyof IfaceChoice; name: string } | undefined {
+  for (const list of ["only", "skip"] as const) {
+    const name = ifaceNames(choice[list]).find((n) => !IFACE_NAME.test(n))
+    if (name !== undefined) return { list, name }
+  }
+}
+
+/** The `--iface` value for a choice; null while [badIfaceName] finds one. */
+export function ifaceSpec(choice: IfaceChoice): string | null {
+  if (badIfaceName(choice)) return null
+  return [...ifaceNames(choice.only), ...ifaceNames(choice.skip).map((n) => `-${n}`)].join(",")
+}
+
+export function ifaceChoice(spec: string): IfaceChoice {
+  const names = ifaceNames(spec)
+  return {
+    only: names.filter((n) => !n.startsWith("-")).join(","),
+    skip: names.filter((n) => n.startsWith("-")).map((n) => n.slice(1)).join(","),
+  }
+}
+
+/**
+ * The `--iface` a connected node's agent runs with, read from its boot_id. Empty
+ * means the default rules, which is also what an agent predating the flag
+ * reports; undefined means the node is not reporting and nothing is known.
+ */
+export function currentIface(node: Pick<Node, "metrics">): string | undefined {
+  const boot = node.metrics?.boot_id
+  if (typeof boot !== "string") return undefined
+  const slash = boot.indexOf("/")
+  return slash < 0 ? "" : boot.slice(slash + 1)
 }
 
 export class ApiError extends Error {
