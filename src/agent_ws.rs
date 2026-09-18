@@ -863,6 +863,7 @@ mod tests {
                     interval: 60,
                     nodes: vec![id],
                     auto_join: false,
+                    base: None,
                 })
                 .unwrap()
         };

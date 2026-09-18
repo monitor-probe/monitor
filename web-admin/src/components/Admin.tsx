@@ -74,6 +74,12 @@ function Addresses({ node }: { node: Node }) {
   )
 }
 
+// Name, address and country: what a node is looked up by, on the node list and
+// in the probe editor alike.
+function matches(n: Node, needle: string) {
+  return [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country].some((v) => v?.toLowerCase().includes(needle))
+}
+
 function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
   return (
     <div className={`space-y-2 ${className}`}>
@@ -618,13 +624,10 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
     ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
     ...nodes.filter((node) => !orderedIds.has(node.id)),
   ]
-  // Name and address, the two things a row is looked up by. `order` itself stays
-  // whole, because the order sent on drop is the order of every node.
+  // `order` itself stays whole, because the order sent on drop is the order of
+  // every node.
   const needle = query.trim().toLowerCase()
-  const visible = needle
-    ? order.filter((n) =>
-      [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin].some((v) => v?.toLowerCase().includes(needle)))
-    : order
+  const visible = needle ? order.filter((n) => matches(n, needle)) : order
 
   async function remove() {
     if (!deleting) return
@@ -675,7 +678,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
       <div className="flex flex-wrap items-center justify-end gap-2">
         <Input
           className="mr-auto w-full sm:w-64"
-          placeholder="搜索名称或地址"
+          placeholder="搜索名称、地址或地区"
           aria-label="搜索节点"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -874,10 +877,25 @@ function PingForm({ task, nodes, onClose, onSaved }: {
   // The unfiltered list's height, held as its floor: the dialog is centred, so a
   // shrinking list would move the search box out from under the cursor.
   const [listHeight, setListHeight] = useState(0)
+  // The assignments as the hub holds them, as far as this dialog can tell: those
+  // loaded, plus any node that registers while it is open, which an auto_join
+  // probe takes at once. Shown ticked, so unticking one removes it.
+  const base = useRef(task.nodes ?? [])
+  const seen = useRef(new Set(nodes.map((n) => n.id)))
+  useEffect(() => {
+    const fresh = nodes.filter((n) => !seen.current.has(n.id)).map((n) => n.id)
+    for (const id of fresh) seen.current.add(id)
+    if (!task.auto_join || !fresh.length) return
+    base.current = [...base.current, ...fresh]
+    setForm((f) => ({ ...f, nodes: [...(f.nodes ?? []), ...fresh] }))
+  }, [nodes, task.auto_join])
   const chosen = new Set(form.nodes)
   const needle = query.trim().toLowerCase()
-  const visible = needle ? nodes.filter((n) => n.name.toLowerCase().includes(needle)) : nodes
+  const visible = needle ? nodes.filter((n) => matches(n, needle)) : nodes
   const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
+  // Counted against the live list: `form.nodes` can still name a node deleted
+  // since the probes were loaded.
+  const chosenCount = nodes.filter((n) => chosen.has(n.id)).length
 
   // 全选 and 全不选 act on the rows in view, so a search narrows what they touch.
   const pick = (list: Node[], on: boolean) =>
@@ -894,7 +912,9 @@ function PingForm({ task, nodes, onClose, onSaved }: {
     if (!form.name?.trim() || !form.target?.trim()) return toast.error("请填写名称和目标")
     setSaving(true)
     try {
-      await api("/ping-tasks", { method: "POST", body: JSON.stringify(form) })
+      // `base` limits the save to what was ticked or unticked here; a node that
+      // joined through auto_join while the dialog was open keeps its assignment.
+      await api("/ping-tasks", { method: "POST", body: JSON.stringify(task.id ? { ...form, base: base.current } : form) })
       toast.success("已保存，正在下发")
       onClose()
       onSaved()
@@ -912,14 +932,15 @@ function PingForm({ task, nodes, onClose, onSaved }: {
           <DialogTitle>{task.id ? "编辑监控" : "添加监控"}</DialogTitle>
         </DialogHeader>
         <div className="space-y-6">
-          {/* Name and interval share a row on a phone, with the target below. */}
+          {/* On a phone the name takes the first row and the target shares the
+              second with the interval, so the tab order matches the screen. */}
           <section className="grid grid-cols-[1fr_6rem] gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
-            <Field label="名称">
+            <Field label="名称" className="col-span-full sm:col-span-1">
               {/* A new monitor starts empty, so the cursor belongs here;
                   editing an existing one starts with nothing selected. */}
               <Input autoFocus={!task.id} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
             </Field>
-            <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接" className="order-last col-span-full sm:order-none sm:col-span-1">
+            <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接">
               <Input value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />
             </Field>
             <Field label="间隔（秒）" hint="5–3600">
@@ -931,22 +952,24 @@ function PingForm({ task, nodes, onClose, onSaved }: {
           <section className="space-y-3 border-t pt-5">
             <div className="flex items-baseline justify-between gap-2">
               <h3 className="text-sm font-medium">运行节点</h3>
-              <span className="tnum text-xs text-muted-foreground">已选 {chosen.size} / {nodes.length}</span>
+              <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
             </div>
             <div className="rounded-lg border">
               <div className="flex items-center gap-1 border-b p-2">
                 <div className="relative min-w-0 flex-1">
                   <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input className="h-8 pl-8" placeholder="搜索节点名称" aria-label="搜索节点" value={query} onChange={(e) => setQuery(e.target.value)} />
+                  <Input className="h-8 pl-8" placeholder="名称/地址/地区" aria-label="搜索节点" value={query} onChange={(e) => setQuery(e.target.value)} />
                 </div>
-                <Button size="sm" variant="ghost" disabled={visibleChosen === visible.length} onClick={() => pick(visible, true)}>全选</Button>
-                <Button size="sm" variant="ghost" disabled={visibleChosen === 0} onClick={() => pick(visible, false)}>全不选</Button>
+                <Button size="sm" variant="ghost" className="px-2.5" disabled={visibleChosen === visible.length} onClick={() => pick(visible, true)}>全选</Button>
+                <Button size="sm" variant="ghost" className="px-2.5" disabled={visibleChosen === 0} onClick={() => pick(visible, false)}>全不选</Button>
               </div>
               {/* Three columns keep a few dozen nodes within one scroll; offline
                   nodes are dimmed but remain assignable. */}
               <div
                 ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
-                style={{ minHeight: listHeight || undefined }}
+                // Capped like the height itself, which a min-height would
+                // otherwise override once the viewport shrinks.
+                style={{ minHeight: listHeight ? `min(${listHeight}px, 16rem, 40dvh)` : undefined }}
                 className="grid max-h-[min(16rem,40dvh)] grid-cols-2 content-start gap-0.5 overflow-y-auto p-1.5 sm:grid-cols-3"
               >
                 {visible.map((n) => (
@@ -986,7 +1009,9 @@ function Ping({ nodes }: { nodes: Node[] }) {
   const [removing, setRemoving] = useState(false)
 
   const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
-  useEffect(() => { load() }, [])
+  // A node added or removed changes assignments on the hub: auto_join adds, a
+  // deletion cascades.
+  useEffect(() => { load() }, [nodes.length])
 
   async function remove() {
     if (!deleting) return

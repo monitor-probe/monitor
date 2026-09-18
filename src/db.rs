@@ -456,7 +456,7 @@ pub struct Traffic {
     pub day_tx: i64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct PingTask {
     #[serde(default)]
     pub id: i64,
@@ -470,6 +470,12 @@ pub struct PingTask {
     /// nodes follow `nodes` alone.
     #[serde(default)]
     pub auto_join: bool,
+    /// The assignments the editor started from. When given on an update, only
+    /// the difference between it and `nodes` is applied, so an assignment made
+    /// while the editor was open -- a node joining through `auto_join` -- is
+    /// not removed by a list that predates it.
+    #[serde(default, skip_serializing)]
+    pub base: Option<Vec<i64>>,
 }
 
 /// Restricts the database to its owner.
@@ -589,8 +595,10 @@ impl Db {
 
     /// Creates a node and returns its id.
     ///
-    /// Both rows or neither: `accumulate` reads the `traffic` row on every
-    /// report, so a node lacking one cannot report.
+    /// One transaction: `accumulate` reads the `traffic` row on every report, so
+    /// a node lacking one cannot report. The node also takes every `auto_join`
+    /// probe here, at most [`Self::MAX_PROBES_PER_NODE`] rows, a limit
+    /// `save_ping_task` enforces.
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1090,6 +1098,7 @@ impl Db {
                     interval: r.get(3)?,
                     nodes: Vec::new(),
                     auto_join: r.get(4)?,
+                    base: None,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1124,10 +1133,16 @@ impl Db {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let id = if t.id > 0 {
-            tx.execute(
+            let updated = tx.execute(
                 "UPDATE ping_task SET name=?2, target=?3, interval=?4, auto_join=?5 WHERE id=?1",
                 params![t.id, t.name, t.target, t.interval, t.auto_join],
             )?;
+            // Deleted from another session. Without this the first assignment
+            // would fail on the task's foreign key and be reported against a
+            // node, or, with none, the save would report success.
+            if updated == 0 {
+                anyhow::bail!("监控不存在，可能已被删除");
+            }
             t.id
         } else {
             tx.execute(
@@ -1136,28 +1151,46 @@ impl Db {
             )?;
             tx.last_insert_rowid()
         };
-        tx.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
-        for node in &t.nodes {
-            // The foreign key is the check; naming the node turns SQLite's
-            // "FOREIGN KEY constraint failed" into something the panel can show.
-            tx.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])
-                .with_context(|| format!("节点 {node} 不存在"))?;
+        let added: Vec<i64> = match &t.base {
+            Some(base) if t.id > 0 => {
+                for node in base.iter().filter(|n| !t.nodes.contains(n)) {
+                    tx.execute("DELETE FROM ping_node WHERE task_id=?1 AND node_id=?2", params![id, node])?;
+                }
+                t.nodes.iter().filter(|n| !base.contains(n)).copied().collect()
+            }
+            _ => {
+                tx.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
+                t.nodes.clone()
+            }
+        };
+        for node in &added {
+            // OR IGNORE covers a node that joined while the editor was open and
+            // was then ticked. It does not cover the foreign key, which remains
+            // the check; naming the node turns SQLite's "FOREIGN KEY constraint
+            // failed" into something the panel can show.
+            tx.execute(
+                "INSERT OR IGNORE INTO ping_node (task_id, node_id) VALUES (?1,?2)",
+                params![id, node],
+            )
+            .with_context(|| format!("节点 {node} 不存在"))?;
         }
         // Queried from the table after the rows are in rather than counted from
         // the request: an update replaces this task's own assignments, so
         // arithmetic on the way in would have to subtract them again. The
         // transaction makes this atomic with the write, and bailing here rolls it
         // back.
-        let crowded: Option<i64> = tx
+        // By name: the panel identifies nodes by name and never shows an id.
+        let crowded: Option<String> = tx
             .query_row(
-                "SELECT node_id FROM ping_node GROUP BY node_id HAVING COUNT(*) > ?1 LIMIT 1",
+                "SELECT n.name FROM ping_node p JOIN node n ON n.id = p.node_id
+                 GROUP BY p.node_id HAVING COUNT(*) > ?1 LIMIT 1",
                 [Self::MAX_PROBES_PER_NODE],
                 |r| r.get(0),
             )
             .optional()?;
         if let Some(node) = crowded {
             anyhow::bail!(
-                "节点 {node} 会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
+                "节点「{node}」会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
                 Self::MAX_PROBES_PER_NODE
             );
         }
@@ -1863,6 +1896,7 @@ mod tests {
                 interval: 60,
                 nodes: vec![id],
                 auto_join: false,
+                base: None,
             })
             .unwrap();
         db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
@@ -2120,6 +2154,7 @@ mod tests {
             interval: 60,
             nodes,
             auto_join: false,
+            base: None,
         };
         let task = db.save_ping_task(&probe(vec![id])).unwrap();
         db.accumulate(id, "b", Some((10, 10))).unwrap();
@@ -2154,6 +2189,7 @@ mod tests {
             interval: 60,
             nodes: vec![id],
             auto_join: false,
+            base: None,
         };
         let old = db.save_ping_task(&probe("tokyo")).unwrap();
         db.insert_ping(id, old, 1, 999).unwrap();
@@ -2183,6 +2219,7 @@ mod tests {
                 interval: 60,
                 nodes: vec![mine],
                 auto_join: false,
+                base: None,
             })
             .unwrap();
 
@@ -2545,6 +2582,7 @@ mod tests {
                 interval: 60,
                 nodes,
                 auto_join: false,
+                base: None,
             })
             .unwrap()
         };
@@ -2583,6 +2621,7 @@ mod tests {
                 interval: 60,
                 nodes: vec![a, b],
                 auto_join: false,
+                base: None,
             })
             .unwrap();
         assert_eq!(db.ping_tasks_for(a).unwrap().len(), 1);
@@ -2595,6 +2634,7 @@ mod tests {
             interval: 30,
             nodes: vec![a],
             auto_join: false,
+            base: None,
         })
         .unwrap();
         assert_eq!(db.ping_tasks_for(b).unwrap().len(), 0);
@@ -2612,6 +2652,7 @@ mod tests {
             interval: 60,
             nodes: vec![],
             auto_join,
+            base: None,
         };
         let joining = db.save_ping_task(&probe(true)).unwrap();
         db.save_ping_task(&probe(false)).unwrap();
@@ -2632,6 +2673,53 @@ mod tests {
         assert_eq!(db.ping_tasks().unwrap().len() as i64, Db::MAX_PROBES_PER_NODE + 1);
     }
 
+    /// The editor's list is a snapshot, while `create_node` assigns auto-joining
+    /// probes whenever a node registers.
+    #[test]
+    fn an_edit_applies_only_the_assignments_it_changed() {
+        let db = db();
+        let (a, b) = (node(&db, 1), node(&db, 1));
+        let save = |id, nodes: Vec<i64>, base: Vec<i64>| {
+            db.save_ping_task(&PingTask {
+                id,
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes,
+                auto_join: true,
+                base: Some(base),
+            })
+        };
+        let assigned = |id| {
+            let mut nodes = db.ping_tasks().unwrap().into_iter().find(|t| t.id == id).unwrap().nodes;
+            nodes.sort_unstable();
+            nodes
+        };
+        let id = save(0, vec![a], vec![]).unwrap();
+        let joined = node(&db, 1);
+
+        // Opened before `joined` existed, so it is in neither list and stays.
+        save(id, vec![a, b], vec![a]).unwrap();
+        assert_eq!(assigned(id), [a, b, joined]);
+        save(id, vec![b], vec![a, b]).unwrap();
+        assert_eq!(assigned(id), [b, joined]);
+
+        // Ticked after joining on its own: already assigned, not an error.
+        save(id, vec![b, joined], vec![b]).unwrap();
+        assert_eq!(assigned(id), [b, joined]);
+        // OR IGNORE leaves the foreign key in force.
+        assert!(save(id, vec![b, joined, 9999], vec![b, joined]).is_err(), "an id that is not a node");
+        assert_eq!(assigned(id), [b, joined]);
+
+        // A node deleted since the editor opened is in both lists and untouched.
+        db.delete_node(b).unwrap();
+        save(id, vec![b, joined], vec![b, joined]).unwrap();
+
+        db.delete_ping_task(id).unwrap();
+        assert!(save(id, vec![], vec![]).is_err(), "a deleted probe is not reported as saved");
+        assert!(db.ping_tasks().unwrap().is_empty());
+    }
+
     /// The agent caps the probe list it will run and drops the remainder with
     /// nothing but a line in its own journal. The hub knows the total, so the hub
     /// issues the refusal; otherwise the panel lists probes that never ran and
@@ -2648,6 +2736,7 @@ mod tests {
                 interval: 60,
                 nodes,
                 auto_join: false,
+                base: None,
             })
         };
         for _ in 0..Db::MAX_PROBES_PER_NODE {
