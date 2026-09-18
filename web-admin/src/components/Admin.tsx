@@ -987,7 +987,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
             <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
               <span>
                 <span className="block font-medium">新节点自动加入</span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">以后添加的节点自动运行此监控，已有节点按上面的勾选</span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">以后添加的节点自动运行此监控</span>
               </span>
               <Switch checked={!!form.auto_join} onCheckedChange={(v) => setForm({ ...form, auto_join: v })} />
             </label>
