@@ -246,7 +246,8 @@ UNIT
 	pw=""
 	if [ -n "$first" ]; then
 		install -m 0600 -o "$USER_NAME" /dev/null "$DATA/monitor.db"
-		pw="$(new_password)"
+		# Quiet: a release predating the flag is handled after the start below.
+		pw="$(new_password 2>/dev/null)"
 	fi
 
 	systemctl daemon-reload
@@ -270,13 +271,22 @@ UNIT
 		if [ -n "$backup" ]; then
 			install -m 0755 "$backup" "$BIN"
 			rm -f "$backup"
-			systemctl restart "$SERVICE" 2>/dev/null || true
+			# Not on a first install: there is no data to serve, and on an empty
+			# database the previous binary would set a password shown only in the
+			# journal.
+			[ -n "$first" ] || systemctl restart "$SERVICE" 2>/dev/null || true
 			die "新版本没能启动，已回滚到上一版。日志：journalctl -u $SERVICE -n 50"
 		fi
 		die "服务启动失败。日志：journalctl -u $SERVICE -n 50"
 	fi
 	rm -f "$BIN.old"
 	ok "服务" "已启动并开机自启"
+	# A release predating --reset-password refuses it, and its first start sets
+	# the password and prints it to the journal instead.
+	if [ -n "$first" ] && [ -z "$pw" ]; then
+		pw="$(journalctl -u "$SERVICE" --since '-2 min' --no-pager 2>/dev/null |
+			sed -n 's/.*Emergency password: //p' | tail -1)"
+	fi
 
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
 	printf '\n  %s%s%s\n' "$B" "$done_title" "$N"

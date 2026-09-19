@@ -1477,7 +1477,6 @@ impl Db {
         Ok(())
     }
 
-    /// Invalidates every login. Used when the admin password changes.
     /// Replaces the admin password hash and signs every session out, both or
     /// neither: a reset that stored the hash and then failed would report failure
     /// while the old password no longer works.
@@ -1494,6 +1493,8 @@ impl Db {
         Ok(())
     }
 
+    /// Invalidates every login. Used after a restore, which would otherwise
+    /// revive every session the backup holds.
     pub fn drop_all_sessions(&self) -> Result<()> {
         self.conn().execute("DELETE FROM session", [])?;
         Ok(())
