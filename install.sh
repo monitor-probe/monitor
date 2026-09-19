@@ -22,7 +22,7 @@ TOKEN=""
 REGISTER=""
 IFACE=""
 IFACE_SET=""
-INTERVAL=1
+INTERVAL=""
 INSECURE=""
 UNINSTALL=""
 
@@ -70,6 +70,16 @@ fi
 	echo "       install.sh --uninstall" >&2
 	exit 2
 }
+# A setting of this machine, kept by a rerun without the flag for the reason
+# given for --iface below: the batch command carries none, and the panel's
+# install command leaves it out unless it is changed there. It is read back from
+# the service definition the last install wrote; a first install takes 1.
+if [ -z "$INTERVAL" ]; then
+	INTERVAL=$(cat "$UNIT_FILE" "$RC_FILE" 2>/dev/null | sed -n \
+		-e 's/^ExecStart=.* --interval \([0-9][0-9]*\).*/\1/p' \
+		-e 's/^command_args="--interval \([0-9][0-9]*\).*/\1/p' | tail -n 1)
+	if [ -n "$INTERVAL" ]; then echo "keeping --interval $INTERVAL from the previous install"; else INTERVAL=1; fi
+fi
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
 [ "$INTERVAL" -ge 1 ] && [ "$INTERVAL" -le 3600 ] || { echo "interval must be from 1 to 3600" >&2; exit 2; }
 # Which interfaces carry this machine's traffic is known only on the machine,

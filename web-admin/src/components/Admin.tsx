@@ -511,8 +511,10 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, `--interval ${seconds}`, ...ifaceArg(iface)])
+// No --interval unless one is given: install.sh then keeps the machine's own.
+function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
+  const interval = seconds === undefined ? [] : [`--interval ${seconds}`]
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...interval, ...ifaceArg(iface)])
 }
 
 // Quoted for the `*` a pattern may end in. ifaceSpec admits no quote, and ''
@@ -692,12 +694,12 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   onRotated: () => void
 }) {
   const [token, setToken] = useState(node.token ?? "")
-  const [interval, setInterval] = useState("1")
+  const [interval, setInterval] = useState("")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
 
-  const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
+  const seconds = interval.trim() === "" ? undefined : Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
   const command = token && iface.valid ? installCommand(site, token, seconds, iface.flag) : ""
 
   async function rotate() {
@@ -724,7 +726,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         <div className="space-y-5">
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
-            <OptionRow title="上报间隔" hint="1–3600 秒，默认 1 秒">
+            <OptionRow title="上报间隔" hint="1–3600 秒。留空沿用机器上原有的设置，新装为 1 秒">
               <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
                 <Input
                   type="number"
@@ -732,6 +734,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
                   max={3600}
                   value={interval}
                   onChange={(e) => setInterval(e.target.value)}
+                  placeholder="沿用"
                   aria-label="上报间隔（秒）"
                   className="tnum h-8 w-20 bg-background text-right"
                 />
