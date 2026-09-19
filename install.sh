@@ -75,8 +75,7 @@ case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3
 # Which interfaces carry this machine's traffic is known only on the machine,
 # and the batch command a fleet shares cannot carry one value per machine. A
 # rerun without --iface, the documented upgrade, therefore keeps the value in
-# the env file; --iface '' clears it. That file is root-only: without root this
-# reads nothing, and the install stops at the root check regardless.
+# the env file; --iface '' clears it.
 #
 # A kept value is written back as found, the last assignment being the one
 # systemd and OpenRC apply: root wrote it, both already read it, and a hand edit

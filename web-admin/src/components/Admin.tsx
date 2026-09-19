@@ -157,22 +157,27 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
 }
 
 // A titled option with its control at the right. `toggle` makes the whole row a
-// label, so a click anywhere flips the Switch it holds.
-function OptionRow({ title, hint, toggle = false, children }: {
+// label, so a click anywhere flips the Switch it holds; `below` opens beneath it
+// in the same card.
+function OptionRow({ title, hint, toggle = false, below, children }: {
   title: React.ReactNode
   hint?: React.ReactNode
   toggle?: boolean
+  below?: React.ReactNode
   children: React.ReactNode
 }) {
   const Row = toggle ? "label" : "div"
   return (
-    <Row className={`flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm ${toggle ? "cursor-pointer" : ""}`}>
-      <span>
-        <span className="block font-medium">{title}</span>
-        {hint && <span className="mt-0.5 block text-xs text-muted-foreground">{hint}</span>}
-      </span>
-      {children}
-    </Row>
+    <div className="rounded-lg border bg-muted/30 text-sm">
+      <Row className={`flex items-center justify-between gap-4 px-3 py-2.5 ${toggle ? "cursor-pointer" : ""}`}>
+        <span>
+          <span className="block font-medium">{title}</span>
+          {hint && <span className="mt-0.5 block text-xs text-muted-foreground">{hint}</span>}
+        </span>
+        {children}
+      </Row>
+      {below && <div className="border-t px-3 pt-3 pb-3.5">{below}</div>}
+    </div>
   )
 }
 
@@ -652,24 +657,16 @@ function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useI
       />
     </Field>
   )
+  const hint = on
+    ? batch ? "每台机器都按这里的设置统计" : "覆盖这台机器原有的设置"
+    : batch ? "关闭时各台机器沿用原有设置，新机器按默认规则" : "关闭时沿用机器上原有的设置，转发流量的机器才需要指定"
   return (
-    <div className="rounded-lg border bg-muted/30 text-sm">
-      <label className="flex cursor-pointer items-center justify-between gap-4 px-3 py-2.5">
-        <span>
-          <span className="block font-medium">指定统计的网卡</span>
-          <span className="mt-0.5 block text-xs text-muted-foreground">
-            {on
-              ? batch ? "每台机器都按这里的设置统计" : "覆盖这台机器原有的设置"
-              : batch ? "关闭时各台机器沿用原有设置，新机器按默认规则" : "关闭时沿用机器上原有的设置，转发流量的机器才需要指定"}
-          </span>
-          {current !== undefined && (
-            <span className="mt-0.5 block text-xs text-muted-foreground">当前：{describeIface(current)}</span>
-          )}
-        </span>
-        <Switch checked={on} onCheckedChange={setOn} />
-      </label>
-      {on && (
-        <div className="space-y-2.5 border-t px-3 pt-3 pb-3.5">
+    <OptionRow
+      title="指定统计的网卡"
+      hint={<>{hint}{current !== undefined && <span className="mt-0.5 block">当前：{describeIface(current)}</span>}</>}
+      toggle
+      below={on && (
+        <div className="space-y-2.5">
           <div className="grid gap-3 sm:grid-cols-2">
             {field("only", "只统计", "如 WAN 口 eth1 或 pppoe-wan")}
             {field("skip", "不统计", "如 LAN 口 eth0")}
@@ -681,7 +678,9 @@ function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useI
           </p>
         </div>
       )}
-    </div>
+    >
+      <Switch checked={on} onCheckedChange={setOn} />
+    </OptionRow>
   )
 }
 
@@ -724,11 +723,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         <div className="space-y-5">
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
-            <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-              <span>
-                <span className="block font-medium">上报间隔</span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">1–3600 秒，默认 1 秒</span>
-              </span>
+            <OptionRow title="上报间隔" hint="1–3600 秒，默认 1 秒">
               <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
                 <Input
                   type="number"
@@ -741,7 +736,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
                 />
                 秒
               </span>
-            </div>
+            </OptionRow>
             <IfaceOption option={iface} />
           </section>
           <section className="space-y-2 border-t pt-5">

@@ -949,11 +949,13 @@ impl Db {
         let (d_rx, d_tx) = match counters {
             None => (0, 0),
             Some(_) if prev_boot.is_empty() || prev_boot != boot_id => {
-                // Logged in either case: on a healthy node this is a reboot,
-                // while one every few seconds indicates two machines sharing a
-                // token.
+                // Logged with both values. The agent appends a digest of the
+                // interfaces it sums, so a change after the `/` alone is that
+                // set changing rather than a reboot. One every few seconds
+                // indicates two machines sharing a token, or counted interfaces
+                // coming and going.
                 if !prev_boot.is_empty() {
-                    info!("node {node_id} reports a new boot; re-aligning");
+                    info!("node {node_id} reports boot_id {boot_id} after {prev_boot}; re-aligning");
                 }
                 (0, 0)
             }
