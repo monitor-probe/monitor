@@ -638,7 +638,7 @@ function IntervalOption({ option, batch = false }: { option: ReturnType<typeof u
   return (
     <OptionRow
       title="上报间隔"
-      hint={batch ? "1–3600 秒，默认 1 秒。这一批机器都按这个间隔上报，机器多时调大省各自的上行流量" : "1–3600 秒，默认 1 秒"}
+      hint={batch ? "1–3600 秒，默认 1 秒。这一批机器都按这个间隔上报，机器多时可以调大" : "1–3600 秒，默认 1 秒"}
     >
       <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
         {/* Text rather than number: no spinner arrows, and no wheel changing
