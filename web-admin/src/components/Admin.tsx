@@ -525,8 +525,8 @@ function ifaceArg(iface: string | undefined) {
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // used directly in a loop.
-function registerCommand(site: string, key: string, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...ifaceArg(iface)])
+function registerCommand(site: string, key: string, seconds: number, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, `--interval ${seconds}`, ...ifaceArg(iface)])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -581,7 +581,8 @@ function RegisterDialog({ site, reg, onClose }: {
   onClose: () => void
 }) {
   const iface = useIfaceOption(undefined)
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, iface.flag) : ""
+  const interval = useIntervalOption()
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.seconds, iface.flag) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -598,6 +599,7 @@ function RegisterDialog({ site, reg, onClose }: {
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
+            <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
           </section>
           {reg.left > 0 ? (
@@ -622,6 +624,35 @@ function RegisterDialog({ site, reg, onClose }: {
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// The reporting interval both install dialogs offer, kept in one place because
+// the batch command carries the same flag for every machine it runs on.
+function useIntervalOption() {
+  const [typed, setTyped] = useState("1")
+  return { typed, setTyped, seconds: Math.min(3600, Math.max(1, Math.round(Number(typed) || 1))) }
+}
+
+function IntervalOption({ option, batch = false }: { option: ReturnType<typeof useIntervalOption>; batch?: boolean }) {
+  return (
+    <OptionRow
+      title="上报间隔"
+      hint={batch ? "1–3600 秒，默认 1 秒。这一批机器都按这个间隔上报，机器多时调大省各自的上行流量" : "1–3600 秒，默认 1 秒"}
+    >
+      <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
+        {/* Text rather than number: no spinner arrows, and no wheel changing
+            the value under a passing scroll. */}
+        <Input
+          inputMode="numeric"
+          value={option.typed}
+          onChange={(e) => option.setTyped(e.target.value.replace(/\D/g, ""))}
+          aria-label="上报间隔（秒）"
+          className="tnum h-8 w-20 bg-background text-right"
+        />
+        秒
+      </span>
+    </OptionRow>
   )
 }
 
@@ -692,13 +723,12 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   onRotated: () => void
 }) {
   const [token, setToken] = useState(node.token ?? "")
-  const [interval, setInterval] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
+  const interval = useIntervalOption()
 
-  const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const command = token && iface.valid ? installCommand(site, token, seconds, iface.flag) : ""
+  const command = token && iface.valid ? installCommand(site, token, interval.seconds, iface.flag) : ""
 
   async function rotate() {
     setRotating(true)
@@ -724,20 +754,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         <div className="space-y-5">
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
-            <OptionRow title="上报间隔" hint="1–3600 秒，默认 1 秒">
-              <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
-                {/* Text rather than number: no spinner arrows, and no wheel
-                    changing the value under a passing scroll. */}
-                <Input
-                  inputMode="numeric"
-                  value={interval}
-                  onChange={(e) => setInterval(e.target.value.replace(/\D/g, ""))}
-                  aria-label="上报间隔（秒）"
-                  className="tnum h-8 w-20 bg-background text-right"
-                />
-                秒
-              </span>
-            </OptionRow>
+            <IntervalOption option={interval} />
             <IfaceOption option={iface} />
           </section>
           <section className="space-y-2 border-t pt-5">
