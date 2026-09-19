@@ -156,6 +156,26 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
   )
 }
 
+// A titled option with its control at the right. `toggle` makes the whole row a
+// label, so a click anywhere flips the Switch it holds.
+function OptionRow({ title, hint, toggle = false, children }: {
+  title: React.ReactNode
+  hint?: React.ReactNode
+  toggle?: boolean
+  children: React.ReactNode
+}) {
+  const Row = toggle ? "label" : "div"
+  return (
+    <Row className={`flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm ${toggle ? "cursor-pointer" : ""}`}>
+      <span>
+        <span className="block font-medium">{title}</span>
+        {hint && <span className="mt-0.5 block text-xs text-muted-foreground">{hint}</span>}
+      </span>
+      {children}
+    </Row>
+  )
+}
+
 
 function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
   title: string
@@ -307,20 +327,12 @@ function NodeForm({ node, onClose, onSaved }: {
               </Field>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
-              <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-                <span>
-                  <span className="block font-medium">公开显示</span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">关闭后只在管理后台可见</span>
-                </span>
+              <OptionRow title="公开显示" hint="关闭后只在管理后台可见" toggle>
                 <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
-              </label>
-              <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-                <span>
-                  <span className="block font-medium">离线通知</span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期、恢复时各推一条</span>
-                </span>
+              </OptionRow>
+              <OptionRow title="离线通知" hint="掉线超过宽限期、恢复时各推一条" toggle>
                 <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
-              </label>
+              </OptionRow>
             </div>
           </section>
           <section className="space-y-3 border-t pt-5">
@@ -573,15 +585,9 @@ function RegisterDialog({ site, reg, onClose }: {
           {command ? (
             <Field label="安装命令">
               <Command className="h-24">{command}</Command>
-              <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-                <span>
-                  <span className="block font-medium">窗口 {clock} 后自动关闭</span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">
-                    到点自动失效，装完了也可以现在就关
-                  </span>
-                </span>
+              <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
                 <Button variant="outline" size="sm" onClick={reg.close}>立即关闭</Button>
-              </div>
+              </OptionRow>
             </Field>
           ) : (
             <Button onClick={reg.open}>开启一小时窗口</Button>
@@ -644,17 +650,11 @@ function InstallDialog({ node, site, onClose, onRotated }: {
               {command || "旧版本创建的凭证不可读取，换发后显示"}
             </Command>
           </Field>
-          <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-            <span>
-              <span className="block font-medium">换发凭证</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                旧凭证立即作废，agent 掉线，需用新命令重装
-              </span>
-            </span>
+          <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
               换发
             </Button>
-          </div>
+          </OptionRow>
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>关闭</Button>
@@ -1031,13 +1031,9 @@ function PingForm({ task, nodes, onClose, onSaved }: {
               <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
             </div>
             <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
-            <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-              <span>
-                <span className="block font-medium">新节点自动加入</span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">以后添加的节点自动运行此监控</span>
-              </span>
+            <OptionRow title="新节点自动加入" hint="以后添加的节点自动运行此监控" toggle>
               <Switch checked={!!form.auto_join} onCheckedChange={(v) => setForm({ ...form, auto_join: v })} />
-            </label>
+            </OptionRow>
           </section>
         </div>
         <DialogFooter>

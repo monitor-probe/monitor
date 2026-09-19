@@ -43,32 +43,20 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
-if command -v systemctl >/dev/null; then
-	INIT=systemd
-elif command -v rc-update >/dev/null; then
-	INIT=openrc
-else
-	echo "this installer needs systemd or OpenRC" >&2
-	exit 1
-fi
 
-# Removes exactly what an install writes and nothing else. The hub may be
-# installed in $ROOT as well, so the directory is removed only once empty.
+# Removes exactly what an install writes and nothing else, for both init
+# systems: the one present now need not be the one the install found, and
+# systemctl fails outright where systemd is not PID 1 (WSL, containers) although
+# the install left its files there. Each step therefore tolerates failure. The
+# hub may be installed in $ROOT as well, so the directory is removed only once
+# empty.
 if [ -n "$UNINSTALL" ]; then
-	if [ "$INIT" = openrc ]; then
-		rc-service monitor-agent stop 2>/dev/null || true
-		rc-update del monitor-agent default >/dev/null 2>&1 || true
-		rm -f "$RC_FILE" "$LOG_FILE"
-	else
-		# systemctl fails outright where systemd is not PID 1 (WSL, containers),
-		# and the install leaves its files there before failing the same way;
-		# they must still be removed.
-		systemctl disable --now monitor-agent 2>/dev/null || true
-		rm -f "$UNIT_FILE"
-		systemctl daemon-reload 2>/dev/null || true
-		userdel monitor-agent 2>/dev/null || true
-	fi
-	rm -f "$BIN" "$ENV_FILE"
+	rc-service monitor-agent stop 2>/dev/null || true
+	rc-update del monitor-agent default >/dev/null 2>&1 || true
+	systemctl disable --now monitor-agent 2>/dev/null || true
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$ENV_FILE"
+	systemctl daemon-reload 2>/dev/null || true
+	userdel monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
 	echo "monitor-agent uninstalled"
 	exit 0
@@ -145,6 +133,14 @@ http://*)
 	fi
 	;;
 esac
+if command -v systemctl >/dev/null; then
+	INIT=systemd
+elif command -v rc-update >/dev/null; then
+	INIT=openrc
+else
+	echo "this installer needs systemd or OpenRC" >&2
+	exit 1
+fi
 
 # The service user the unit below runs as, created before the download and the
 # registration, so a host where this fails keeps the agent it already runs and
