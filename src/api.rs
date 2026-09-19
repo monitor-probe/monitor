@@ -660,7 +660,10 @@ pub async fn agent_register(
     }
     // One answer for both "no window is open" and "that key is wrong": the
     // difference is only useful to someone who has neither.
-    let closed = || (StatusCode::FORBIDDEN, "registration is closed").into_response();
+    let closed = || {
+        (StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
+            .into_response()
+    };
     let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
     let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && Utc::now().timestamp() < until)
     else {
@@ -675,7 +678,11 @@ pub async fn agent_register(
     }
     match app.db.nodes_created_since(until - REGISTER_WINDOW) {
         Ok(n) if n >= REGISTER_LIMIT => {
-            return (StatusCode::FORBIDDEN, "this window has registered enough nodes").into_response()
+            return (
+                StatusCode::FORBIDDEN,
+                "this window has registered enough nodes; open a new window from the panel's node list",
+            )
+                .into_response()
         }
         Err(e) => return fail(e),
         Ok(_) => {}
