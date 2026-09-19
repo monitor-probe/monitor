@@ -170,18 +170,22 @@ if [ -z "$TOKEN" ]; then
 	# a hostname may contain, so nothing unexpected travels in the body.
 	NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
 	echo "registering $NAME with the hub"
-	# curl sends no header at all for an empty $HELD.
-	TOKEN=$(curl -fsS --max-time 30 -H "Authorization: Bearer $REGISTER" -H "X-Node-Token: $HELD" \
-		--data-binary "$NAME" "${SERVER%/}/api/agent/register") || {
-		# 22 is an HTTP error from the hub. Any other failure never reached it,
-		# and curl has already said why.
-		[ $? -eq 22 ] || exit 1
-		echo "the hub refused the registration key: the window may have closed," >&2
-		echo "the key may be wrong, or it has registered enough nodes already." >&2
-		echo "open a new one from the panel's node list." >&2
+	# curl sends no header at all for an empty $HELD. The status follows the body
+	# on a line of its own, so a refusal shows the hub's own reason: a closed
+	# window, a lockout, an entry that is not an https domain and a database
+	# error share one exit status under --fail. A request that got no response
+	# stops here, with curl's own message.
+	REPLY=$(curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
+		-H "X-Node-Token: $HELD" --data-binary "$NAME" "${SERVER%/}/api/agent/register") || exit 1
+	CODE=$(printf '%s\n' "$REPLY" | tail -n 1)
+	TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')
+	if [ "$CODE" != 200 ]; then
+		echo "registration failed (HTTP $CODE): $TOKEN" >&2
+		# One answer for a closed window and a wrong key alike.
+		[ "$TOKEN" != "registration is closed" ] || echo "open a new window from the panel's node list and run its command." >&2
 		[ -z "$HELD" ] || echo "if this machine's node was deleted or its token reissued, the token it holds no longer counts." >&2
 		exit 1
-	}
+	fi
 	[ -n "$TOKEN" ] || { echo "the hub answered without a token" >&2; exit 1; }
 	if [ "$TOKEN" = "$HELD" ]; then
 		echo "this machine is already registered; keeping its token"
