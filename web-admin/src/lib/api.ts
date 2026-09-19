@@ -166,6 +166,23 @@ export function provisioningSite(site: string): string {
   }
 }
 
+/**
+ * Whether this is the hub's own machine in the address bar, which is what a
+ * tunnel into the panel leaves there. The hub applies the same test: such an
+ * entry is not in the clear, but it names no address a node could reach, so it
+ * provisions only alongside `--site`.
+ */
+export function loopbackOrigin(origin: string): boolean {
+  try {
+    const { protocol, hostname } = new URL(origin)
+    return (protocol === "https:" || protocol === "http:")
+      && (hostname === "localhost" || hostname.endsWith(".localhost")
+        || hostname === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(hostname))
+  } catch {
+    return false
+  }
+}
+
 /** The agent's `--iface` as the install dialogs edit it: names to count alone, names to leave out. */
 export type IfaceChoice = { only: string; skip: string }
 

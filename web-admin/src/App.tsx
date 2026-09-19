@@ -6,7 +6,7 @@ import { Admin } from "@/components/Admin"
 import { Login } from "@/components/Login"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { api, provisioningSite, useNodes } from "@/lib/api"
+import { api, loopbackOrigin, provisioningSite, useNodes } from "@/lib/api"
 
 type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
 
@@ -147,8 +147,13 @@ export default function App() {
             site={me.site || location.origin}
             // The same two addresses the hub measures: the origin this page was
             // loaded from, which reaches the hub as `Origin`, and `--site` when
-            // one is set, which takes that origin's place in the command.
-            canProvision={!!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
+            // one is set, which takes that origin's place in the command. A
+            // tunnelled panel reads as loopback, which is a sound entry but no
+            // address for a node, so there the command rests on `--site` alone.
+            canProvision={
+              !!provisioningSite(me.site || location.origin)
+              && (!!provisioningSite(location.origin) || loopbackOrigin(location.origin))
+            }
           />
         )}
       </main>

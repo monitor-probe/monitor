@@ -432,14 +432,30 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
 
 // ---- panel write paths ----
 
-/// Names both causes. The second is `--site`, the one input to this decision
-/// that nothing about the request reveals: a hub started with
+/// Names all three causes. `--site` is the one input to this decision that
+/// nothing about the request reveals: a hub started with
 /// `--site https://198.51.100.7` refuses every provisioning call from an
-/// otherwise valid https domain entry. `main` warns about that at startup; this
-/// is for whoever reads the panel rather than the journal.
+/// otherwise valid https domain entry, and a tunnelled panel is refused until
+/// one is given. `main` warns about the first at startup; this is for whoever
+/// reads the panel rather than the journal.
 const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装节点；\
-     如果地址栏已经是 https 域名，检查 hub 的启动参数 --site，\
-     它必须是 https:// 加域名，不能是 IP、不能带路径";
+     从隧道或回环地址进面板时，给 hub 加 --site 指定节点可达的域名；\
+     --site 必须是 https:// 加域名，不能是 IP、不能带路径";
+
+/// Whether this origin is the hub's own machine, which is what a tunnel into the
+/// panel leaves in the address bar. Nothing between that browser and the hub is
+/// in the clear -- it is the loopback interface, or the tunnel's own encryption
+/// -- so the entry is sound; what it lacks is an address a node could use, which
+/// is why it counts only alongside `--site`.
+fn loopback_origin(origin: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(origin) else { return false };
+    let Some(host) = url.host_str() else { return false };
+    matches!(url.scheme(), "http" | "https")
+        && (host == "localhost"
+            || host.ends_with(".localhost")
+            // host_str keeps the brackets an IPv6 literal is written with.
+            || host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()))
+}
 
 pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
     let url = reqwest::Url::parse(site).ok()?;
@@ -468,14 +484,17 @@ pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
 ///
 /// `--site` is measured by the same rule, because it takes this origin's place
 /// in the command: an IP or a path there is refused however the panel is
-/// reached.
+/// reached. It also answers for the one entry this origin cannot: a panel opened
+/// over a tunnel reads `http://127.0.0.1:PORT`, which names no address a node
+/// could reach, while `--site` names one and the tunnel carries the session
+/// under its own encryption.
 fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
     if !app.site.is_empty() && https_domain(&app.site).is_none() {
         debug!("provisioning refused: --site {:?} is not an https domain entry", app.site);
         return false;
     }
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or_default();
-    if https_domain(origin).is_none() {
+    if https_domain(origin).is_none() && !(loopback_origin(origin) && !app.site.is_empty()) {
         debug!("provisioning refused: Origin {origin:?} is not an https domain entry");
         return false;
     }
@@ -1594,10 +1613,26 @@ mod tests {
         proxied.insert("x-forwarded-proto", "http".parse().unwrap());
         assert!(provisioning_allowed(&app, &proxied));
 
-        for origin in ["http://monitor.example.com", "https://198.51.100.1", "https://localhost", "null"] {
+        for origin in [
+            "http://monitor.example.com",
+            "https://198.51.100.1",
+            "null",
+            // A registered name resolving wherever its owner points it, which is
+            // not the loopback entry below however it is spelled.
+            "http://127.0.0.1.example.com",
+        ] {
             let mut headers = good.clone();
             headers.insert(header::ORIGIN, origin.parse().unwrap());
             assert!(!provisioning_allowed(&app, &headers), "{origin}");
+        }
+
+        // A panel opened over a tunnel reads as loopback. It names no address a
+        // node could reach, so it provisions alongside --site and not without it.
+        for origin in ["http://127.0.0.1:9911", "http://localhost:9911", "http://[::1]:9911"] {
+            let mut headers = good.clone();
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+            assert!(provisioning_allowed(&app, &headers), "{origin}");
+            assert!(!provisioning_allowed(&app_with_site(""), &headers), "{origin} without --site");
         }
         // A request carrying no origin at all, which is every caller that is not
         // a browser, and one sent from a page elsewhere.

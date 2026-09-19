@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, provisioningSite, trafficCorrection, upload, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { addresses, api, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, loopbackOrigin, provisioningSite, trafficCorrection, upload, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -529,6 +529,19 @@ function registerCommand(site: string, key: string, iface: string | undefined) {
   return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...ifaceArg(iface)])
 }
 
+// Which of the three refusals applies, in the terms the operator can act on:
+// the address bar, a missing --site, or one that is not an https domain. `site`
+// is already `--site` when there is one, so a loopback address here is the
+// tunnelled panel that has none.
+function provisionHint(site: string) {
+  if (!provisioningSite(location.origin) && !loopbackOrigin(location.origin)) {
+    return "请通过 HTTPS 域名访问面板后添加或安装节点。"
+  }
+  return loopbackOrigin(site)
+    ? "从隧道或回环地址进面板时，要给 hub 加 --site 指定节点可达的 https 域名。"
+    : "hub 的 --site 不是 https 域名，改正后才能添加或安装节点。"
+}
+
 // Carries no token, so it is the same for every node and remains valid after the
 // node is deleted.
 function uninstallCommand(site: string) {
@@ -845,15 +858,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
 
   return (
     <div className="space-y-4">
-      {/* Two causes, and the address bar is only one of them: on an https domain
-          entry what remains is --site, which the hub measures by the same rule. */}
-      {!canProvision && (
-        <p className="text-sm text-muted-foreground">
-          {provisioningSite(location.origin)
-            ? "hub 的 --site 不是 https 域名，改正后才能添加或安装节点。"
-            : "请通过 HTTPS 域名访问面板后添加或安装节点。"}
-        </p>
-      )}
+      {!canProvision && <p className="text-sm text-muted-foreground">{provisionHint(site)}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
         {/* An open window is visible from the list itself, so nobody has to
