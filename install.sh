@@ -71,8 +71,7 @@ fi
 	exit 2
 }
 # A setting of this machine, kept by a rerun without the flag for the reason
-# given for --iface below: the batch command carries none, and the panel's
-# install command leaves it out unless it is changed there. It is read back from
+# given for --iface below: the batch command carries none. It is read back from
 # the service definition the last install wrote; a first install takes 1.
 if [ -z "$INTERVAL" ]; then
 	INTERVAL=$(cat "$UNIT_FILE" "$RC_FILE" 2>/dev/null | sed -n \
