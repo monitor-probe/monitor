@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react"
 
 export type Metrics = {
-  /** The kernel's boot id, followed by `/` and the agent's `--iface` list when one is set. */
-  boot_id?: string
+  /** The agent's `--iface`, empty for the default rules; absent from an agent predating it. */
+  iface?: string
   uptime: number
   cpu: number
   load: [number, number, number]
@@ -199,15 +199,12 @@ export function ifaceChoice(spec: string): IfaceChoice {
 }
 
 /**
- * The `--iface` a connected node's agent runs with, read from its boot_id. Empty
- * means the default rules, which is also what an agent predating the flag
- * reports; undefined means the node is not reporting and nothing is known.
+ * The `--iface` a connected node's agent runs with. Empty means the default
+ * rules, which is also what an agent predating the flag applies; undefined
+ * means the node is not reporting and nothing is known.
  */
 export function currentIface(node: Pick<Node, "metrics">): string | undefined {
-  const boot = node.metrics?.boot_id
-  if (typeof boot !== "string") return undefined
-  const slash = boot.indexOf("/")
-  return slash < 0 ? "" : boot.slice(slash + 1)
+  return node.metrics ? (node.metrics.iface ?? "") : undefined
 }
 
 export class ApiError extends Error {

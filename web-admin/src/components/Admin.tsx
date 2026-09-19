@@ -660,7 +660,7 @@ function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useI
           <span className="mt-0.5 block text-xs text-muted-foreground">
             {on
               ? batch ? "每台机器都按这里的设置统计" : "覆盖这台机器原有的设置"
-              : batch ? "关闭时各台机器沿用原有设置，新机器按默认规则" : "默认已排除虚拟网卡、隧道和网桥，转发流量的机器才需要指定"}
+              : batch ? "关闭时各台机器沿用原有设置，新机器按默认规则" : "关闭时沿用机器上原有的设置，转发流量的机器才需要指定"}
           </span>
           {current !== undefined && (
             <span className="mt-0.5 block text-xs text-muted-foreground">当前：{describeIface(current)}</span>
@@ -671,8 +671,8 @@ function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useI
       {on && (
         <div className="space-y-2.5 border-t px-3 pt-3 pb-3.5">
           <div className="grid gap-3 sm:grid-cols-2">
-            {field("only", "只统计", "如 eth1 或 pppoe-wan")}
-            {field("skip", "不统计", "如 vxlan100, nebula*")}
+            {field("only", "只统计", "如 WAN 口 eth1 或 pppoe-wan")}
+            {field("skip", "不统计", "如 LAN 口 eth0")}
           </div>
           <p className={`text-xs leading-relaxed ${bad ? "text-destructive" : "text-muted-foreground"}`}>
             {bad

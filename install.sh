@@ -77,15 +77,25 @@ case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3
 # rerun without --iface, the documented upgrade, therefore keeps the value in
 # the env file; --iface '' clears it. That file is root-only: without root this
 # reads nothing, and the install stops at the root check regardless.
+#
+# A kept value is written back as found, the last assignment being the one
+# systemd and OpenRC apply: root wrote it, both already read it, and a hand edit
+# with quotes must not block every later upgrade. A value given here is held to
+# what the agent accepts -- names separated by commas, each optionally led by
+# one `-` and ended by `*`, never a bare `*` -- since the agent refuses anything
+# else at startup and would restart forever while this script reported success.
+# The character set also keeps it inert where OpenRC sources the file as shell.
 if [ -z "$IFACE_SET" ]; then
-	IFACE=$(sed -n 's/^MONITOR_IFACE=//p' "$ENV_FILE" 2>/dev/null || true)
+	IFACE=$(sed -n 's/^MONITOR_IFACE=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
 	[ -z "$IFACE" ] || echo "keeping --iface $IFACE from the previous install"
+else
+	case ",$IFACE," in
+	*[!A-Za-z0-9._*,-]* | *,-,* | *,--* | *,\*,* | *,-\*,* | *\*[!,]*)
+		echo "--iface takes interface names separated by commas, each optionally led by - and ended by *, not: $IFACE" >&2
+		exit 2
+		;;
+	esac
 fi
-# OpenRC sources the env file as shell, so the value is held to what names,
-# commas, a leading `-` and a trailing `*` require.
-case "$IFACE" in
-*[!A-Za-z0-9._*,-]*) echo "--iface takes interface names separated by commas, not: $IFACE" >&2; exit 2 ;;
-esac
 # A bare host implies TLS, matching the upgrade the agent's ws_url() performs,
 # and the same reversal under --insecure where the hub has no TLS to upgrade to.
 # Without this the two diverge: the agent would dial wss:// while curl below
@@ -250,7 +260,7 @@ install -m 0755 "$TMP" "$BIN"
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 ENV
-	[ -z "$IFACE" ] || echo "MONITOR_IFACE=$IFACE" >>"$ENV_FILE"
+	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )
 
 if [ "$INIT" = openrc ]; then

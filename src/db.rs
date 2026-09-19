@@ -937,10 +937,11 @@ impl Db {
         // one -- an interface included in the sum has disappeared -- so the
         // reading is the remainder of that history and booking it would count it
         // twice. A changed boot_id means the counters restarted, that the agent
-        // now sums a different set of interfaces (it appends its --iface list),
-        // or, indistinguishably from here, that a second machine shares the
-        // token. Realigning costs the seconds since the reboot; the alternative
-        // costs hundreds of gigabytes against a total that only increases.
+        // now sums a different set of interfaces (it appends a digest of them,
+        // so a device joining the sum is caught as well as one leaving it), or,
+        // indistinguishably from here, that a second machine shares the token.
+        // Realigning costs the seconds since the reboot; the alternative costs
+        // hundreds of gigabytes against a total that only increases.
         //
         // A fourth case: no reading at all. The row is left exactly as it was,
         // since writing zero would realign the baseline to zero and book the next

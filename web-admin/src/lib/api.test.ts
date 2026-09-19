@@ -69,7 +69,7 @@ assert.deepEqual(badIfaceName({ only: "eth0", skip: "vxlan*, e*h0" }), { list: "
 assert.equal(badIfaceName({ only: "eth0", skip: "vxlan*" }), undefined)
 assert.deepEqual(ifaceChoice("eth1,-vxlan*,pppoe-wan"), { only: "eth1,pppoe-wan", skip: "vxlan*" })
 assert.equal(ifaceSpec(ifaceChoice("enp*,-enp5s0")), "enp*,-enp5s0")
-// The agent appends its list to the kernel's boot id; a node not reporting has none.
+// A node not reporting tells nothing; an agent predating --iface runs the default rules.
 assert.equal(currentIface({ metrics: null }), undefined)
-assert.equal(currentIface({ metrics: { boot_id: "8f1c2e40-7d1b-4c55-9d0e-2b4a6f3c9e11" } as never }), "")
-assert.equal(currentIface({ metrics: { boot_id: "8f1c2e40-7d1b-4c55-9d0e-2b4a6f3c9e11/eth1,-vxlan*" } as never }), "eth1,-vxlan*")
+assert.equal(currentIface({ metrics: {} as never }), "")
+assert.equal(currentIface({ metrics: { iface: "eth1,-eth0" } as never }), "eth1,-eth0")
