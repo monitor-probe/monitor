@@ -392,23 +392,67 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
 /// the operator's address locks them out of the sign-in page.
 ///
 /// A second trusted proxy in front of the local one places its own address at
-/// the tail instead. No single value in this header identifies the client, so
-/// such a deployment must have its edge write the client address.
+/// the tail instead. That address is Cloudflare's for most such deployments, and
+/// Cloudflare replaces `CF-Connecting-IP` on every request it forwards, so the
+/// header is read when, and only when, the hop is one of its published ranges.
+/// Anyone can send the header; only Cloudflare can connect from those ranges.
+/// Another CDN is left to the local proxy's real-IP configuration.
 ///
-/// Both addresses are canonicalized: the default dual-stack `[::]` listener
+/// Every address is canonicalized: the default dual-stack `[::]` listener
 /// reports IPv4 peers, 127.0.0.1 included, as `::ffff:a.b.c.d`, which no IPv6
 /// range below recognizes as local.
 pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+    // The last value, which for CF-Connecting-IP is the only one.
+    let last = |name: &str| {
+        let value = headers.get(name)?.to_str().ok()?.rsplit(',').next()?;
+        value.trim().parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+    };
     let peer = peer.to_canonical();
-    if !behind_local_proxy(peer) {
-        return peer;
+    let hop = if behind_local_proxy(peer) { last("x-forwarded-for").unwrap_or(peer) } else { peer };
+    if cloudflare(hop) {
+        return last("cf-connecting-ip").unwrap_or(hop);
     }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').next())
-        .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        .map_or(peer, |ip| ip.to_canonical())
+    hop
+}
+
+/// https://www.cloudflare.com/ips/, unchanged since 2021. A range added later
+/// only leaves its visitors under the edge's address, as before this list.
+const CLOUDFLARE: [&str; 22] = [
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+];
+
+fn cloudflare(ip: IpAddr) -> bool {
+    CLOUDFLARE.iter().any(|net| {
+        let (base, len) = net.split_once('/').unwrap();
+        let len: u32 = len.parse().unwrap();
+        // Within the range when the first `len` bits agree.
+        match (ip, base.parse().unwrap()) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => (u32::from(a) ^ u32::from(b)).leading_zeros() >= len,
+            (IpAddr::V6(a), IpAddr::V6(b)) => (u128::from(a) ^ u128::from(b)).leading_zeros() >= len,
+            _ => false,
+        }
+    })
 }
 
 /// Loopback or a private network, where a reverse proxy resides.
@@ -584,5 +628,26 @@ mod tests {
         assert_eq!(client_ip(&forged, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer address is used.
         assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+
+        // Cloudflare in front of the local proxy: the tail is its edge, and the
+        // client is in the header the edge rewrites. The same when the edge
+        // connects to the hub itself.
+        let mut edge = xff("10.0.0.2, 203.0.113.7, 162.158.88.126");
+        edge.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(client_ip(&edge, ip("127.0.0.1")), ip("203.0.113.7"));
+        // The last address of 162.158.0.0/15.
+        assert_eq!(client_ip(&edge, ip("::ffff:162.159.255.255")), ip("203.0.113.7"));
+        let mut edge6 = xff("2a06:98c0:3600::103");
+        edge6.insert("cf-connecting-ip", "2001:db8::7".parse().unwrap());
+        assert_eq!(client_ip(&edge6, ip("::1")), ip("2001:db8::7"));
+        // Next to the ranges, or without the edge in the path, the header is the
+        // caller's own and changes nothing.
+        let mut direct = xff("198.51.100.9");
+        direct.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(client_ip(&direct, ip("127.0.0.1")), ip("198.51.100.9"));
+        assert_eq!(client_ip(&direct, ip("162.160.0.1")), ip("162.160.0.1"));
+        assert_eq!(client_ip(&direct, ip("2a06:98c8::1")), ip("2a06:98c8::1"));
+        // An edge that sent nothing usable leaves its own address.
+        assert_eq!(client_ip(&xff("162.158.88.126"), ip("127.0.0.1")), ip("162.158.88.126"));
     }
 }
