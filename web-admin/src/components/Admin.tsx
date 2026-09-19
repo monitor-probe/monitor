@@ -168,8 +168,9 @@ function OptionRow({ title, hint, toggle = false, below, children }: {
 }) {
   const Row = toggle ? "label" : "div"
   return (
-    <div className="rounded-lg border bg-muted/30 text-sm">
-      <Row className={`flex items-center justify-between gap-4 px-3 py-2.5 ${toggle ? "cursor-pointer" : ""}`}>
+    <div className="flex flex-col rounded-lg border bg-muted/30 text-sm">
+      {/* flex-1: stretched by a grid, the row fills the card and stays clickable. */}
+      <Row className={`flex flex-1 items-center justify-between gap-4 px-3 py-2.5 ${toggle ? "cursor-pointer" : ""}`}>
         <span>
           <span className="block font-medium">{title}</span>
           {hint && <span className="mt-0.5 block text-xs text-muted-foreground">{hint}</span>}
