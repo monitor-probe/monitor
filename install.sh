@@ -141,7 +141,7 @@ TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
 echo "downloading monitor-agent ($ARCH)"
-curl -fsSL "$URL" -o "$TMP"
+curl -fsSL --max-time 300 "$URL" -o "$TMP"
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
