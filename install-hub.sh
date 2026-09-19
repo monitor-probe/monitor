@@ -1,7 +1,7 @@
 #!/bin/sh
 # monitor hub installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/monitor-probe/monitor/main/install-hub.sh -o install-hub.sh
+#   curl -fsSL https://github.com/monitor-probe/monitor/releases/latest/download/install-hub.sh -o install-hub.sh
 #   chmod +x install-hub.sh
 #   sudo ./install-hub.sh
 #
@@ -34,6 +34,9 @@ SITE_SET=""
 YES=""
 PURGE=""
 ACTION=""
+# How this run was invoked, for the message asking for a re-run after the script
+# replaces itself; the parser below consumes "$@".
+if [ $# -gt 0 ]; then INVOCATION="$0 $*"; else INVOCATION="$0"; fi
 
 # ---- ui ----
 # Colour only to a terminal, and never when NO_COLOR is set: the output of a
@@ -81,6 +84,35 @@ press() {
 	if [ ! -t 0 ]; then return 0; fi
 	printf '\n  %s回车返回菜单%s ' "$D" "$N"
 	read -r _ || true
+}
+
+# A copy of this script saved on the machine may be several releases old, and
+# re-running it is the documented way to upgrade -- it rewrites the unit by that
+# version's rules. The release publishes this script and hashes it alongside the
+# binary, so the copy can measure itself before it acts. A piped run has no file
+# to measure and needs none: it was fetched a moment ago.
+check_self() {
+	sums="$1" tag="$2" base="$3"
+	[ -f "$0" ] || return 0
+	want="$(sed -n 's/^\([0-9a-f]\{64\}\)  *install-hub.sh$/\1/p' "$sums")"
+	# A release published before the script was an asset carries no such line,
+	# which is not a mismatch.
+	[ -n "$want" ] || return 0
+	[ "$(sha256sum "$0" | cut -d' ' -f1)" != "$want" ] || return 0
+
+	warn "这个脚本不是 $tag 那一版，装法可能已经变了"
+	field "更新" "curl -fsSL $base/install-hub.sh -o $0"
+	case "$(ask "现在就下载新版脚本？" "n")" in
+	y | Y | yes) ;;
+	*) return 0 ;;
+	esac
+	curl -fsSL --max-time 30 "$base/install-hub.sh" -o "$tmp/self" || die "脚本下载失败"
+	[ "$(sha256sum "$tmp/self" | cut -d' ' -f1)" = "$want" ] || die "新脚本校验不通过，已丢弃"
+	# Written through the existing file, which keeps its mode and owner.
+	cat "$tmp/self" > "$0" || die "写不进 $0"
+	ok "脚本" "已更新到 $tag"
+	printf '\n  重新执行一次：%s%s%s\n\n' "$B" "$INVOCATION" "$N"
+	exit 0
 }
 
 check_port() {
@@ -170,13 +202,17 @@ install_hub() {
 
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' EXIT
+	# The checksum file first: it also carries this script's own hash, and 6 MB is
+	# not to be fetched on the terms of a copy that turns out to be stale.
+	curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$tmp/sums" ||
+		die "校验文件下载失败"
+	check_self "$tmp/sums" "$tag" "$base"
+
 	curl -fsSL --max-time 300 "$base/$asset" -o "$tmp/$asset" || die "二进制下载失败：$base/$asset"
 	ok "下载" "$(du -h "$tmp/$asset" | cut -f1)"
 
 	# Verified against the release's own checksum file, so a truncated transfer or
 	# a substituted asset is caught before anything lands in /opt/monitor.
-	curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$tmp/sums" ||
-		die "校验文件下载失败"
 	want="$(sed -n "s/^\([0-9a-f]\{64\}\)  *$asset\$/\1/p" "$tmp/sums")"
 	[ -n "$want" ] || die "sha256sums.txt 里没有 $asset 这一项"
 	got="$(sha256sum "$tmp/$asset" | cut -d' ' -f1)"
