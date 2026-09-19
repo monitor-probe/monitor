@@ -19,7 +19,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::auth::client_ip;
+use crate::auth::node_ip;
 use crate::{App, Shared};
 
 /// How often a quiet agent is probed, and how long the hub waits for any frame
@@ -151,7 +151,7 @@ pub async fn handler(
         // The same response whether the token is malformed or merely unknown.
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
-    let ip = client_ip(&headers, peer.ip()).to_string();
+    let ip = node_ip(&headers, peer.ip()).to_string();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
