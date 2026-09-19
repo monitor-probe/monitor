@@ -845,7 +845,15 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
 
   return (
     <div className="space-y-4">
-      {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
+      {/* Two causes, and the address bar is only one of them: on an https domain
+          entry what remains is --site, which the hub measures by the same rule. */}
+      {!canProvision && (
+        <p className="text-sm text-muted-foreground">
+          {provisioningSite(location.origin)
+            ? "hub 的 --site 不是 https 域名，改正后才能添加或安装节点。"
+            : "请通过 HTTPS 域名访问面板后添加或安装节点。"}
+        </p>
+      )}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
         {/* An open window is visible from the list itself, so nobody has to

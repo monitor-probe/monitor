@@ -95,9 +95,10 @@ impl App {
     /// header. Marking the cookie Secure over plain HTTP would cause the browser
     /// to discard the session.
     ///
-    /// The header is supplied by the trusted reverse proxy. Provisioning also
-    /// checks it along with the request's Host/Origin; the listener must remain
-    /// publicly unreachable so callers cannot bypass that proxy.
+    /// The header is supplied by the trusted reverse proxy, so the listener must
+    /// remain publicly unreachable for a caller not to set its own. A proxy that
+    /// sends none leaves the flag off, which costs the flag rather than the
+    /// session; `--site https://...` sets it regardless.
     pub fn secure_cookies(&self, headers: &HeaderMap) -> bool {
         if !self.site.is_empty() {
             return !self.site.starts_with("http://");
@@ -369,8 +370,8 @@ async fn main() -> Result<()> {
     // advertises. This one derives from the socket actually open, and the two
     // diverge in the deployment that needs it most: `--site https://...` with
     // --listen left at its wildcard default prints nothing while the port answers
-    // plain HTTP to anyone who finds it. The provisioning gate in `api` and the
-    // X-Forwarded-Proto cookie flag both assume the proxy cannot be bypassed.
+    // plain HTTP to anyone who finds it. The X-Forwarded-Proto cookie flag
+    // assumes the proxy cannot be bypassed.
     else if !args.listen.ip().is_loopback() {
         warn!(
             "listening on {} in the clear. If a TLS proxy fronts this hub, callers can still reach \
@@ -383,9 +384,8 @@ async fn main() -> Result<()> {
     // Checked once here, because the answer is static: `provisioning_allowed`
     // measures every request against --site, so a value that is not an https
     // domain permanently refuses adding and installing nodes however the panel is
-    // reached. That refusal names the browser's address and the reverse proxy,
-    // both of which are correct here, while the debug line naming --site is off
-    // at the default log level. A warning rather than a fatal error: the hub
+    // reached. The panel names --site in that refusal, and this warning reaches
+    // an operator who never opens the panel. A warning rather than a fatal error: the hub
     // still serves everything else, and an operator upgrading into this check
     // should not lose a running hub. `install-hub.sh` refuses the same values
     // where they are entered.

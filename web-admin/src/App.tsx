@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, provisioningSite, useNodes } from "@/lib/api"
 
-type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string; can_provision: boolean }
+type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
 
 // `/admin` alone is not a page; it is normalised to the first section so that a
 // bookmark and the OAuth redirect both resolve to a real route.
@@ -145,7 +145,10 @@ export default function App() {
             // panel is frequently reached over a loopback port behind a proxy,
             // while the install command and OAuth callback need the real one.
             site={me.site || location.origin}
-            canProvision={me.can_provision && !!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
+            // The same two addresses the hub measures: the origin this page was
+            // loaded from, which reaches the hub as `Origin`, and `--site` when
+            // one is set, which takes that origin's place in the command.
+            canProvision={!!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
           />
         )}
       </main>
