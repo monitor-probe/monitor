@@ -246,8 +246,7 @@ UNIT
 	pw=""
 	if [ -n "$first" ]; then
 		install -m 0600 -o "$USER_NAME" /dev/null "$DATA/monitor.db"
-		# Quiet: a release predating the flag is handled after the start below.
-		pw="$(new_password 2>/dev/null)"
+		pw="$(new_password)"
 	fi
 
 	systemctl daemon-reload
@@ -256,7 +255,6 @@ UNIT
 	# precisely the case the rollback below exists for. Unguarded, the script
 	# would exit here with a raw systemd error and leave the hub down on the
 	# binary that just failed.
-	started="$(date '+%Y-%m-%d %H:%M:%S')"
 	systemctl restart "$SERVICE" || true
 	# is-active answers before a unit that exits immediately has done so. Wait,
 	# then query.
@@ -283,13 +281,6 @@ UNIT
 	fi
 	rm -f "$BIN.old"
 	ok "服务" "已启动并开机自启"
-	# A release predating --reset-password refuses it, and its first start sets
-	# the password and prints it to the journal instead. Only this start's lines:
-	# an earlier failed attempt printed a password for a database since removed.
-	if [ -n "$first" ] && [ -z "$pw" ]; then
-		pw="$(journalctl -u "$SERVICE" --since "$started" --no-pager 2>/dev/null |
-			sed -n 's/.*Emergency password: //p' | tail -1)"
-	fi
 
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
 	printf '\n  %s%s%s\n' "$B" "$done_title" "$N"
