@@ -180,9 +180,14 @@ if [ -z "$TOKEN" ]; then
 	CODE=$(printf '%s\n' "$REPLY" | tail -n 1)
 	TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')
 	if [ "$CODE" != 200 ]; then
-		echo "registration failed (HTTP $CODE): $TOKEN" >&2
+		# The hub answers in one line of text. A proxy or CDN in front may answer
+		# with a page of HTML instead, of which the first line is enough.
+		printf 'registration failed (HTTP %s): %s\n' "$CODE" "$(printf '%s\n' "$TOKEN" | head -n 1 | cut -c1-500)" >&2
+		case "$TOKEN" in
 		# One answer for a closed window and a wrong key alike.
-		[ "$TOKEN" != "registration is closed" ] || echo "open a new window from the panel's node list and run its command." >&2
+		"registration is closed" | "this window has registered enough nodes")
+			echo "open a new window from the panel's node list and run its command." >&2 ;;
+		esac
 		[ -z "$HELD" ] || echo "if this machine's node was deleted or its token reissued, the token it holds no longer counts." >&2
 		exit 1
 	fi
