@@ -256,25 +256,27 @@ UNIT
 	# precisely the case the rollback below exists for. Unguarded, the script
 	# would exit here with a raw systemd error and leave the hub down on the
 	# binary that just failed.
+	started="$(date '+%Y-%m-%d %H:%M:%S')"
 	systemctl restart "$SERVICE" || true
 	# is-active answers before a unit that exits immediately has done so. Wait,
 	# then query.
 	sleep 3
 	if ! systemctl is-active --quiet "$SERVICE"; then
-		# The new database holds nothing but a password never shown. Removed, with
-		# the service stopped so no restart recreates it, so that a rerun is again
-		# a first install and shows one.
+		# A first install has nothing to keep serving, so there is no rollback.
+		# The new database holds nothing but a password never shown; it is removed
+		# so that a rerun is again a first install and shows one, and the unit is
+		# disabled, since any binary it started later -- on a reboot as well --
+		# would set a password on an empty database and print it only to the
+		# journal. A backup, if any, stays for the next run.
 		if [ -n "$first" ]; then
-			systemctl stop "$SERVICE" 2>/dev/null || true
+			systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
 			rm -f "$DATA/monitor.db" "$DATA/monitor.db-wal" "$DATA/monitor.db-shm"
+			die "服务启动失败。日志：journalctl -u $SERVICE -n 50"
 		fi
 		if [ -n "$backup" ]; then
 			install -m 0755 "$backup" "$BIN"
 			rm -f "$backup"
-			# Not on a first install: there is no data to serve, and on an empty
-			# database the previous binary would set a password shown only in the
-			# journal.
-			[ -n "$first" ] || systemctl restart "$SERVICE" 2>/dev/null || true
+			systemctl restart "$SERVICE" 2>/dev/null || true
 			die "新版本没能启动，已回滚到上一版。日志：journalctl -u $SERVICE -n 50"
 		fi
 		die "服务启动失败。日志：journalctl -u $SERVICE -n 50"
@@ -282,9 +284,10 @@ UNIT
 	rm -f "$BIN.old"
 	ok "服务" "已启动并开机自启"
 	# A release predating --reset-password refuses it, and its first start sets
-	# the password and prints it to the journal instead.
+	# the password and prints it to the journal instead. Only this start's lines:
+	# an earlier failed attempt printed a password for a database since removed.
 	if [ -n "$first" ] && [ -z "$pw" ]; then
-		pw="$(journalctl -u "$SERVICE" --since '-2 min' --no-pager 2>/dev/null |
+		pw="$(journalctl -u "$SERVICE" --since "$started" --no-pager 2>/dev/null |
 			sed -n 's/.*Emergency password: //p' | tail -1)"
 	fi
 
