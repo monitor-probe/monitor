@@ -56,19 +56,19 @@ console.log("partial edits, traffic corrections, provisioning and address checks
 
 // --iface from the two lists the install dialogs show, and back.
 assert.equal(ifaceSpec({ only: " eth1, pppoe-wan ", skip: "" }), "eth1,pppoe-wan")
-assert.equal(ifaceSpec({ only: "", skip: "vxlan*, nebula1" }), "-vxlan*,-nebula1")
-assert.equal(ifaceSpec({ only: "enp*", skip: "enp5s0" }), "enp*,-enp5s0")
+assert.equal(ifaceSpec({ only: "", skip: "vxlan100, nebula1" }), "-vxlan100,-nebula1")
+assert.equal(ifaceSpec({ only: "enp1s0", skip: "enp5s0" }), "enp1s0,-enp5s0")
 assert.equal(ifaceSpec({ only: "", skip: "" }), "", "both empty restores the default rules")
 // Each of these the agent would refuse, or would match nothing without a word.
-for (const bad of ["eth0 eth1", "e*h0", "-eth0", "eth0;reboot", "eth0'", "*"]) {
+for (const bad of ["eth0 eth1", "eth*", "e*h0", "-eth0", "eth0;reboot", "eth0'", "*"]) {
   assert.equal(ifaceSpec({ only: bad, skip: "" }), null, bad)
   assert.equal(ifaceSpec({ only: "", skip: bad }), null, bad)
 }
 // The dialog names the offender and marks the field it sits in.
-assert.deepEqual(badIfaceName({ only: "eth0", skip: "vxlan*, e*h0" }), { list: "skip", name: "e*h0" })
-assert.equal(badIfaceName({ only: "eth0", skip: "vxlan*" }), undefined)
-assert.deepEqual(ifaceChoice("eth1,-vxlan*,pppoe-wan"), { only: "eth1,pppoe-wan", skip: "vxlan*" })
-assert.equal(ifaceSpec(ifaceChoice("enp*,-enp5s0")), "enp*,-enp5s0")
+assert.deepEqual(badIfaceName({ only: "eth0", skip: "vxlan100, eth*" }), { list: "skip", name: "eth*" })
+assert.equal(badIfaceName({ only: "eth0", skip: "vxlan100" }), undefined)
+assert.deepEqual(ifaceChoice("eth1,-vxlan100,pppoe-wan"), { only: "eth1,pppoe-wan", skip: "vxlan100" })
+assert.equal(ifaceSpec(ifaceChoice("enp1s0,-enp5s0")), "enp1s0,-enp5s0")
 // A node not reporting tells nothing; an agent predating --iface runs the default rules.
 assert.equal(currentIface({ metrics: null }), undefined)
 assert.equal(currentIface({ metrics: {} as never }), "")

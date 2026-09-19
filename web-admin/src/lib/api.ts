@@ -172,7 +172,7 @@ export type IfaceChoice = { only: string; skip: string }
 // What the agent accepts as a name, less the leading `-` that marks an exclusion
 // in the flag itself. Narrower than a kernel interface name, and within what
 // install.sh admits into the env file OpenRC sources as shell.
-const IFACE_NAME = /^[A-Za-z0-9._][A-Za-z0-9._-]*\*?$/
+const IFACE_NAME = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/
 
 const ifaceNames = (list: string) => list.split(",").map((n) => n.trim()).filter(Boolean)
 

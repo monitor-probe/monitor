@@ -517,10 +517,10 @@ function installCommand(site: string, token: string, seconds: number | undefined
   return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...interval, ...ifaceArg(iface)])
 }
 
-// Quoted for the `*` a pattern may end in. ifaceSpec admits no quote, and ''
-// is how install.sh is told to clear a value it would otherwise keep.
+// '' is how install.sh is told to clear a value it would otherwise keep; a
+// name needs no quoting, as ifaceSpec admits no shell metacharacter.
 function ifaceArg(iface: string | undefined) {
-  return iface === undefined ? [] : [`--iface '${iface}'`]
+  return iface === undefined ? [] : [`--iface ${iface || "''"}`]
 }
 
 // One command for a batch of machines. The key belongs to the hub, is valid only
@@ -676,8 +676,8 @@ function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useI
           </div>
           <p className={`text-xs leading-relaxed ${bad ? "text-destructive" : "text-muted-foreground"}`}>
             {bad
-              ? `「${bad.name}」不是有效的网卡名：多个用逗号分隔，* 只能放在末尾`
-              : "逗号分隔，末尾的 * 匹配前缀。两项都留空即恢复默认规则。"}
+              ? `「${bad.name}」不是有效的网卡名：写完整的名字，多个用逗号分隔`
+              : "写完整的网卡名，多个用逗号分隔。两项都留空即恢复默认规则。"}
           </p>
         </div>
       )}

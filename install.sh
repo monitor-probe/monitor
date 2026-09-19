@@ -90,17 +90,17 @@ case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3
 # A kept value is written back as found, the last assignment being the one
 # systemd and OpenRC apply: root wrote it, both already read it, and a hand edit
 # with quotes must not block every later upgrade. A value given here is held to
-# what the agent accepts -- names separated by commas, each optionally led by
-# one `-` and ended by `*`, never a bare `*` -- since the agent refuses anything
-# else at startup and would restart forever while this script reported success.
-# The character set also keeps it inert where OpenRC sources the file as shell.
+# what the agent accepts -- full names separated by commas, each optionally led
+# by one `-` -- since the agent refuses anything else at startup and would
+# restart forever while this script reported success. The character set also
+# keeps it inert where OpenRC sources the file as shell.
 if [ -z "$IFACE_SET" ]; then
 	IFACE=$(sed -n 's/^MONITOR_IFACE=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
 	[ -z "$IFACE" ] || echo "keeping --iface $IFACE from the previous install"
 else
 	case ",$IFACE," in
-	*[!A-Za-z0-9._*,-]* | *,-,* | *,--* | *,\*,* | *,-\*,* | *\*[!,]*)
-		echo "--iface takes interface names separated by commas, each optionally led by - and ended by *, not: $IFACE" >&2
+	*[!A-Za-z0-9._,-]* | *,-,* | *,--*)
+		echo "--iface takes full interface names separated by commas, each optionally led by -, not: $IFACE" >&2
 		exit 2
 		;;
 	esac
