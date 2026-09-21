@@ -445,6 +445,46 @@ fn behind_local_proxy(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    /// Held by every test that drives `login`, which is the only way to the argon2
+    /// gate.
+    ///
+    /// That gate is a process-wide static with a single permit, and the test
+    /// below holds it to watch a flood be refused. libtest runs tests in parallel
+    /// by default, so without this a sign-in elsewhere is refused with a 429 and
+    /// fails for a reason it has nothing to do with. Taking this lock is what a
+    /// new test reaching `login` has to do.
+    ///
+    /// Tokio's mutex rather than the standard one, whose guard cannot be held
+    /// across an await without `clippy::await_holding_lock` refusing the build.
+    static PASSWORD_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn app() -> std::sync::Arc<crate::App> {
+        std::sync::Arc::new(crate::App::for_test(crate::db::Db::open(":memory:").unwrap()))
+    }
+
+    /// One sign-in attempt, as the panel makes it: no proxy in front, so the peer
+    /// address is the caller's.
+    async fn sign_in(app: &std::sync::Arc<crate::App>, peer: &str, password: &str) -> Response {
+        login(
+            State(app.clone()),
+            ConnectInfo(peer.parse().unwrap()),
+            HeaderMap::new(),
+            Json(LoginBody { password: password.into() }),
+        )
+        .await
+    }
+
+    /// The token out of the `Set-Cookie` a successful sign-in answers with.
+    fn session_token(response: &Response) -> String {
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("a sign-in sets a session cookie")
+            .to_str()
+            .unwrap();
+        cookie.split(';').next().unwrap().split('=').nth(1).unwrap().to_owned()
+    }
+
     #[test]
     fn a_password_round_trips_fails_closed_and_never_repeats_a_salt() {
         let hash = hash_password("correct horse battery staple").unwrap();
@@ -501,13 +541,72 @@ mod tests {
     /// The gate must refuse rather than queue: a queue admits the same flood,
     /// and each attempt that lands costs 19 MiB which remains in a thread's
     /// arena for the life of the process.
-    #[test]
-    fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+    #[tokio::test]
+    async fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+        // Takes the one permit, which no other test may want; see PASSWORD_TESTS.
+        let _serial = PASSWORD_TESTS.lock().await;
         let held: Vec<_> =
             (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
         assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");
         drop(held);
         assert!(PASSWORD_GATE.try_acquire().is_ok(), "permits come back when the checks finish");
+    }
+
+    /// What `login` composes out of parts each tested on their own: the lockout is
+    /// consulted before the password is, a refusal counts against the address, a
+    /// sign-in clears the count, and the session it hands out opens.
+    ///
+    /// The count is built up through `Throttle::record_failure` rather than through
+    /// further attempts. Counting is the throttle's own and is tested above; what
+    /// is under test here is how `login` drives it, and every attempt that reaches
+    /// `verify_password` costs argon2 a deliberate half-second in a debug build.
+    #[tokio::test]
+    async fn a_password_sign_in_counts_failures_clears_them_and_issues_a_session() {
+        let _serial = PASSWORD_TESTS.lock().await;
+        const CALLER: &str = "198.51.100.7:40000";
+        let ip: IpAddr = "198.51.100.7".parse().unwrap();
+        let password = "correct horse battery staple";
+        let app = app();
+        let fill = |n: u32| (0..n).for_each(|_| app.throttle.record_failure(ip));
+
+        // A hub with no password stored closes the endpoint rather than opening it:
+        // the hash is what first run and `--reset-password` write.
+        assert_eq!(sign_in(&app, CALLER, password).await.status(), StatusCode::FORBIDDEN);
+        app.db.set("admin_password_hash", &hash_password(password).unwrap()).unwrap();
+
+        // With the argon2 gate taken the attempt is refused rather than queued
+        // behind it, and the permit comes back when the check finishes.
+        let held = PASSWORD_GATE.try_acquire().expect("the only permit");
+        assert_eq!(sign_in(&app, CALLER, password).await.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held);
+
+        // A refusal is counted against the address: one short of the limit, the
+        // attempt that follows it shuts the address out.
+        fill(MAX_ATTEMPTS - 1);
+        assert_eq!(sign_in(&app, CALLER, "wrong").await.status(), StatusCode::UNAUTHORIZED);
+        assert!(app.throttle.locked(ip), "the refusal was counted");
+
+        // The right password hands out a session that opens, and clears what the
+        // refusals before it had built up -- otherwise typos on either side of a
+        // sign-in would add up to a lockout.
+        app.throttle.clear(ip);
+        fill(MAX_ATTEMPTS - 1);
+        let ok = sign_in(&app, CALLER, password).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let token = session_token(&ok);
+        assert!(app.db.session_valid(&sha256(&token)), "the cookie it sets opens a session");
+        fill(MAX_ATTEMPTS - 1);
+        assert!(!app.throttle.locked(ip), "the sign-in cleared what the refusals had built up");
+
+        // The lockout is consulted before the password is looked at, so a shut-out
+        // address is refused whatever it sends.
+        fill(MAX_ATTEMPTS);
+        assert!(app.throttle.locked(ip));
+        assert_eq!(
+            sign_in(&app, CALLER, password).await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a locked-out address is refused whatever it sends"
+        );
     }
 
     /// Both ends of the same redirect: every form GitHub can send must parse,
