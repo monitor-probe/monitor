@@ -32,8 +32,15 @@ const TRAFFIC_MODES: Record<string, string> = {
 // Reordering uses the browser's view transitions, so displaced rows slide.
 // Browsers without support jump instead.
 function animate(update: () => void) {
-  if (document.startViewTransition) document.startViewTransition(() => flushSync(update))
-  else update()
+  if (!document.startViewTransition) return update()
+  // A reorder landing while the previous transition is still running skips it,
+  // and a skipped transition's promises reject. Nothing awaits them, so one drag
+  // -- which rearranges on every row the pointer crosses, then again on release
+  // -- ended in an unhandled error. The update runs either way; only that slide
+  // is lost.
+  const transition = document.startViewTransition(() => flushSync(update))
+  transition.ready.catch(() => {})
+  transition.finished.catch(() => {})
 }
 
 /** What a drag handle needs from [`useDragOrder`], so the generic hook can be passed as one type. */

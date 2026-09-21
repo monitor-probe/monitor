@@ -1602,6 +1602,20 @@ mod tests {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
+    /// Held by every test that reaches the `metrics` handler, which is the only
+    /// way to the history gate.
+    ///
+    /// The gate is a process-wide static, and one of those tests deliberately
+    /// holds every permit to watch a request be refused. libtest runs tests in
+    /// parallel by default, so without this the other test is refused too and
+    /// fails somewhere unrelated: it parses the 503's plain-text body as JSON and
+    /// reports "expected ident", naming neither the gate nor the test that took
+    /// it. Taking this lock is what a new test reaching `metrics` has to do.
+    ///
+    /// Tokio's mutex rather than the standard one, whose guard cannot be held
+    /// across an await without `clippy::await_holding_lock` refusing the build.
+    static HISTORY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn provisioning_requires_the_current_https_domain_entry() {
         let no_site = app();
@@ -2556,6 +2570,8 @@ mod tests {
     /// that make this process work hard.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
+        // This test holds every permit; see HISTORY_TESTS.
+        let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let ask = || {
@@ -2652,6 +2668,8 @@ mod tests {
     /// every row behind it holding the write connection.
     #[tokio::test]
     async fn an_anonymous_history_window_stops_at_a_week() {
+        // Reaches the gate through `metrics`; see HISTORY_TESTS.
+        let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
