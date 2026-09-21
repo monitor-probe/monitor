@@ -111,7 +111,10 @@ CREATE TABLE IF NOT EXISTS ping_task (
   name     TEXT    NOT NULL,
   target   TEXT    NOT NULL,
   interval INTEGER NOT NULL DEFAULT 60,
-  auto_join INTEGER NOT NULL DEFAULT 0
+  auto_join INTEGER NOT NULL DEFAULT 0,
+  -- The panel's order, as `node.sort` is. Every row an older build wrote ties at
+  -- 0, so a database upgrading into this column keeps its id order.
+  sort     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ping_node (
@@ -149,7 +152,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -266,6 +269,13 @@ fn migrate_to_6(conn: &Connection) -> Result<()> {
     add_column(conn, "ping_task", "auto_join INTEGER NOT NULL DEFAULT 0")
 }
 
+/// Probes were listed by id until the panel gained a drag order. Every existing
+/// row ties at 0, which leaves `ORDER BY sort, id` reading them in exactly the
+/// order they were read in before the upgrade.
+fn migrate_to_7(conn: &Connection) -> Result<()> {
+    add_column(conn, "ping_task", "sort INTEGER NOT NULL DEFAULT 0")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -296,6 +306,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 6 {
         migrate_to_6(&tx)?;
+    }
+    if from < 7 {
+        migrate_to_7(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -479,6 +492,11 @@ pub struct PingTask {
     pub target: String,
     #[serde(default)]
     pub interval: i64,
+    /// The panel's order. Read back so the list describes its own ordering, and
+    /// ignored by every write: reordering goes through `reorder_ping_tasks`
+    /// alone, as `node.sort` goes through `reorder_nodes`.
+    #[serde(default)]
+    pub sort: i64,
     #[serde(default)]
     pub nodes: Vec<i64>,
     /// Nodes created later are assigned this probe as they are added. Existing
@@ -1107,8 +1125,8 @@ impl Db {
 
     pub fn ping_tasks(&self) -> Result<Vec<PingTask>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT id, name, target, interval, auto_join FROM ping_task ORDER BY id")?;
+        let mut stmt = conn
+            .prepare("SELECT id, name, target, interval, auto_join, sort FROM ping_task ORDER BY sort, id")?;
         let tasks: Vec<PingTask> = stmt
             .query_map([], |r| {
                 Ok(PingTask {
@@ -1118,6 +1136,7 @@ impl Db {
                     interval: r.get(3)?,
                     nodes: Vec::new(),
                     auto_join: r.get(4)?,
+                    sort: r.get(5)?,
                     base: None,
                 })
             })?
@@ -1166,8 +1185,12 @@ impl Db {
             }
             t.id
         } else {
+            // A new probe belongs at the end, where the panel offers it. The
+            // caller sends sort 0, which would tie with whatever the last
+            // reorder placed first.
             tx.execute(
-                "INSERT INTO ping_task (name, target, interval, auto_join) VALUES (?1,?2,?3,?4)",
+                "INSERT INTO ping_task (name, target, interval, auto_join, sort)
+                 VALUES (?1,?2,?3,?4,(SELECT COALESCE(MAX(sort),-1)+1 FROM ping_task))",
                 params![t.name, t.target, t.interval, t.auto_join],
             )?;
             tx.last_insert_rowid()
@@ -1246,6 +1269,33 @@ impl Db {
         Ok(())
     }
 
+    /// The panel's drag order, saved whole. Every probe must be named exactly
+    /// once, checked inside the transaction that renumbers rather than before it:
+    /// re-reading the list first would only race the write it guards, the same
+    /// reasoning as `reorder_nodes`.
+    ///
+    /// A probe deleted from another tab is in neither the list nor the table, so
+    /// the count check reports that rather than renumbering around it.
+    pub fn reorder_ping_tasks(&self, ids: &[i64]) -> Result<()> {
+        let unique: HashSet<_> = ids.iter().collect();
+        if unique.len() != ids.len() {
+            anyhow::bail!("排序里有重复的监控");
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM ping_task", [], |r| r.get(0))?;
+        if count as usize != ids.len() {
+            anyhow::bail!("排序必须包含全部监控");
+        }
+        for (sort, id) in ids.iter().enumerate() {
+            if tx.execute("UPDATE ping_task SET sort=?2 WHERE id=?1", params![id, sort as i64])? != 1 {
+                anyhow::bail!("排序里有不存在的监控");
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The task list pushed to one agent.
     ///
     /// Ordered, because the agent keeps the first [`Self::MAX_PROBES_PER_NODE`]
@@ -1254,11 +1304,15 @@ impl Db {
     /// the timers each time; `save_ping_task` prevents reaching that boundary,
     /// and this makes the backstop deterministic should a database arrive there
     /// by another route.
+    ///
+    /// The order is the panel's, which is what the operator rearranged: should a
+    /// database arrive at that boundary by another route, the truncated list
+    /// keeps the probes listed first rather than the ones created first.
     pub fn ping_tasks_for(&self, node_id: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT t.id, t.target, t.interval FROM ping_task t
-             JOIN ping_node n ON n.task_id = t.id WHERE n.node_id = ?1 ORDER BY t.id",
+             JOIN ping_node n ON n.task_id = t.id WHERE n.node_id = ?1 ORDER BY t.sort, t.id",
         )?;
         let rows = stmt.query_map([node_id], |r| {
             Ok(serde_json::json!({
@@ -1320,6 +1374,11 @@ impl Db {
     /// Probe results for one node, one sample per probe per `step` seconds: the
     /// bucket's median round trip, its range, and the proportion lost.
     ///
+    /// Emitted in the panel's order rather than by probe id. The chart takes its
+    /// series, their colours and its legend from the order these rows arrive in,
+    /// so this is what makes dragging a probe in the panel reorder the public
+    /// page's chart.
+    ///
     /// These stamps fall wherever the probe finished rather than on a minute, so
     /// the thinning buckets them instead of matching a multiple, as in `metrics`
     /// above. This is the larger half of that response, since a probe reports far
@@ -1345,6 +1404,27 @@ impl Db {
         step: i64,
     ) -> Result<(Vec<serde_json::Value>, serde_json::Value)> {
         let conn = self.conn();
+        // The order the operator arranged the probes in. A statement of its own
+        // rather than part of [`PING_ROWS`], whose plan is asserted to be a seek
+        // on the window key with no sorter; this is what `close_bucket` orders by
+        // instead, in the fold below.
+        //
+        // Read on the connection already held, never through another `&self`
+        // method: `conn()` locks a plain mutex, so a nested call would deadlock.
+        // `stats` documents the same hazard from the other side.
+        let ranks: HashMap<i64, i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM ping_task
+                 WHERE id IN (SELECT task_id FROM ping_node WHERE node_id=?1)
+                 ORDER BY sort, id",
+            )?;
+            let ids = stmt.query_map([node_id], |r| r.get::<_, i64>(0))?;
+            let mut ranks = HashMap::new();
+            for (position, id) in ids.enumerate() {
+                ranks.insert(id?, position as i64);
+            }
+            ranks
+        };
         let mut stmt = conn.prepare_cached(PING_ROWS)?;
         let mut rows = stmt.query(params![node_id, since, step])?;
         let mut out = Vec::new();
@@ -1359,7 +1439,7 @@ impl Db {
         while let Some(row) = rows.next()? {
             let (b, task, latency) = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?);
             if b != bucket {
-                close_bucket(&mut out, &mut open, bucket * step);
+                close_bucket(&mut out, &mut open, bucket * step, &ranks);
                 bucket = b;
             }
             let seen = totals.entry(task).or_insert((0, 0));
@@ -1380,7 +1460,7 @@ impl Db {
                 probe.1.push(latency);
             }
         }
-        close_bucket(&mut out, &mut open, bucket * step);
+        close_bucket(&mut out, &mut open, bucket * step, &ranks);
         // Unrounded: the caller decides how to render it, and rounding here would
         // turn 0.14% into the 0% that denotes no loss at all.
         let loss: serde_json::Map<String, serde_json::Value> = totals
@@ -1678,10 +1758,20 @@ impl Db {
 /// `"loss":0` on each would add 29 kB of nothing. Rounded up, so that the absence
 /// of a `loss` key means no timeouts occurred: truncating would report a bucket
 /// that lost 1 of 180 as clean.
-fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>, i64)>, ts: i64) {
-    // Ordered by probe rather than by which answered first in this bucket, since
-    // the chart shades its lines by arrival order.
-    open.sort_unstable_by_key(|(task, ..)| *task);
+fn close_bucket(
+    out: &mut Vec<serde_json::Value>,
+    open: &mut Vec<(i64, Vec<i64>, i64)>,
+    ts: i64,
+    ranks: &HashMap<i64, i64>,
+) {
+    // Ordered by the panel's arrangement rather than by which answered first in
+    // this bucket, since the chart takes its series, their colours and its legend
+    // from the order the rows arrive in.
+    //
+    // A probe the map does not name -- an assignment removed while a result was
+    // still in flight -- sorts last, and by id among such probes, so the key
+    // stays total and the output is deterministic either way.
+    open.sort_unstable_by_key(|(task, ..)| (ranks.get(task).copied().unwrap_or(i64::MAX), *task));
     for (task, mut answered, lost) in open.drain(..) {
         answered.sort_unstable();
         let middle = match answered.len() {
@@ -1974,6 +2064,80 @@ mod tests {
         let token = format!("token-{}", rand::random::<u32>());
         db.create_node(&Node { name: "n".into(), traffic_reset_day: reset_day, ..Default::default() }, &token)
             .unwrap()
+    }
+
+    fn add_probe(db: &Db, name: &str, nodes: Vec<i64>) -> i64 {
+        db.save_ping_task(&PingTask {
+            id: 0,
+            name: name.into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// The mirror of `nodes_can_be_reordered_atomically`, on the table whose order
+    /// the chart reads as well as the panel.
+    #[test]
+    fn ping_tasks_can_be_reordered_atomically() {
+        let db = db();
+        let (a, b, c) =
+            (add_probe(&db, "a", vec![]), add_probe(&db, "b", vec![]), add_probe(&db, "c", vec![]));
+        let order = || db.ping_tasks().unwrap().iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(order(), vec![a, b, c], "a new probe starts at the end");
+
+        db.reorder_ping_tasks(&[c, a, b]).unwrap();
+        assert_eq!(order(), vec![c, a, b]);
+
+        // Every rejected input leaves the existing order intact. The partial list
+        // matters most: a stale tab would otherwise renumber around a probe it
+        // never saw.
+        assert!(db.reorder_ping_tasks(&[a, a, c]).is_err(), "duplicates");
+        assert!(db.reorder_ping_tasks(&[a, b]).is_err(), "a probe left out");
+        assert!(db.reorder_ping_tasks(&[a, b, 9999]).is_err(), "an id that is not a probe");
+        assert_eq!(order(), vec![c, a, b]);
+
+        // A probe added afterwards goes to the end rather than wherever sort 0
+        // places it.
+        let d = add_probe(&db, "d", vec![]);
+        assert_eq!(order(), vec![c, a, b, d]);
+    }
+
+    /// The public page's chart takes its series, their colours and its legend from
+    /// the order these rows arrive in, so the panel's arrangement has to reach
+    /// them. The list handed to the agent is the same order: a probe the agent
+    /// never runs is not one the chart can draw.
+    #[test]
+    fn a_probe_chart_follows_the_operator_order() {
+        let db = db();
+        let id = node(&db, 1);
+        let (a, b, c) =
+            (add_probe(&db, "a", vec![id]), add_probe(&db, "b", vec![id]), add_probe(&db, "c", vec![id]));
+        // One bucket, so the emission order within it is the whole of what the
+        // chart is given.
+        let base = Utc::now().timestamp() / 60 * 60 - 60;
+        for (i, task) in [a, b, c].into_iter().enumerate() {
+            db.insert_ping(id, task, base + i as i64, 10 + i as i64).unwrap();
+        }
+        let emitted = |db: &Db| {
+            db.ping_records(id, base, 60)
+                .unwrap()
+                .0
+                .iter()
+                .map(|r| r["task_id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let pushed = |db: &Db| {
+            db.ping_tasks_for(id).unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(emitted(&db), vec![a, b, c], "the order the probes were created in");
+        assert_eq!(pushed(&db), vec![a, b, c]);
+
+        db.reorder_ping_tasks(&[c, a, b]).unwrap();
+        assert_eq!(emitted(&db), vec![c, a, b], "the chart follows the panel");
+        assert_eq!(pushed(&db), vec![c, a, b], "and so does the agent's own list");
     }
 
     /// The country is derived from the address, so it must be dropped the moment
@@ -2542,6 +2706,41 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// A database predating the sort column lists its probes in the order it
+    /// already held them: every row the migration adds ties at 0, and the read
+    /// falls back to the id. One that renumbered instead would silently rearrange
+    /// every deployment that upgraded, with nothing to notice it by.
+    #[test]
+    fn an_upgraded_release_keeps_its_probe_order() {
+        let scratch = Scratch::new();
+        release_file(&scratch.0);
+        // Two more probes, on top of the one the release file writes, so the
+        // order is not a single row's.
+        let by_id = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT name FROM ping_task ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before = {
+            let conn = Connection::open(&scratch.0).unwrap();
+            conn.execute_batch(
+                "INSERT INTO ping_task (name, target, interval) VALUES ('b', '1.1.1.2:443', 60);
+                 INSERT INTO ping_task (name, target, interval) VALUES ('c', '1.1.1.3:443', 60);
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+            by_id(&conn)
+        };
+        assert_eq!(before, ["cm", "b", "c"], "the fixture must hold more than one probe");
+
+        let db = Db::open(&scratch.0).unwrap();
+        let order: Vec<String> = db.ping_tasks().unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(order, before, "the upgrade must not rearrange what was already listed");
+    }
+
     /// The trigger fails the UPDATE in `migrate_to_5` after `migrate_to_4` has
     /// added its columns: a failure part-way through an upgrade.
     #[test]
@@ -2723,6 +2922,7 @@ mod tests {
                 name: "p".into(),
                 target: "1.1.1.1:443".into(),
                 interval: 60,
+                sort: 0,
                 nodes,
                 auto_join: true,
                 base: Some(base),
