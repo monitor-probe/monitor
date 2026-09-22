@@ -2253,7 +2253,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
             <div className="space-y-3 border-t pt-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs text-muted-foreground">
-                  {offline ? `其中 ${offline} 台离线，重新连上之前升级不了` : "待升级的节点"}
+                  {offline ? `其中 ${offline} 台离线` : "待升级的节点"}
                 </span>
                 <Button size="sm" variant="ghost" onClick={() => copy(outdated.map((n) => n.name).join("\n"))}>
                   <Copy className="size-4" /> 复制名单
