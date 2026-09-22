@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, isPublic, loopbackOrigin, provisionRefusal, provisioningSite, trafficCorrection } from "./api.ts"
+import { addresses, badIfaceName, behind, changes, currentIface, GIB, ifaceChoice, ifaceSpec, isPublic, loopbackOrigin, outdatedAgents, provisionRefusal, provisioningSite, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -31,6 +31,19 @@ for (const [origin, site, cause] of [
   const refusal = provisionRefusal(origin, site)
   assert.ok(cause ? refusal.includes(cause) : refusal === "", `${origin} ${site}: ${refusal}`)
 }
+// A node that never reported carries no version, an unreachable GitHub leaves no
+// published one, and a locally built agent ahead of the release is not one to
+// upgrade: none of the three is an upgrade to offer.
+const fleet = [{ agent_version: "1.1.0" }, { agent_version: "1.0.9" }, { agent_version: "" }, { agent_version: "1.1.1" }]
+assert.deepEqual(outdatedAgents(fleet, "1.1.0"), [{ agent_version: "1.0.9" }])
+assert.deepEqual(outdatedAgents(fleet, ""), [])
+assert.deepEqual(outdatedAgents([{ agent_version: "1.2" }], "1.2.0"), [])
+assert.deepEqual(outdatedAgents([{ agent_version: "1.2.0-dev" }], "1.2.0"), [{ agent_version: "1.2.0-dev" }])
+// The hub's own version goes through the same comparison.
+assert.equal(behind("1.2.0", "1.10.0"), true)
+assert.equal(behind("1.3.0", "1.2.0"), false)
+assert.equal(behind("1.2.0", ""), false)
+
 // An emptied traffic field means the counter is not to be corrected. Sent as 0
 // it would clear a lifetime total, which must never decrease.
 const shown = { total_rx: "1.5", total_tx: "2", month_rx: "0.25", month_tx: "1" }

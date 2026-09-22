@@ -959,6 +959,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
+    "update_check",
 ];
 
 // ---- the database itself ----
@@ -1294,6 +1295,89 @@ pub async fn upload_theme(
 /// same `theme.tar.gz` the upload button accepts.
 const ARCHIVE: &str = "theme.tar.gz";
 
+/// How long a release lookup stands before the panel asks GitHub again, and how
+/// long a failed one does. The short retry keeps one unreachable moment from
+/// hiding an update for the rest of the day; the long one keeps a panel left
+/// open on a screen to four lookups a day, well inside the 60 per hour an
+/// unauthenticated caller is allowed.
+const RELEASES_FRESH: i64 = 6 * 3600;
+const RELEASES_RETRY: i64 = 600;
+
+/// What is running here, and what is published. The agent's own version travels
+/// in its hello and is already in the node list, so the panel compares the two
+/// itself and names the nodes to upgrade.
+///
+/// Admin-only, and deliberately not part of `/api/me`: that route answers
+/// anonymous callers, and which hub version is running is not a visitor's
+/// business. Nothing is fetched until an administrator opens the panel, so a hub
+/// nobody looks at makes no outbound request at all.
+pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
+    // Switched off in the panel: nothing is fetched and no latest version is
+    // reported, leaving the running version alone. `check` travels with the
+    // answer because the panel words a switched-off lookup differently from an
+    // unreachable github.com.
+    if app.db.get("update_check").as_deref() == Some("off") {
+        return Json(
+            json!({"hub": env!("CARGO_PKG_VERSION"), "hub_latest": "", "agent_latest": "", "check": false}),
+        );
+    }
+    let cached = app.releases.lock().unwrap().clone();
+    let latest = if fresh_enough(&cached, Utc::now().timestamp()) {
+        cached
+    } else {
+        // Both at once: one round trip of latency rather than two, and neither
+        // lookup depends on the other.
+        let (hub, agent) =
+            tokio::join!(latest_tag(&app, crate::HUB_REPO), latest_tag(&app, crate::AGENT_REPO));
+        let read = crate::Releases {
+            read_at: Utc::now().timestamp(),
+            hub: hub.unwrap_or_default(),
+            agent: agent.unwrap_or_default(),
+        };
+        *app.releases.lock().unwrap() = read.clone();
+        read
+    };
+    Json(json!({
+        "hub": env!("CARGO_PKG_VERSION"),
+        // Empty where GitHub could not be reached, which the panel renders as no
+        // update rather than as an error: a hub on a network that cannot reach
+        // github.com is a supported deployment, not a fault to report.
+        "hub_latest": latest.hub,
+        "agent_latest": latest.agent,
+        "check": true,
+    }))
+}
+
+/// Whether the cached lookup still answers. One that returned nothing is held
+/// for [`RELEASES_RETRY`] instead, so a single unreachable moment does not hide
+/// an update for the rest of the day.
+fn fresh_enough(cached: &crate::Releases, now: i64) -> bool {
+    let holds =
+        if cached.hub.is_empty() || cached.agent.is_empty() { RELEASES_RETRY } else { RELEASES_FRESH };
+    cached.read_at != 0 && now - cached.read_at < holds
+}
+
+/// The tag of a repository's latest release, without its leading `v`, or None
+/// where GitHub could not be read. Unauthenticated, as in `update_theme`, and
+/// never through the panel's GitHub proxy: most proxies front release downloads
+/// alone, and an unreadable tag costs only the update notice.
+async fn latest_tag(app: &App, repo: &str) -> Option<String> {
+    let release: Release = app
+        .http
+        .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
+        .header(header::USER_AGENT, "monitor-hub")
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let tag = release.tag_name;
+    Some(tag.strip_prefix('v').unwrap_or(&tag).to_owned())
+}
+
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
@@ -1599,6 +1683,23 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    /// A lookup nobody can refresh must not hide an update all day, and a panel
+    /// left open on a screen must not ask GitHub on every load.
+    #[test]
+    fn a_release_lookup_is_held_for_six_hours_and_a_failed_one_for_ten_minutes() {
+        let now = Utc::now().timestamp();
+        let read = |read_at, hub: &str, agent: &str| crate::Releases {
+            read_at,
+            hub: hub.into(),
+            agent: agent.into(),
+        };
+        assert!(!fresh_enough(&crate::Releases::default(), now), "nothing has been read yet");
+        assert!(fresh_enough(&read(now - 5 * 3600, "1.2.0", "1.1.0"), now));
+        assert!(!fresh_enough(&read(now - 7 * 3600, "1.2.0", "1.1.0"), now));
+        assert!(fresh_enough(&read(now - 300, "", ""), now), "a failure is held briefly");
+        assert!(!fresh_enough(&read(now - 1200, "1.2.0", ""), now), "half an answer is a failure");
     }
 
     fn app_with_site(site: &str) -> App {

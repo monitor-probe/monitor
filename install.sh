@@ -2,6 +2,7 @@
 # Installs monitor-agent as a systemd or OpenRC service.
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --token TOKEN [options]
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --register KEY [options]
+#   curl -fsSL https://hub.example.com/install.sh | sh -s -- --upgrade
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --uninstall
 set -eu
 # useradd and rc-update reside in sbin, which a root shell entered through `su`
@@ -25,6 +26,7 @@ IFACE_SET=""
 INTERVAL=""
 INSECURE=""
 UNINSTALL=""
+UPGRADE=""
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -41,6 +43,7 @@ while [ $# -gt 0 ]; do
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
+	--upgrade) UPGRADE=1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
@@ -65,8 +68,27 @@ if [ -n "$UNINSTALL" ]; then
 	exit 0
 fi
 
+# Reinstalls the binary with what this machine already holds. It is the one
+# command a whole fleet can be upgraded with, because it carries no credential
+# and names no node: the token and the hub address come from the env file, which
+# only an install writes. Registering is not reached, so it can neither add a
+# node nor spend a key, and a machine with nothing installed is told to use the
+# panel's command rather than quietly becoming a new node.
+if [ -n "$UPGRADE" ]; then
+	[ -z "$TOKEN$REGISTER" ] ||
+		{ echo "--upgrade takes no --token or --register; it reuses what this machine holds" >&2; exit 2; }
+	TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	[ -n "$SERVER" ] || SERVER=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+	[ -n "$TOKEN" ] && [ -n "$SERVER" ] || {
+		echo "no agent is installed here: $ENV_FILE holds no token and hub address." >&2
+		echo "install it with the command from the panel instead" >&2
+		exit 2
+	}
+fi
+
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
 	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
+	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS]" >&2
 	echo "       install.sh --uninstall" >&2
 	exit 2
 }

@@ -58,6 +58,19 @@ pub struct App {
     pub themes: PathBuf,
     /// Alerts on their way out; see `notify::send`.
     pub notes: tokio::sync::mpsc::Sender<notify::Note>,
+    /// The latest published tags, as last read from GitHub. Filled when the panel
+    /// asks rather than on a timer, so a hub nobody opens makes no outbound
+    /// request; see `api::versions`.
+    pub releases: Mutex<Releases>,
+}
+
+#[derive(Default, Clone)]
+pub struct Releases {
+    /// The second these were read, 0 before the first read.
+    pub read_at: i64,
+    /// Tags without their leading `v`, empty where the lookup failed.
+    pub hub: String,
+    pub agent: String,
 }
 
 impl App {
@@ -75,6 +88,7 @@ impl App {
             site,
             themes,
             notes,
+            releases: Mutex::default(),
         }
     }
 
@@ -114,9 +128,11 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
     Some(chain.split(',').next()?.trim())
 }
 
-/// Where the agent binaries are published. Not a setting: redirecting it
-/// implies a fork, which rebuilds this line anyway.
-const AGENT_REPO: &str = "monitor-probe/agent";
+/// Where the agent binaries are published, and where this hub is published. Not
+/// settings: redirecting either implies a fork, which rebuilds these lines
+/// anyway.
+pub const AGENT_REPO: &str = "monitor-probe/agent";
+pub const HUB_REPO: &str = "monitor-probe/monitor";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -430,6 +446,7 @@ async fn main() -> Result<()> {
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
+        .route("/api/version", get(api::versions))
         .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))

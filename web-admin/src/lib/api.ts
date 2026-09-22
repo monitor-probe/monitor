@@ -197,6 +197,32 @@ export function provisionRefusal(origin: string, site: string): string {
     : "请通过 HTTPS 域名访问面板后添加或安装节点。"
 }
 
+/** `1.2.3` as numbers, or null for anything else. */
+const versionParts = (v: string) => (/^\d+(\.\d+)*$/.test(v) ? v.split(".").map(Number) : null)
+
+/**
+ * Whether `current` names an earlier release than `latest`; missing components
+ * count as 0. An empty side is never behind: a node that has not reported
+ * carries no version, and an unreachable GitHub leaves no latest. A build ahead
+ * of the release -- one compiled locally -- is not behind either. Versions that
+ * are not `1.2.3` can only be compared for equality.
+ */
+export function behind(current: string, latest: string): boolean {
+  if (!current || !latest) return false
+  const a = versionParts(current)
+  const b = versionParts(latest)
+  if (!a || !b) return current !== latest
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) < (b[i] ?? 0)
+  }
+  return false
+}
+
+/** The nodes running an earlier agent than the published one. */
+export function outdatedAgents<T extends { agent_version: string }>(nodes: T[], latest: string): T[] {
+  return nodes.filter((n) => behind(n.agent_version, latest))
+}
+
 /** The agent's `--iface` as the install dialogs edit it: names to count alone, names to leave out. */
 export type IfaceChoice = { only: string; skip: string }
 
