@@ -595,7 +595,7 @@ function RegisterDialog({ site, reg, onClose }: {
           {/* One string: JSX turns a line break inside CJK text into a visible space. */}
           <p className="text-sm text-muted-foreground">
             {"开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在列表里，" +
-              "名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。"}
+              "名字默认取它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。"}
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
@@ -608,6 +608,19 @@ function RegisterDialog({ site, reg, onClose }: {
               <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
                 {command || "网卡名有误，改正后显示命令"}
               </Command>
+              {/* Per machine, so it cannot be part of the one command: the loop
+                  supplies it, and the documentation shows the quoting. */}
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                想按自己的主机名单命名，在命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
+                <a
+                  className="ml-1 underline underline-offset-2 hover:text-foreground"
+                  href="https://monitor-document.pages.dev/install/agent#%E6%89%B9%E9%87%8F%E6%B3%A8%E5%86%8C"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  ssh 循环的写法
+                </a>
+              </p>
               <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
                 <Button variant="outline" size="sm" onClick={reg.close}>立即关闭</Button>
               </OptionRow>

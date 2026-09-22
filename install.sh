@@ -20,6 +20,7 @@ LOG_FILE="/var/log/monitor-agent.log"
 SERVER=""
 TOKEN=""
 REGISTER=""
+NAME=""
 IFACE=""
 IFACE_SET=""
 INTERVAL=""
@@ -30,13 +31,14 @@ while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --iface | --interval)
+	--server | --token | --register | --name | --iface | --interval)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
 	--server) SERVER="$2"; shift 2 ;;
 	--token) TOKEN="$2"; shift 2 ;;
 	--register) REGISTER="$2"; shift 2 ;;
+	--name) NAME="$2"; shift 2 ;;
 	--iface) IFACE="$2"; IFACE_SET=1; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--insecure) INSECURE=1; shift ;;
@@ -68,8 +70,14 @@ fi
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
 	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
 	echo "       install.sh --uninstall" >&2
+	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
 	exit 2
 }
+# Names the node a registration creates. A token belongs to a node that already
+# has a name, which the panel changes; silently dropping the flag there would
+# read as a rename that never happened.
+[ -z "$NAME" ] || [ -n "$REGISTER" ] ||
+	{ echo "--name applies only with --register; rename an existing node in the panel" >&2; exit 2; }
 # A setting of this machine, kept by a rerun without the flag for the reason
 # given for --iface below: the batch command carries none. It is read back from
 # the service definition the last install wrote; a first install takes 1.
@@ -227,17 +235,19 @@ if [ -z "$TOKEN" ]; then
 	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
 		HELD=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	fi
-	# The hub trims and bounds this as well; here it is restricted to characters
-	# a hostname may contain, so nothing unexpected travels in the body.
-	NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
+	# --name as given, which a batch loop sets from its own host list, or else
+	# the hostname, restricted to characters a hostname may contain. The hub
+	# trims and bounds either.
+	[ -n "$NAME" ] || NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
 	echo "registering $NAME with the hub"
 	# curl sends no header at all for an empty $HELD. The status follows the body
 	# on a line of its own, so a refusal shows the hub's own reason: a closed
 	# window, a lockout, an entry that is not an https domain and a database
 	# error share one exit status under --fail. A request that got no response
-	# stops here, with curl's own message.
-	REPLY=$(curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
-		-H "X-Node-Token: $HELD" --data-binary "$NAME" "${SERVER%/}/api/agent/register") || exit 1
+	# stops here, with curl's own message. The name travels on stdin: as an
+	# argument, one beginning with @ would be read as a file to send.
+	REPLY=$(printf '%s' "$NAME" | curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
+		-H "X-Node-Token: $HELD" --data-binary @- "${SERVER%/}/api/agent/register") || exit 1
 	CODE=$(printf '%s\n' "$REPLY" | tail -n 1)
 	TOKEN=$(printf '%s\n' "$REPLY" | sed '$d')
 	if [ "$CODE" != 200 ]; then
@@ -249,7 +259,7 @@ if [ -z "$TOKEN" ]; then
 	fi
 	[ -n "$TOKEN" ] || { echo "the hub answered without a token" >&2; exit 1; }
 	if [ "$TOKEN" = "$HELD" ]; then
-		echo "this machine is already registered; keeping its token"
+		echo "this machine is already registered; keeping its token and the name the panel shows"
 	elif [ -n "$HELD" ]; then
 		echo "the token this machine held no longer opens a node; registered as a new node."
 		echo "if that token was reissued rather than its node deleted, delete the old node in the panel."
