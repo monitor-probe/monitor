@@ -157,11 +157,20 @@ pub fn proxied(app: &App, url: String) -> String {
 /// caller can request. Streaming bounds the memory each transfer holds; this
 /// bounds how many may run, closing the same gap as the password gate in `auth`.
 ///
-/// Four, because a node installs once: a handful of machines set up together is
-/// the expected load, not a sustained workload. Refused rather than queued, for
-/// the same reason.
+/// Four, because a node installs once: the load is a burst, not a sustained
+/// workload. A batch install or upgrade run in parallel -- ansible, pssh,
+/// `xargs -P` -- arrives as exactly that burst, so a request past the four waits
+/// its turn for up to [`RELAY_WAIT`] rather than being refused at once, which
+/// would fail eight of twelve parallel downloads within 2 ms. The semaphore is
+/// FIFO, and a waiting request holds its connection alone: no fetch, no buffer.
 const RELAY_SLOTS: usize = 4;
 static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RELAY_SLOTS);
+
+/// Longest a request waits for a relay slot before the 503. Below the 60 s nginx
+/// and the 100 s Cloudflare allow for a response head, so the refusal is the
+/// hub's own and says why; `install.sh` retries it. At about a second per
+/// transfer, four slots drain some 120 queued machines within it.
+const RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Longest a relay may hold its permit.
 ///
@@ -230,7 +239,7 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
     }
-    let Ok(permit) = RELAY_GATE.try_acquire() else {
+    let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
     };
     let url = release_url(&app, &arch);
