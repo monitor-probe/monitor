@@ -595,7 +595,7 @@ function RegisterDialog({ site, reg, onClose }: {
           {/* One string: JSX turns a line break inside CJK text into a visible space. */}
           <p className="text-sm text-muted-foreground">
             {"开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在列表里，" +
-              "名字默认取它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。"}
+              "名字默认取它的 hostname。命令里没有任何一台机器的凭证，可以同时发给多台机器。"}
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
