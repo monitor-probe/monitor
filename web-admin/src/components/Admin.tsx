@@ -2236,9 +2236,10 @@ function Update({ versions, reload, nodes, site, refusal }: {
                       发布说明
                     </a>
                   </Button>
-                  {/* The loop and the parallel forms are in that section. */}
+                  {/* The loop over the copied host list, and its parallel form, are in
+                      that section; the batch registration above it is for new machines. */}
                   <Button size="sm" variant="ghost" asChild>
-                    <a href={`${DOCS}/install/agent#%E6%89%B9%E9%87%8F%E6%B3%A8%E5%86%8C`} target="_blank" rel="noreferrer">
+                    <a href={`${DOCS}/install/agent#%E5%8D%87%E7%BA%A7`} target="_blank" rel="noreferrer">
                       批量升级的做法
                     </a>
                   </Button>
