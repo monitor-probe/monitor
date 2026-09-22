@@ -614,11 +614,11 @@ function RegisterDialog({ site, reg, onClose }: {
                 想按自己的主机名单命名，在命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
                 <a
                   className="ml-1 underline underline-offset-2 hover:text-foreground"
-                  href="https://monitor-document.pages.dev/install/agent#%E6%89%B9%E9%87%8F%E6%B3%A8%E5%86%8C"
+                  href="https://monitor-document.pages.dev/install/batch"
                   target="_blank"
                   rel="noreferrer"
                 >
-                  ssh 循环的写法
+                  批量执行的做法
                 </a>
               </p>
               <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
