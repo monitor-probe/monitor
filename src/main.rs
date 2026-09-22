@@ -385,10 +385,10 @@ async fn main() -> Result<()> {
     // measures every request against --site, so a value that is not an https
     // domain permanently refuses adding and installing nodes however the panel is
     // reached. The panel names --site in that refusal, and this warning reaches
-    // an operator who never opens the panel. A warning rather than a fatal error: the hub
-    // still serves everything else, and an operator upgrading into this check
-    // should not lose a running hub. `install-hub.sh` refuses the same values
-    // where they are entered.
+    // an operator who never opens the panel. A warning rather than a fatal
+    // error: the hub still serves everything else, and an operator upgrading
+    // into this check should not lose a running hub. `install-hub.sh` refuses
+    // the same values where they are entered.
     if !args.site.is_empty() && api::https_domain(&args.site).is_none() {
         warn!(
             "--site {} is not an https domain entry, so adding and installing nodes will be refused \

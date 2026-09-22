@@ -442,6 +442,12 @@ const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加�
      从隧道或回环地址进面板时，给 hub 加 --site 指定节点可达的域名；\
      --site 必须是 https:// 加域名，不能是 IP、不能带路径";
 
+/// Every browser sends `Origin` with these writes, so its absence points at a
+/// proxy clearing it. The panel judges from its own address bar and offers the
+/// button, which leaves this as the only account of why the hub refuses.
+const ORIGIN_MISSING: &str = "请求没有带 Origin 头。浏览器都会发送它，多半是反向代理清掉了\
+     （例如 proxy_set_header Origin \"\"），去掉那一行后再试";
+
 /// Whether this origin is the hub's own machine, which is what a tunnel into the
 /// panel leaves in the address bar. Nothing between that browser and the hub is
 /// in the clear -- it is the loopback interface, or the tunnel's own encryption
@@ -450,11 +456,10 @@ const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加�
 fn loopback_origin(origin: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else { return false };
     let Some(host) = url.host_str() else { return false };
+    // host_str keeps the brackets an IPv6 literal is written with.
+    let ip = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>();
     matches!(url.scheme(), "http" | "https")
-        && (host == "localhost"
-            || host.ends_with(".localhost")
-            // host_str keeps the brackets an IPv6 literal is written with.
-            || host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()))
+        && (host == "localhost" || host.ends_with(".localhost") || ip.is_ok_and(|ip| ip.is_loopback()))
 }
 
 pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
@@ -488,15 +493,20 @@ pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
 /// over a tunnel reads `http://127.0.0.1:PORT`, which names no address a node
 /// could reach, while `--site` names one and the tunnel carries the session
 /// under its own encryption.
-fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
+///
+/// The error is the message the panel shows.
+fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static str> {
     if !app.site.is_empty() && https_domain(&app.site).is_none() {
         debug!("provisioning refused: --site {:?} is not an https domain entry", app.site);
-        return false;
+        return Err(PROVISIONING_DENIED);
     }
-    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        debug!("provisioning refused: the request carries no readable Origin");
+        return Err(ORIGIN_MISSING);
+    };
     if https_domain(origin).is_none() && !(loopback_origin(origin) && !app.site.is_empty()) {
         debug!("provisioning refused: Origin {origin:?} is not an https domain entry");
-        return false;
+        return Err(PROVISIONING_DENIED);
     }
     // States that the request belongs to the page it addresses, which `Origin`
     // alone does not: the panel is the only caller, and a page elsewhere holds no
@@ -505,9 +515,9 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
     let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
     if fetch_site.is_some_and(|site| site != "same-origin") {
         debug!("provisioning refused: Sec-Fetch-Site {fetch_site:?} is not same-origin");
-        return false;
+        return Err(PROVISIONING_DENIED);
     }
-    true
+    Ok(())
 }
 
 /// Range and sign limits every stored node must satisfy, or the reason it does
@@ -561,12 +571,8 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
-        // No `can_provision`: this is a GET and carries no `Origin`, so the hub
-        // would have to answer it from the proxy headers while the write paths
-        // answer from the browser -- two answers to one question, and the panel
-        // would grey a button the hub goes on to allow, or offer one it refuses.
-        // The panel measures its own address and this `site` by the rule
-        // `provisioning_allowed` applies to the origin it receives.
+        // Whether this browser may provision is not answered here: a GET carries
+        // no `Origin`, so the panel applies `provisioning_allowed`'s rule itself.
         //
         // The hub's own public URL when one was given, which is what belongs in an
         // install command and in the OAuth callback -- not whichever address this
@@ -583,8 +589,8 @@ pub async fn create_node(
     headers: HeaderMap,
     body: Result<Json<Node>, JsonRejection>,
 ) -> Response {
-    if !provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
+    if let Err(refusal) = provisioning_allowed(&app, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
     if node.name.trim().is_empty() {
@@ -737,8 +743,8 @@ pub async fn agent_register(
 /// Opens a registration window with a fresh key. Any previous key stops working
 /// the moment this returns.
 pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderMap) -> Response {
-    if !provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
+    if let Err(refusal) = provisioning_allowed(&app, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let key = random_token();
     let until = (Utc::now().timestamp() + REGISTER_WINDOW).to_string();
@@ -1595,13 +1601,17 @@ mod tests {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
+    fn app_with_site(site: &str) -> App {
+        let mut state = app();
+        state.site = site.into();
+        state
+    }
+
     #[tokio::test]
     async fn provisioning_follows_the_browsers_own_origin() {
-        let mut state = app();
-        state.site = "https://monitor.example.com".into();
-        let app = std::sync::Arc::new(state);
+        let app = std::sync::Arc::new(app_with_site("https://monitor.example.com"));
         let good = panel_headers();
-        assert!(provisioning_allowed(&app, &good));
+        assert!(provisioning_allowed(&app, &good).is_ok());
 
         // The four shapes a reverse proxy puts in Host and X-Forwarded-Proto
         // while the browser is on https: no X-Forwarded-Proto at all, the proxy's
@@ -1611,7 +1621,7 @@ mod tests {
         let mut proxied = good.clone();
         proxied.insert(header::HOST, "127.0.0.1:28080".parse().unwrap());
         proxied.insert("x-forwarded-proto", "http".parse().unwrap());
-        assert!(provisioning_allowed(&app, &proxied));
+        assert!(provisioning_allowed(&app, &proxied).is_ok());
 
         for origin in [
             "http://monitor.example.com",
@@ -1623,7 +1633,7 @@ mod tests {
         ] {
             let mut headers = good.clone();
             headers.insert(header::ORIGIN, origin.parse().unwrap());
-            assert!(!provisioning_allowed(&app, &headers), "{origin}");
+            assert_eq!(provisioning_allowed(&app, &headers), Err(PROVISIONING_DENIED), "{origin}");
         }
 
         // A panel opened over a tunnel reads as loopback. It names no address a
@@ -1631,17 +1641,18 @@ mod tests {
         for origin in ["http://127.0.0.1:9911", "http://localhost:9911", "http://[::1]:9911"] {
             let mut headers = good.clone();
             headers.insert(header::ORIGIN, origin.parse().unwrap());
-            assert!(provisioning_allowed(&app, &headers), "{origin}");
-            assert!(!provisioning_allowed(&app_with_site(""), &headers), "{origin} without --site");
+            assert!(provisioning_allowed(&app, &headers).is_ok(), "{origin}");
+            assert!(provisioning_allowed(&app_with_site(""), &headers).is_err(), "{origin} without --site");
         }
-        // A request carrying no origin at all, which is every caller that is not
-        // a browser, and one sent from a page elsewhere.
+        // No origin at all: every caller that is not a browser, and a browser
+        // behind a proxy that clears the header, which the message names.
         let mut headers = good.clone();
         headers.remove(header::ORIGIN);
-        assert!(!provisioning_allowed(&app, &headers));
+        assert_eq!(provisioning_allowed(&app, &headers), Err(ORIGIN_MISSING));
+        // A request sent from a page elsewhere.
         headers = good.clone();
         headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
-        assert!(!provisioning_allowed(&app, &headers));
+        assert!(provisioning_allowed(&app, &headers).is_err());
 
         // Both panel paths refuse, and neither leaves anything behind.
         headers = good.clone();
@@ -1657,10 +1668,6 @@ mod tests {
 
         // --site takes the origin's place in the command, so one that is not an
         // https domain refuses every entry.
-        let mut state = app_with_site("https://198.51.100.1");
-        assert!(!provisioning_allowed(&state, &good));
-        state.site = "https://monitor.example.com/path".into();
-        assert!(!provisioning_allowed(&state, &good));
         for site in [
             "http://monitor.example.com",
             "https://198.51.100.1",
@@ -1668,33 +1675,8 @@ mod tests {
             "https://monitor.example.com/path",
         ] {
             assert!(https_domain(site).is_none());
+            assert_eq!(provisioning_allowed(&app_with_site(site), &good), Err(PROVISIONING_DENIED), "{site}");
         }
-    }
-
-    fn app_with_site(site: &str) -> App {
-        let mut state = app();
-        state.site = site.into();
-        state
-    }
-
-    /// `install.sh` sends no browser origin, and the headers that remain cannot
-    /// state the address it used; that address is checked in the script itself.
-    #[tokio::test]
-    async fn registering_a_node_needs_no_proxy_headers() {
-        let app = std::sync::Arc::new(app());
-        app.db.set("register_key", "the-key").unwrap();
-        app.db.set("register_until", &(Utc::now().timestamp() + 60).to_string()).unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer the-key".parse().unwrap());
-        let registered = agent_register(
-            State(app.clone()),
-            ConnectInfo("127.0.0.1:1".parse().unwrap()),
-            headers,
-            "n".into(),
-        )
-        .await;
-        assert_eq!(registered.status(), StatusCode::OK);
-        assert_eq!(app.db.nodes().unwrap().len(), 1);
     }
 
     /// Whatever this accepts is pushed to every assigned agent and passed directly

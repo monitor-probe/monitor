@@ -6,7 +6,7 @@ import { Admin } from "@/components/Admin"
 import { Login } from "@/components/Login"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { api, loopbackOrigin, provisioningSite, useNodes } from "@/lib/api"
+import { api, provisionRefusal, useNodes } from "@/lib/api"
 
 type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
 
@@ -145,15 +145,9 @@ export default function App() {
             // panel is frequently reached over a loopback port behind a proxy,
             // while the install command and OAuth callback need the real one.
             site={me.site || location.origin}
-            // The same two addresses the hub measures: the origin this page was
-            // loaded from, which reaches the hub as `Origin`, and `--site` when
-            // one is set, which takes that origin's place in the command. A
-            // tunnelled panel reads as loopback, which is a sound entry but no
-            // address for a node, so there the command rests on `--site` alone.
-            canProvision={
-              !!provisioningSite(me.site || location.origin)
-              && (!!provisioningSite(location.origin) || loopbackOrigin(location.origin))
-            }
+            // Why this page cannot add nodes, measured by the rule the hub applies
+            // to the `Origin` it receives; empty when it can.
+            refusal={provisionRefusal(location.origin, me.site)}
           />
         )}
       </main>
