@@ -541,7 +541,7 @@ function upgradeCommand(site: string) {
   return scriptCommand(site, () => ["--upgrade"])
 }
 
-export type Versions = { hub: string; hub_latest: string; agent_latest: string; check: boolean }
+export type Versions = { hub: string; hub_latest: string; agent_latest: string; notice: boolean }
 
 /**
  * What is running and what is published. Read once per panel load: the hub holds
@@ -2125,15 +2125,6 @@ function Data() {
   )
 }
 
-// The three lines the documentation gives. They also refresh the copy of the
-// script saved on the machine, which is what the next upgrade measures itself
-// against.
-const HUB_UPGRADE = [
-  "curl -fsSL https://github.com/monitor-probe/monitor/releases/latest/download/install-hub.sh -o install-hub.sh",
-  "chmod +x install-hub.sh",
-  "sudo ./install-hub.sh",
-].join("\n")
-
 const releaseUrl = (repo: string, version: string) => `https://github.com/monitor-probe/${repo}/releases/tag/v${version}`
 
 /** `v1.2.0 → v1.3.0` when something is published, the running version alone otherwise. */
@@ -2149,10 +2140,20 @@ function VersionPair({ current, latest }: { current: string; latest: string }) {
   )
 }
 
+/** Outdated nodes grouped by the version they run, oldest first. */
+function byVersion(nodes: Node[]): [string, Node[]][] {
+  const groups = new Map<string, Node[]>()
+  for (const n of nodes) groups.set(n.agent_version, [...(groups.get(n.agent_version) ?? []), n])
+  return [...groups].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+}
+
 /**
- * What is published for the hub and the agents, and how to take it. Its own
- * route rather than a banner on the node list; the dot in the navigation is
- * what says there is something here.
+ * What is published for the hub and the agents. Its own route rather than a
+ * banner on the node list; the dot in the navigation is what says there is
+ * something here.
+ *
+ * The hub card names the release alone: how to take it depends on how the hub
+ * was installed, script or container, which the hub cannot tell.
  */
 function Update({ versions, reload, nodes, site, refusal }: {
   versions: Versions | null
@@ -2164,17 +2165,15 @@ function Update({ versions, reload, nodes, site, refusal }: {
   const [saving, setSaving] = useState(false)
   if (!versions) return null
   const outdated = outdatedAgents(nodes, versions.agent_latest)
-  const hubBehind = behind(versions.hub, versions.hub_latest)
-  // The same gate the install commands sit behind: the command names the hub,
-  // and an address a node cannot reach is no use in it.
+  const offline = outdated.filter((n) => !n.online).length
   const upgrade = refusal ? "" : upgradeCommand(site)
-  const unreachable = versions.check && !versions.hub_latest && !versions.agent_latest
+  const unreachable = !versions.hub_latest && !versions.agent_latest
 
-  // Applied on the spot: one switch, and the cards above it change with it.
-  async function setCheck(on: boolean) {
+  // Applied on the spot: one switch, and the navigation changes with it.
+  async function setNotice(on: boolean) {
     setSaving(true)
     try {
-      await api("/settings", { method: "PUT", body: JSON.stringify({ update_check: on ? "on" : "off" }) })
+      await api("/settings", { method: "PUT", body: JSON.stringify({ update_notice: on ? "on" : "off" }) })
       reload()
     } catch (e) {
       toast.error((e as Error).message)
@@ -2196,42 +2195,28 @@ function Update({ versions, reload, nodes, site, refusal }: {
       <Card className="gap-4 p-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-medium">hub</h3>
-          {versions.check
-            ? <VersionPair current={versions.hub} latest={versions.hub_latest} />
-            : <span className="text-xs text-muted-foreground">当前 v{versions.hub}</span>}
-        </div>
-        {hubBehind && (
-          <>
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              重跑一键脚本即升级：校验通过才替换，起不来自动回滚，端口与 <code>--site</code> 沿用上次的。
-              容器部署改为 <code>docker pull</code> 后用原命令重建。
-            </p>
-            <Command>{HUB_UPGRADE}</Command>
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" variant="secondary" onClick={() => copy(HUB_UPGRADE)}>
-                <Copy className="size-4" /> 复制命令
-              </Button>
+          <div className="flex items-center gap-3">
+            <VersionPair current={versions.hub} latest={versions.hub_latest} />
+            {behind(versions.hub, versions.hub_latest) && (
               <Button size="sm" variant="ghost" asChild>
                 <a href={releaseUrl("monitor", versions.hub_latest)} target="_blank" rel="noreferrer">
                   发布说明
                 </a>
               </Button>
-            </div>
-          </>
-        )}
+            )}
+          </div>
+        </div>
       </Card>
 
       <Card className="gap-4 p-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-medium">agent</h3>
           <span className="text-xs text-muted-foreground">
-            {!versions.check
-              ? "检查已关闭"
-              : versions.agent_latest
-                ? outdated.length
-                  ? <>最新 v{versions.agent_latest} · <span className="font-medium text-foreground">{outdated.length} 台待升级</span></>
-                  : `全部已是最新 v${versions.agent_latest}`
-                : "查不到版本"}
+            {versions.agent_latest
+              ? outdated.length
+                ? <>最新 v{versions.agent_latest} · <span className="font-medium text-foreground">{outdated.length} 台待升级</span></>
+                : `全部已是最新 v${versions.agent_latest}`
+              : "查不到版本"}
           </span>
         </div>
         {outdated.length > 0 && (
@@ -2251,7 +2236,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
                       发布说明
                     </a>
                   </Button>
-                  {/* The loop, ansible and boot-script forms are all in that section. */}
+                  {/* The loop, the host list and the parallel forms are all in that section. */}
                   <Button size="sm" variant="ghost" asChild>
                     <a href={`${DOCS}/install/agent#%E5%8D%87%E7%BA%A7`} target="_blank" rel="noreferrer">
                       批量升级的做法
@@ -2262,28 +2247,48 @@ function Update({ versions, reload, nodes, site, refusal }: {
             ) : (
               <p className="text-xs text-muted-foreground">{refusal}</p>
             )}
-            {/* Named as well as counted: the count sizes the loop, the names say
-                which machines it visits. */}
-            <div className="flex max-h-40 flex-wrap gap-1.5 overflow-auto border-t pt-3">
-              {outdated.map((n) => (
-                <Badge key={n.id} variant="secondary" className="font-normal">
-                  {n.name}
-                  <span className="ml-1 text-muted-foreground">v{n.agent_version}</span>
-                </Badge>
-              ))}
+            {/* Grouped by version so any number of nodes reads as a few lines, and
+                bounded in height; the list itself goes out through the copy
+                button, one name per line, which is what a loop over hosts reads. */}
+            <div className="space-y-3 border-t pt-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">
+                  {offline ? `其中 ${offline} 台离线，重新连上之前升级不了` : "待升级的节点"}
+                </span>
+                <Button size="sm" variant="ghost" onClick={() => copy(outdated.map((n) => n.name).join("\n"))}>
+                  <Copy className="size-4" /> 复制名单
+                </Button>
+              </div>
+              <div className="max-h-60 space-y-3 overflow-auto">
+                {byVersion(outdated).map(([version, group]) => (
+                  <div key={version} className="space-y-1.5">
+                    <div className="text-xs text-muted-foreground">v{version} · {group.length} 台</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {group.map((n) => (
+                        <Badge
+                          key={n.id}
+                          variant="secondary"
+                          className={`font-normal ${n.online ? "" : "opacity-50"}`}
+                          title={n.online ? undefined : "离线"}
+                        >
+                          {n.name}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           </>
         )}
       </Card>
 
-      {/* It governs what the two cards above can say, so it lives with them
-          rather than among the site settings. */}
       <OptionRow
-        title="检查更新"
-        hint="关闭后不再向 GitHub 查询，这一页只显示当前版本"
+        title="更新提醒"
+        hint="有新版本时在导航的「更新」旁显示小圆点。关闭只是不再显示圆点，这一页照常检查"
         toggle
       >
-        <Switch checked={versions.check} disabled={saving} onCheckedChange={setCheck} />
+        <Switch checked={versions.notice} disabled={saving} onCheckedChange={setNotice} />
       </OptionRow>
     </div>
   )
@@ -2322,10 +2327,10 @@ export function Admin({
   refusal: string
 }) {
   const { versions, reload } = useVersions()
-  // One dot for both; the page separates them. Absent while the lookup is off
-  // or failed, which is also when the page has nothing to say.
+  // One dot for both; the page separates them. Absent when switched off on that
+  // page, or when the lookup failed and the page has nothing to say.
   const updates =
-    !!versions
+    !!versions?.notice
     && (behind(versions.hub, versions.hub_latest) || outdatedAgents(nodes, versions.agent_latest).length > 0)
   return (
     <div className="flex flex-col gap-6 md:flex-row">

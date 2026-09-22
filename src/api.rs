@@ -959,7 +959,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
-    "update_check",
+    "update_notice",
 ];
 
 // ---- the database itself ----
@@ -1312,15 +1312,6 @@ const RELEASES_RETRY: i64 = 600;
 /// business. Nothing is fetched until an administrator opens the panel, so a hub
 /// nobody looks at makes no outbound request at all.
 pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
-    // Switched off in the panel: nothing is fetched and no latest version is
-    // reported, leaving the running version alone. `check` travels with the
-    // answer because the panel words a switched-off lookup differently from an
-    // unreachable github.com.
-    if app.db.get("update_check").as_deref() == Some("off") {
-        return Json(
-            json!({"hub": env!("CARGO_PKG_VERSION"), "hub_latest": "", "agent_latest": "", "check": false}),
-        );
-    }
     let cached = app.releases.lock().unwrap().clone();
     let latest = if fresh_enough(&cached, Utc::now().timestamp()) {
         cached
@@ -1344,7 +1335,9 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
         // github.com is a supported deployment, not a fault to report.
         "hub_latest": latest.hub,
         "agent_latest": latest.agent,
-        "check": true,
+        // Whether the navigation marks an update. It governs the mark alone: the
+        // lookup runs either way, so the update page still answers when opened.
+        "notice": app.db.get("update_notice").as_deref() != Some("off"),
     }))
 }
 
