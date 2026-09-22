@@ -64,7 +64,7 @@ if [ -n "$UNINSTALL" ]; then
 	systemctl disable --now monitor-agent 2>/dev/null || true
 	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
 	systemctl daemon-reload 2>/dev/null || true
-	userdel monitor-agent 2>/dev/null || true
+	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
 	echo "monitor-agent uninstalled"
 	exit 0
@@ -208,17 +208,22 @@ else
 	exit 1
 fi
 
-add_user() { useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent; }
+# Alpine ships BusyBox adduser rather than useradd: -S system, -D no password,
+# -H no home.
+add_user() {
+	if command -v useradd >/dev/null; then
+		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent
+	else
+		adduser -S -D -H -s /sbin/nologin monitor-agent
+	fi
+}
 
-# The service user the unit below runs as, created before the download and the
-# registration, so a host where this fails keeps the agent it already runs and
-# spends no registration key. OpenRC has no equivalent and Alpine ships no
-# useradd, which is why this is confined to systemd. One case passes this check
+# The service user the agent runs as under either init system, created before
+# the download and the registration, so a host where this fails keeps the agent
+# it already runs and spends no registration key. One case passes this check
 # without a user and is settled after the old agent stops; see there.
-if [ "$INIT" = systemd ]; then
-	id -u monitor-agent >/dev/null 2>&1 || add_user ||
-		{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
-fi
+id -u monitor-agent >/dev/null 2>&1 || add_user ||
+	{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
 
 case "$(uname -m)" in
 x86_64 | amd64) ARCH=x86_64 ;;
@@ -375,6 +380,7 @@ description="monitor agent"
 command="$BIN"
 command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
 supervisor="supervise-daemon"
+command_user="monitor-agent"
 respawn_delay=5
 output_log="$LOG_FILE"
 error_log="$LOG_FILE"
@@ -383,8 +389,12 @@ depend() {
 	need net
 }
 
-# The token stays in the root-only env file rather than the service script.
+# The token stays in the root-only env file rather than the service script;
+# this runs as root, and the agent inherits what it exports. supervise-daemon
+# opens the log only after dropping to command_user, so the file must be the
+# agent's, including one an earlier install left to root.
 start_pre() {
+	checkpath --file --owner monitor-agent --mode 0600 $LOG_FILE
 	set -a
 	. $ENV_FILE
 	set +a
@@ -393,6 +403,12 @@ RC
 	chmod 0755 "$RC_FILE"
 	rc-update add monitor-agent default >/dev/null
 	rc-service monitor-agent restart
+	# supervise-daemon reports the service started while it respawns an agent
+	# that exits at once, so the process itself is what is looked for, inside
+	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
+	# against the full path.
+	sleep 3
+	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
