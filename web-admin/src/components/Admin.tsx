@@ -1323,6 +1323,10 @@ function ThemeSettings({ theme, saved, onClose }: {
   const paged = large && sections.length > 1
   const [current, setCurrent] = useState(0)
   const [values, setValues] = useState(() => configValues(fields, saved))
+  // What the save builds on. Keys the form does not declare are kept, except
+  // after 恢复默认: that also clears them, the only way from the panel to drop
+  // a value, publicly readable, left by a field the theme has since removed.
+  const [base, setBase] = useState(saved)
   const [saving, setSaving] = useState(false)
   const set = (key: string, value: unknown) => setValues((old) => ({ ...old, [key]: value }))
   const label = (field: ConfigField) => field.label || field.key
@@ -1350,7 +1354,7 @@ function ThemeSettings({ theme, saved, onClose }: {
     try {
       await api(`/themes/${theme.short}/config`, {
         method: "PUT",
-        body: JSON.stringify(configOverrides(fields, saved, Object.fromEntries(fields.map((f) => [f.key, typed(f)])))),
+        body: JSON.stringify(configOverrides(fields, base, Object.fromEntries(fields.map((f) => [f.key, typed(f)])))),
       })
       toast.success("主题设置已保存，公开页刷新后生效")
       onClose()
@@ -1457,7 +1461,10 @@ function ThemeSettings({ theme, saved, onClose }: {
               type="button"
               variant="ghost"
               className="mr-auto"
-              onClick={() => setValues(Object.fromEntries(fields.map((f) => [f.key, f.default])))}
+              onClick={() => {
+                setValues(Object.fromEntries(fields.map((f) => [f.key, f.default])))
+                setBase({})
+              }}
             >
               {paged ? "全部恢复默认" : "恢复默认"}
             </Button>

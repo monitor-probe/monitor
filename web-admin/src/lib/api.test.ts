@@ -140,6 +140,8 @@ const initial = configValues(form, saved)
 assert.deepEqual(initial, { notice: "", layout: "grid", refresh: 10, dark: false })
 assert.equal(fits(form[2], 61), false)
 assert.deepEqual(configOverrides(form, saved, { ...initial, refresh: 5, dark: true }), { legacy: 1, dark: true })
+// 恢复默认 builds on nothing, so undeclared keys go with the overrides.
+assert.deepEqual(configOverrides(form, {}, Object.fromEntries(form.map((f) => [f.key, f.default]))), {})
 // Headings split the form; leading fields get a section, empty headings none.
 assert.deepEqual(
   configSections(configForm([{ key: "a", type: "string", default: "" }, { type: "title", label: "空" }, { type: "title", label: "外观" }, { key: "b", type: "boolean", default: true }]))

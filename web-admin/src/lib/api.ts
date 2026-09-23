@@ -177,8 +177,8 @@ export function configValues(fields: ConfigField[], saved: Record<string, unknow
 /**
  * What the panel stores: only the fields that differ from their defaults, so a
  * default the theme changes later reaches every site that never altered it.
- * Keys the current form does not declare are kept -- a field a newer version
- * dropped returns with a downgrade.
+ * Keys in `saved` the current form does not declare are kept -- a field a
+ * newer version dropped returns with a downgrade; an empty `saved` clears them.
  */
 export function configOverrides(
   fields: ConfigField[],
