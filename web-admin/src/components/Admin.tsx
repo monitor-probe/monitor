@@ -2251,16 +2251,11 @@ function Update({ versions, reload, nodes, site, refusal }: {
               <p className="text-xs text-muted-foreground">{refusal}</p>
             )}
             {/* Grouped by version so any number of nodes reads as a few lines, and
-                bounded in height; the copy button gives one name per line. */}
+                bounded in height. */}
             {outdated.length > 0 && (
               <div className="space-y-3 border-t pt-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-xs text-muted-foreground">
-                    {offline ? `其中 ${offline} 台离线` : "待升级的节点"}
-                  </span>
-                  <Button size="sm" variant="ghost" onClick={() => copy(outdated.map((n) => n.name).join("\n"))}>
-                    <Copy className="size-4" /> 复制名单
-                  </Button>
+                <div className="text-xs text-muted-foreground">
+                  {offline ? `其中 ${offline} 台离线` : "待升级的节点"}
                 </div>
                 <div className="max-h-60 space-y-3 overflow-auto">
                   {byVersion(outdated).map(([version, group]) => (
