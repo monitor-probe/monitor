@@ -524,9 +524,11 @@ function ifaceArg(iface: string | undefined) {
 // One command for a batch of machines. The key belongs to the hub, is valid only
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
-// used directly in a loop.
+// sent to every machine as it is. The default interval is left out, as an
+// untouched --iface is: a rerun then keeps what the machine already has.
 function registerCommand(site: string, key: string, seconds: number, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, `--interval ${seconds}`, ...ifaceArg(iface)])
+  const interval = seconds === 1 ? [] : [`--interval ${seconds}`]
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...interval, ...ifaceArg(iface)])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -608,10 +610,9 @@ function RegisterDialog({ site, reg, onClose }: {
               <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
                 {command || "网卡名有误，改正后显示命令"}
               </Command>
-              {/* Per machine, so it cannot be part of the one command: the loop
-                  supplies it, and the documentation shows the quoting. */}
+              {/* Per machine, so it cannot be part of the one command. */}
               <p className="text-xs leading-relaxed text-muted-foreground">
-                想按自己的主机名单命名，在命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
+                要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
                 <a
                   className="ml-1 underline underline-offset-2 hover:text-foreground"
                   href="https://monitor-document.pages.dev/install/batch"

@@ -79,8 +79,9 @@ fi
 [ -z "$NAME" ] || [ -n "$REGISTER" ] ||
 	{ echo "--name applies only with --register; rename an existing node in the panel" >&2; exit 2; }
 # A setting of this machine, kept by a rerun without the flag for the reason
-# given for --iface below: the batch command carries none. It is read back from
-# the service definition the last install wrote; a first install takes 1.
+# given for --iface below: the batch command carries none at the default. It is
+# read back from the service definition the last install wrote; a first install
+# takes 1.
 if [ -z "$INTERVAL" ]; then
 	INTERVAL=$(cat "$UNIT_FILE" "$RC_FILE" 2>/dev/null | sed -n \
 		-e 's/^ExecStart=.* --interval \([0-9][0-9]*\).*/\1/p' \
@@ -235,9 +236,8 @@ if [ -z "$TOKEN" ]; then
 	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
 		HELD=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	fi
-	# --name as given, which a batch loop sets from its own host list, or else
-	# the hostname, restricted to characters a hostname may contain. The hub
-	# trims and bounds either.
+	# --name as given on this machine, or else the hostname, restricted to
+	# characters a hostname may contain. The hub trims and bounds either.
 	[ -n "$NAME" ] || NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
 	echo "registering $NAME with the hub"
 	# curl sends no header at all for an empty $HELD. The status follows the body
