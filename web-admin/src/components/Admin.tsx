@@ -2219,7 +2219,9 @@ function Update({ versions, reload, nodes, site, refusal }: {
               : "查不到版本"}
           </span>
         </div>
-        {outdated.length > 0 && (
+        {/* Also where the lookup failed: the command does not depend on it, and a
+            hub that fetches agents through the GitHub proxy cannot read tags. */}
+        {(outdated.length > 0 || !versions.agent_latest) && (
           <>
             <p className="text-xs leading-relaxed text-muted-foreground">
               以 root 在每台机器上执行一次。不含凭证，沿用机器上已有的设置，不会新建节点。
@@ -2231,11 +2233,13 @@ function Update({ versions, reload, nodes, site, refusal }: {
                   <Button size="sm" variant="secondary" onClick={() => copy(upgrade)}>
                     <Copy className="size-4" /> 复制命令
                   </Button>
-                  <Button size="sm" variant="ghost" asChild>
-                    <a href={releaseUrl("agent", versions.agent_latest)} target="_blank" rel="noreferrer">
-                      发布说明
-                    </a>
-                  </Button>
+                  {versions.agent_latest && (
+                    <Button size="sm" variant="ghost" asChild>
+                      <a href={releaseUrl("agent", versions.agent_latest)} target="_blank" rel="noreferrer">
+                        发布说明
+                      </a>
+                    </Button>
+                  )}
                   <Button size="sm" variant="ghost" asChild>
                     <a href="https://monitor-document.pages.dev/install/batch" target="_blank" rel="noreferrer">
                       批量升级的做法
@@ -2248,35 +2252,37 @@ function Update({ versions, reload, nodes, site, refusal }: {
             )}
             {/* Grouped by version so any number of nodes reads as a few lines, and
                 bounded in height; the copy button gives one name per line. */}
-            <div className="space-y-3 border-t pt-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs text-muted-foreground">
-                  {offline ? `其中 ${offline} 台离线` : "待升级的节点"}
-                </span>
-                <Button size="sm" variant="ghost" onClick={() => copy(outdated.map((n) => n.name).join("\n"))}>
-                  <Copy className="size-4" /> 复制名单
-                </Button>
-              </div>
-              <div className="max-h-60 space-y-3 overflow-auto">
-                {byVersion(outdated).map(([version, group]) => (
-                  <div key={version} className="space-y-1.5">
-                    <div className="text-xs text-muted-foreground">v{version} · {group.length} 台</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {group.map((n) => (
-                        <Badge
-                          key={n.id}
-                          variant="secondary"
-                          className={`font-normal ${n.online ? "" : "opacity-50"}`}
-                          title={n.online ? undefined : "离线"}
-                        >
-                          {n.name}
-                        </Badge>
-                      ))}
+            {outdated.length > 0 && (
+              <div className="space-y-3 border-t pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {offline ? `其中 ${offline} 台离线` : "待升级的节点"}
+                  </span>
+                  <Button size="sm" variant="ghost" onClick={() => copy(outdated.map((n) => n.name).join("\n"))}>
+                    <Copy className="size-4" /> 复制名单
+                  </Button>
+                </div>
+                <div className="max-h-60 space-y-3 overflow-auto">
+                  {byVersion(outdated).map(([version, group]) => (
+                    <div key={version} className="space-y-1.5">
+                      <div className="text-xs text-muted-foreground">v{version} · {group.length} 台</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {group.map((n) => (
+                          <Badge
+                            key={n.id}
+                            variant="secondary"
+                            className={`font-normal ${n.online ? "" : "opacity-50"}`}
+                            title={n.online ? undefined : "离线"}
+                          >
+                            {n.name}
+                          </Badge>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </>
         )}
       </Card>

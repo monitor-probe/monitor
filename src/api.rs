@@ -1308,9 +1308,9 @@ const RELEASES_RETRY: i64 = 600;
 /// itself and names the nodes to upgrade.
 ///
 /// Admin-only, and deliberately not part of `/api/me`: that route answers
-/// anonymous callers, and which hub version is running is not a visitor's
-/// business. Nothing is fetched until an administrator opens the panel, so a hub
-/// nobody looks at makes no outbound request at all.
+/// anonymous callers, to whom the running hub version is not disclosed. Nothing
+/// is fetched until an administrator opens the panel, so a hub whose panel is
+/// never opened makes no outbound request.
 pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
     let cached = app.releases.lock().unwrap().clone();
     let latest = if fresh_enough(&cached, Utc::now().timestamp()) {
@@ -1351,24 +1351,24 @@ fn fresh_enough(cached: &crate::Releases, now: i64) -> bool {
 }
 
 /// The tag of a repository's latest release, without its leading `v`, or None
-/// where GitHub could not be read. Unauthenticated, as in `update_theme`, and
-/// never through the panel's GitHub proxy: most proxies front release downloads
-/// alone, and an unreadable tag costs only the update notice.
+/// where GitHub could not be read, which costs only the update notice.
 async fn latest_tag(app: &App, repo: &str) -> Option<String> {
-    let release: Release = app
-        .http
+    let tag = latest_release(app, repo).await.ok()?.tag_name;
+    Some(tag.strip_prefix('v').unwrap_or(&tag).to_owned())
+}
+
+/// The latest release of `owner/repo`. Unauthenticated: 60 requests per hour from
+/// this address. GitHub returns 403 without a User-Agent. Never through the
+/// panel's GitHub proxy, which most mirrors provide for release downloads alone.
+async fn latest_release(app: &App, repo: &str) -> reqwest::Result<Release> {
+    app.http
         .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
         .header(header::USER_AGENT, "monitor-hub")
         .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
+        .await?
+        .error_for_status()?
         .json()
         .await
-        .ok()?;
-    let tag = release.tag_name;
-    Some(tag.strip_prefix('v').unwrap_or(&tag).to_owned())
 }
 
 #[derive(Deserialize)]
@@ -1434,18 +1434,9 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     let (owner, repo) = github_repo(&installed.url)
         .context("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包")?;
 
-    // Unauthenticated: 60 requests per hour from this address, ample for a manual
-    // action. GitHub returns 403 without a User-Agent.
-    let release: Release = app
-        .http
-        .get(format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"))
-        .header(header::USER_AGENT, "monitor-hub")
-        .send()
-        .await?
-        .error_for_status()
-        .with_context(|| format!("读不到 {owner}/{repo} 的最新 release"))?
-        .json()
-        .await?;
+    let release = latest_release(app, &format!("{owner}/{repo}"))
+        .await
+        .with_context(|| format!("读不到 {owner}/{repo} 的最新 release"))?;
 
     // Tags read `v1.2.3` while manifests carry `1.2.3`. Equal means up to date;
     // anything else is installed, including a deliberate downgrade, since the
