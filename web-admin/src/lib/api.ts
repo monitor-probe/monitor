@@ -144,6 +144,23 @@ export function configFields(config: unknown): ConfigField[] {
   return configForm(config).filter((entry): entry is ConfigField => entry.type !== "title")
 }
 
+/**
+ * The form split at its headings. Fields ahead of the first heading form a
+ * section of their own, and a heading with no field under it is dropped, so
+ * every section listed has something to show.
+ */
+export function configSections(form: (ConfigField | ConfigTitle)[]): { label: string; fields: ConfigField[] }[] {
+  const sections: { label: string; fields: ConfigField[] }[] = []
+  for (const entry of form) {
+    if (entry.type === "title") sections.push({ label: entry.label, fields: [] })
+    else {
+      if (!sections.length) sections.push({ label: "通用", fields: [] })
+      sections[sections.length - 1].fields.push(entry)
+    }
+  }
+  return sections.filter((section) => section.fields.length)
+}
+
 /** The value each field shows: the saved one while the field can still hold it, else the default. */
 export function configValues(fields: ConfigField[], saved: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(fields.map((f) => [f.key, fits(f, saved[f.key]) ? saved[f.key] : f.default]))

@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, badIfaceName, behind, changes, configFields, configForm, configOverrides, configValues, currentIface, fits, GIB, ifaceChoice, ifaceSpec, isPublic, loopbackOrigin, outdatedAgents, provisionRefusal, provisioningSite, trafficCorrection } from "./api.ts"
+import { addresses, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, ifaceChoice, ifaceSpec, isPublic, loopbackOrigin, outdatedAgents, provisionRefusal, provisioningSite, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -135,3 +135,10 @@ const initial = configValues(form, saved)
 assert.deepEqual(initial, { notice: "", layout: "grid", refresh: 10, dark: false })
 assert.equal(fits(form[2], 61), false)
 assert.deepEqual(configOverrides(form, saved, { ...initial, refresh: 5, dark: true }), { legacy: 1, dark: true })
+// Headings split the form; leading fields get a section, empty headings none.
+assert.deepEqual(
+  configSections(configForm([{ key: "a", type: "string", default: "" }, { type: "title", label: "空" }, { type: "title", label: "外观" }, { key: "b", type: "boolean", default: true }]))
+    .map((s) => [s.label, s.fields.map((f) => f.key)]),
+  [["通用", ["a"]], ["外观", ["b"]]],
+)
+
