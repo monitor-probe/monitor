@@ -59,6 +59,8 @@ export type Node = {
   hostname?: string
   /** ISO 3166-1 alpha-2 as shown: the one set by hand, else the one looked up from the node's address. */
   country: string
+  /** Set by hand and public; empty is ungrouped. Absent from a hub predating groups. */
+  group?: string
   /** Panel only. Set by hand; empty is automatic. */
   country_pin?: string
   /** Panel only. The looked-up country, which a pin hides. */
@@ -77,6 +79,18 @@ export type Node = {
 }
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[]; auto_join: boolean }
+
+/** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
+export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
+  return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]
+}
+
+/** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */
+export function inGroup<T extends Pick<Node, "group">>(nodes: T[], filter: string): T[] {
+  if (filter === "all") return nodes
+  const group = filter === "none" ? "" : filter.slice(1)
+  return nodes.filter((n) => (n.group ?? "") === group)
+}
 
 /** Form snapshots must never overwrite fields the user did not edit. */
 export function changes<T extends object>(initial: T, values: Partial<T>): Partial<T> {

@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS node (
   -- Set in the panel. When not empty it is the country shown, in place of the
   -- looked-up one, which goes on updating underneath.
   country_pin TEXT NOT NULL DEFAULT '',
+  -- Set in the panel and shown on the status page, where a theme may divide the
+  -- node list by it. Empty is ungrouped. Not `group`, a reserved word.
+  group_name TEXT NOT NULL DEFAULT '',
   -- Set in the panel, each replacing the address shown for its family. Empty
   -- means automatic. Panel only, like the reported addresses.
   ipv4_pin TEXT NOT NULL DEFAULT '', ipv6_pin TEXT NOT NULL DEFAULT '',
@@ -149,7 +152,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -266,6 +269,10 @@ fn migrate_to_6(conn: &Connection) -> Result<()> {
     add_column(conn, "ping_task", "auto_join INTEGER NOT NULL DEFAULT 0")
 }
 
+fn migrate_to_7(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "group_name TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -296,6 +303,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 6 {
         migrate_to_6(&tx)?;
+    }
+    if from < 7 {
+        migrate_to_7(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -373,6 +383,9 @@ pub struct Node {
     /// `country`. What the status page shows is this when present.
     #[serde(default)]
     pub country_pin: String,
+    /// Set in the panel; empty is ungrouped. Public, like the name.
+    #[serde(default)]
+    pub group: String,
     /// Set in the panel, in canonical form, for what neither agent nor hub can
     /// know: the home line behind a transparent proxy, or which of several public
     /// addresses to show. Each replaces the address shown for its family; empty
@@ -419,6 +432,7 @@ pub struct NodePatch {
     pub country_pin: Option<String>,
     pub ipv4_pin: Option<String>,
     pub ipv6_pin: Option<String>,
+    pub group: Option<String>,
 }
 
 fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
@@ -621,8 +635,9 @@ impl Db {
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
-                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
+                               group_name)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -635,7 +650,8 @@ impl Db {
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
-                Utc::now().timestamp()
+                Utc::now().timestamp(),
+                n.group
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -663,38 +679,59 @@ impl Db {
 
     /// False when no node has this id.
     pub fn update_node(&self, id: i64, n: &NodePatch) -> Result<bool> {
-        let found = self.conn().execute(
-            "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
-                             price=COALESCE(?5,price), currency=COALESCE(?6,currency),
-                             billing_cycle=COALESCE(?7,billing_cycle),
-                             expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
-                             remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
-                             traffic_mode=COALESCE(?12,traffic_mode),
-                             traffic_reset_day=COALESCE(?13,traffic_reset_day),
-                             notify=COALESCE(?14,notify), country_pin=COALESCE(?15,country_pin),
-                             ipv4_pin=COALESCE(?16,ipv4_pin), ipv6_pin=COALESCE(?17,ipv6_pin)
-             WHERE id=?1",
-            params![
-                id,
-                n.name,
-                n.sort,
-                n.public,
-                n.price,
-                n.currency,
-                n.billing_cycle,
-                n.expires_at.is_some(),
-                n.expires_at.as_ref().and_then(|v| v.as_deref()),
-                n.remark,
-                n.traffic_limit,
-                n.traffic_mode,
-                n.traffic_reset_day,
-                n.notify,
-                n.country_pin,
-                n.ipv4_pin,
-                n.ipv6_pin
-            ],
-        )?;
-        Ok(found > 0)
+        self.update_nodes(&[id], n)
+    }
+
+    /// Applies one patch to every node in `ids` in a single transaction. False,
+    /// with nothing written, when any of them no longer exists: a batch applied
+    /// to part of what was selected would leave the panel to work out which part.
+    pub fn update_nodes(&self, ids: &[i64], n: &NodePatch) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut update = tx.prepare(
+                "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
+                                 price=COALESCE(?5,price), currency=COALESCE(?6,currency),
+                                 billing_cycle=COALESCE(?7,billing_cycle),
+                                 expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
+                                 remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
+                                 traffic_mode=COALESCE(?12,traffic_mode),
+                                 traffic_reset_day=COALESCE(?13,traffic_reset_day),
+                                 notify=COALESCE(?14,notify), country_pin=COALESCE(?15,country_pin),
+                                 ipv4_pin=COALESCE(?16,ipv4_pin), ipv6_pin=COALESCE(?17,ipv6_pin),
+                                 group_name=COALESCE(?18,group_name)
+                 WHERE id=?1",
+            )?;
+            for id in ids {
+                let found = update.execute(params![
+                    id,
+                    n.name,
+                    n.sort,
+                    n.public,
+                    n.price,
+                    n.currency,
+                    n.billing_cycle,
+                    n.expires_at.is_some(),
+                    n.expires_at.as_ref().and_then(|v| v.as_deref()),
+                    n.remark,
+                    n.traffic_limit,
+                    n.traffic_mode,
+                    n.traffic_reset_day,
+                    n.notify,
+                    n.country_pin,
+                    n.ipv4_pin,
+                    n.ipv6_pin,
+                    n.group
+                ])?;
+                // Dropping the transaction uncommitted rolls back the nodes
+                // already updated.
+                if found == 0 {
+                    return Ok(false);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
@@ -729,13 +766,30 @@ impl Db {
 
     /// False when no node has this id.
     pub fn delete_node(&self, id: i64) -> Result<bool> {
-        let conn = self.conn();
-        // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
-        // for the chart query -- so it is cleared explicitly. SQLite reassigns a
-        // deleted node's id to the next node created, which would otherwise
-        // inherit the removed machine's latency chart.
-        conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
-        Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
+        Ok(self.delete_nodes(&[id])? > 0)
+    }
+
+    /// Deletes every node in `ids` and returns how many existed. An id already
+    /// gone is not an error: the caller wanted it gone.
+    ///
+    /// One transaction per node, with the connection released between them.
+    /// Clearing a node's latency history -- 100,800 rows at a week of ten probes
+    /// a minute -- measured 50 to 80 ms, so one transaction over a hundred nodes
+    /// would hold every agent's report back for about six seconds.
+    pub fn delete_nodes(&self, ids: &[i64]) -> Result<usize> {
+        let mut deleted = 0;
+        for id in ids {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            // `ping_record` carries no foreign key -- it is WITHOUT ROWID and
+            // keyed for the chart query -- so it is cleared explicitly. SQLite
+            // reassigns a deleted node's id to the next node created, which
+            // would otherwise inherit the removed machine's latency chart.
+            tx.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
+            deleted += tx.execute("DELETE FROM node WHERE id = ?1", [id])?;
+            tx.commit()?;
+        }
+        Ok(deleted)
     }
 
     /// Replaces a node's token, which immediately locks out the old one. False
@@ -1231,7 +1285,7 @@ impl Db {
     /// Deletes a probe and the results filed under it.
     ///
     /// `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed for
-    /// the chart query -- so it is cleared explicitly, as in `delete_node`.
+    /// the chart query -- so it is cleared explicitly, as in `delete_nodes`.
     /// SQLite reassigns a deleted probe's id to the next one created, and the
     /// chart selects on `task_id IN (assignments for this node)`: without this
     /// the new probe would draw the removed one's latency under its own name,
@@ -1738,6 +1792,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         ipv6: s("ipv6"),
         country: s("country"),
         country_pin: s("country_pin"),
+        group: s("group_name"),
         ipv4_pin: s("ipv4_pin"),
         ipv6_pin: s("ipv6_pin"),
         last_seen: n("last_seen"),

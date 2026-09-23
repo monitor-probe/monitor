@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { ArrowUpCircle, Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, badIfaceName, behind, changes, currentIface, GIB, ifaceChoice, ifaceSpec, outdatedAgents, provisioningSite, trafficCorrection, upload, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { addresses, api, badIfaceName, behind, changes, groupsOf, inGroup, currentIface, GIB, ifaceChoice, ifaceSpec, outdatedAgents, provisioningSite, trafficCorrection, upload, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -74,26 +74,56 @@ function Addresses({ node }: { node: Node }) {
   )
 }
 
-// Name, address and country: what a node is looked up by, in every node list.
+// Name, address, country and group: what a node is looked up by, in every node list.
 function searchNodes(nodes: Node[], query: string) {
   const needle = query.trim().toLowerCase()
   if (!needle) return nodes
   return nodes.filter((n) =>
-    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country].some((v) => v?.toLowerCase().includes(needle)))
+    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country, n.group].some((v) => v?.toLowerCase().includes(needle)))
+}
+
+// A filter naming a group no node carries any more -- renamed, or its last node
+// deleted -- falls back to all rather than showing an empty list.
+function useGroupFilter(nodes: Node[]) {
+  const [filter, setFilter] = useState("all")
+  const valid = filter === "all" || filter === "none" || nodes.some((n) => n.group === filter.slice(1))
+  return [valid ? filter : "all", setFilter] as const
+}
+
+// Offered once some node has a group. 未分组 is where a batch of freshly
+// registered machines waits to be assigned one.
+function GroupFilter({ nodes, value, onChange, className = "" }: {
+  nodes: Node[]
+  value: string
+  onChange: (value: string) => void
+  className?: string
+}) {
+  const groups = groupsOf(nodes)
+  if (!groups.length) return null
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger className={className} aria-label="按分组筛选"><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="all">全部分组</SelectItem>
+        {groups.map((g) => <SelectItem key={g} value={`=${g}`}>{g}</SelectItem>)}
+        <SelectItem value="none">未分组</SelectItem>
+      </SelectContent>
+    </Select>
+  )
 }
 
 function NodeSearch({ value, onChange, className = "" }: { value: string; onChange: (value: string) => void; className?: string }) {
   return (
     <div className={`relative ${className}`}>
       <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input className="pl-8" placeholder="名称/地址/地区" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
+      <Input className="pl-8" placeholder="名称/地址/地区/分组" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
     </div>
   )
 }
 
 // Ticks nodes in a searchable grid. 全选 and 全不选 act on the rows in view, so a
-// search narrows what they touch: search JP, then 全选. Offline nodes are dimmed
-// but remain selectable.
+// search or a group narrows what they touch: pick a group, then 全选. Offline
+// nodes are dimmed but remain selectable.
 function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   nodes: Node[]
   chosen: Set<number>
@@ -101,15 +131,17 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   disabled?: boolean
 }) {
   const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
   // The unfiltered list's height, held as its floor: in a centred dialog a
   // shrinking list would move the search box out from under the cursor.
   const [listHeight, setListHeight] = useState(0)
-  const visible = searchNodes(nodes, query)
+  const visible = inGroup(searchNodes(nodes, query), group)
   const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
   return (
     <div className="rounded-lg border">
-      <div className="flex items-center gap-1 border-b p-2">
-        <NodeSearch className="min-w-0 flex-1" value={query} onChange={setQuery} />
+      <div className="flex flex-wrap items-center gap-1 border-b p-2">
+        <NodeSearch className="min-w-0 flex-1 basis-40" value={query} onChange={setQuery} />
+        <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
         <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
         <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
       </div>
@@ -183,6 +215,52 @@ function OptionRow({ title, hint, toggle = false, below, children }: {
 }
 
 
+// Up to five names, then the count: enough to confirm the selection is the
+// intended one.
+function sample(nodes: Node[]) {
+  return nodes.slice(0, 5).map((n) => n.name).join("、") + (nodes.length > 5 ? ` 等 ${nodes.length} 台` : "")
+}
+
+// Free text, with the groups already in use offered, so a group is picked
+// rather than retyped, where a typo would start a second one.
+function GroupInput({ groups, value, onChange }: { groups: string[]; value: string; onChange: (value: string) => void }) {
+  const id = useId()
+  return (
+    <>
+      <Input list={id} maxLength={32} value={value} onChange={(e) => onChange(e.target.value)} placeholder="未分组" />
+      <datalist id={id}>
+        {groups.map((g) => <option key={g} value={g} />)}
+      </datalist>
+    </>
+  )
+}
+
+// Deleting a node leaves the agent running on the machine, retrying with a
+// token the hub no longer accepts. The command carries nothing per machine.
+function UninstallHint({ command, many = false }: { command: string; many?: boolean }) {
+  if (!command) return null
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <Label className="text-sm font-medium">卸载 agent</Label>
+        <Button variant="ghost" size="sm" onClick={() => copy(command)}>
+          <Copy className="size-4" /> 复制
+        </Button>
+      </div>
+      <Command>{command}</Command>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        {many ? "每台机器上以 root 各执行一次，命令都一样" : "在这台机器上以 root 执行"}
+        ，停止 agent，删除二进制、env 文件和服务文件。
+        {many && (
+          <a className="ml-1 underline" href="https://monitor-document.pages.dev/install/batch" target="_blank" rel="noreferrer">
+            批量执行的做法
+          </a>
+        )}
+      </p>
+    </div>
+  )
+}
+
 function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
   title: string
   description: string
@@ -255,8 +333,9 @@ function CreateNode({ onClose, onSaved }: {
   )
 }
 
-function NodeForm({ node, onClose, onSaved }: {
+function NodeForm({ node, groups, onClose, onSaved }: {
   node: Node
+  groups: string[]
   onClose: () => void
   onSaved: () => void
 }) {
@@ -281,6 +360,7 @@ function NodeForm({ node, onClose, onSaved }: {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      group: (form.group ?? "").trim(),
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
@@ -328,8 +408,11 @@ function NodeForm({ node, onClose, onSaved }: {
               <Field label="名称">
                 <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
               </Field>
-              <Field label="备注">
-                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途，仅管理员可见" />
+              <Field label="分组" hint="公开页可见，留空为未分组">
+                <GroupInput groups={groups} value={form.group ?? ""} onChange={(v) => set("group", v)} />
+              </Field>
+              <Field label="备注" className="sm:col-span-2">
+                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="仅管理员可见" />
               </Field>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -494,6 +577,171 @@ function BillingForm({ node, onClose, onSaved }: {
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>取消</Button>
           <Button onClick={save} disabled={saving}>保存</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// A field of the batch form. Ticking it is what puts it in the patch, and the
+// control stays disabled until then, so nothing edited is silently left out.
+function BatchField({ label, hint, on, onToggle, children }: {
+  label: string
+  hint?: string
+  on: boolean
+  onToggle: (on: boolean) => void
+  children: React.ReactNode
+}) {
+  return (
+    <div className="space-y-2">
+      <label className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+        <input type="checkbox" className="accent-primary" checked={on} onChange={(e) => onToggle(e.target.checked)} />
+        {label}
+      </label>
+      <fieldset disabled={!on} className="min-w-0 disabled:opacity-50">{children}</fieldset>
+      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
+    </div>
+  )
+}
+
+// One patch for every selected node, applied by the hub to all of them or to
+// none. Only ticked fields are sent, so what differs between the nodes -- a
+// price, an expiry -- stays as it is unless deliberately made the same. Name,
+// note and addresses describe one machine and are not offered.
+function BatchEdit({ nodes, groups, onClose, onSaved }: {
+  nodes: Node[]
+  groups: string[]
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [on, setOn] = useState<Record<string, boolean>>({})
+  const [form, setForm] = useState({
+    group: "",
+    public: true,
+    notify: true,
+    limit: "",
+    traffic_mode: "sum",
+    reset: "1",
+    price: "",
+    currency: "USD",
+    billing_cycle: "monthly",
+    expires_at: "",
+  })
+  const [saving, setSaving] = useState(false)
+  const set = <K extends keyof typeof form>(k: K, v: (typeof form)[K]) => setForm((f) => ({ ...f, [k]: v }))
+  // Keyed by the patch field each box controls.
+  const tick = (key: string) => ({ on: !!on[key], onToggle: (v: boolean) => setOn((o) => ({ ...o, [key]: v })) })
+
+  async function save() {
+    const limit = Math.round(Number(form.limit) * GIB)
+    if (on.traffic_limit && (!Number.isSafeInteger(limit) || limit < 0)) {
+      return toast.error("流量额度必须是有效的非负数")
+    }
+    const patch = Object.fromEntries(
+      Object.entries({
+        group: form.group.trim(),
+        public: form.public,
+        notify: form.notify,
+        traffic_limit: limit,
+        traffic_mode: form.traffic_mode,
+        traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.reset) || 1))),
+        price: Math.max(0, Number(form.price) || 0),
+        currency: form.currency,
+        billing_cycle: form.billing_cycle,
+        expires_at: form.expires_at || null,
+      }).filter(([key]) => on[key]),
+    )
+    if (!Object.keys(patch).length) return toast.error("先勾选要修改的项")
+    setSaving(true)
+    try {
+      await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids: nodes.map((n) => n.id), patch }) })
+      toast.success(`已修改 ${nodes.length} 台`)
+      onClose()
+      onSaved()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>批量修改 {nodes.length} 台节点</DialogTitle>
+          <DialogDescription className="leading-relaxed">
+            {sample(nodes)}。只改勾选的项，没勾选的保持各自原样。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-6">
+          <section className="grid gap-4 sm:grid-cols-3">
+            <BatchField label="分组" hint="公开页可见，留空为移出分组" {...tick("group")}>
+              <GroupInput groups={groups} value={form.group} onChange={(v) => set("group", v)} />
+            </BatchField>
+            <BatchField label="公开显示" {...tick("public")}>
+              <label className="flex h-9 items-center gap-2 text-sm">
+                <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
+                {form.public ? "公开" : "仅后台可见"}
+              </label>
+            </BatchField>
+            <BatchField label="离线通知" {...tick("notify")}>
+              <label className="flex h-9 items-center gap-2 text-sm">
+                <Switch checked={form.notify} onCheckedChange={(v) => set("notify", v)} />
+                {form.notify ? "开" : "关"}
+              </label>
+            </BatchField>
+          </section>
+          <section className="space-y-3 border-t pt-5">
+            <h3 className="text-sm font-medium">流量</h3>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <BatchField label="每月额度 (GB)" hint="留空或 0 不限" {...tick("traffic_limit")}>
+                <Input type="number" min="0" value={form.limit} onChange={(e) => set("limit", e.target.value)} placeholder="1024" />
+              </BatchField>
+              <BatchField label="计算方式" {...tick("traffic_mode")}>
+                <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {Object.entries(TRAFFIC_MODES).map(([k, v]) => <SelectItem key={k} value={k}>{v}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </BatchField>
+              <BatchField label="每月重置日" hint="1–31，改后本月重算，总量不变" {...tick("traffic_reset_day")}>
+                <Input type="number" min={1} max={31} value={form.reset} onChange={(e) => set("reset", e.target.value)} />
+              </BatchField>
+            </div>
+          </section>
+          <section className="space-y-3 border-t pt-5">
+            <h3 className="text-sm font-medium">计费</h3>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <BatchField label="价格" hint="留空或 0 为免费" {...tick("price")}>
+                <Input type="number" min="0" step="0.01" value={form.price} onChange={(e) => set("price", e.target.value)} placeholder="免费" />
+              </BatchField>
+              <BatchField label="货币" {...tick("currency")}>
+                <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </BatchField>
+              <BatchField label="付款周期" {...tick("billing_cycle")}>
+                <Select value={form.billing_cycle} onValueChange={(v) => set("billing_cycle", v)}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {Object.entries(CYCLES).map(([k, v]) => <SelectItem key={k} value={k}>{v}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </BatchField>
+              <BatchField label="到期时间" hint="留空为清除到期时间" {...tick("expires_at")}>
+                <Input type="date" value={form.expires_at} onChange={(e) => set("expires_at", e.target.value)} />
+              </BatchField>
+            </div>
+          </section>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button onClick={save} disabled={saving}>修改 {nodes.length} 台</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -845,6 +1093,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [removing, setRemoving] = useState(false)
   const [manualOrder, setManualOrder] = useState<number[]>([])
   const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [batchEditing, setBatchEditing] = useState(false)
+  const [batchDeleting, setBatchDeleting] = useState(false)
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
   const byId = new Map(nodes.map((node) => [node.id, node]))
@@ -855,8 +1107,41 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   ]
   // `order` itself stays whole, because the order sent on drop is the order of
   // every node.
-  const visible = searchNodes(order, query)
-  const searching = query.trim() !== ""
+  const visible = inGroup(searchNodes(order, query), group)
+  const searching = query.trim() !== "" || group !== "all"
+  // Read from the live list, so a node deleted elsewhere drops out of the
+  // selection. A selection outlives a change of filter; the bar says how much of
+  // it is out of view, so nothing hidden is edited unawares.
+  const chosen = order.filter((n) => selected.has(n.id))
+  const hiddenChosen = chosen.filter((n) => !visible.includes(n)).length
+  const visibleChosen = visible.filter((n) => selected.has(n.id)).length
+  const pick = (list: Node[], on: boolean) =>
+    setSelected((old) => {
+      const next = new Set(old)
+      for (const n of list) {
+        if (on) next.add(n.id)
+        else next.delete(n.id)
+      }
+      return next
+    })
+
+  async function removeChosen() {
+    setRemoving(true)
+    try {
+      const { deleted } = await api<{ deleted: number }>("/nodes/delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: chosen.map((n) => n.id) }),
+      })
+      toast.success(`已删除 ${deleted} 台`)
+      setBatchDeleting(false)
+      setSelected(new Set())
+      refresh()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setRemoving(false)
+    }
+  }
   const uninstall = refusal ? "" : uninstallCommand(site)
 
   async function remove() {
@@ -906,7 +1191,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     <div className="space-y-4">
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
+        <div className="mr-auto flex w-full gap-2 sm:w-auto">
+          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
+          <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+        </div>
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
         <Button variant="outline" disabled={!!refusal} onClick={() => setRegistering(true)}>
@@ -917,12 +1205,36 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
         </Button>
       </div>
 
+      {chosen.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-sm">
+          <span className="basis-full sm:mr-auto sm:basis-auto">
+            已选 {chosen.length} 台
+            {hiddenChosen > 0 && <span className="text-muted-foreground">，其中 {hiddenChosen} 台不在当前筛选里</span>}
+          </span>
+          <Button size="sm" onClick={() => setBatchEditing(true)}><Pencil /> 批量修改</Button>
+          <Button size="sm" variant="outline" onClick={() => setBatchDeleting(true)}><Trash2 /> 删除</Button>
+          <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>取消选择</Button>
+        </div>
+      )}
+
       <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
             {/* Percentages, or the address column swallows every spare pixel
                 and pushes status across the table. */}
             <TableRow>
+              <TableHead className="w-10 pr-0">
+                {/* Acts on the rows in view, like 全选 in the node picker. */}
+                <input
+                  type="checkbox"
+                  aria-label="选中当前列出的全部节点"
+                  className="accent-primary"
+                  disabled={!visible.length}
+                  checked={visible.length > 0 && visibleChosen === visible.length}
+                  ref={(el) => { if (el) el.indeterminate = visibleChosen > 0 && visibleChosen < visible.length }}
+                  onChange={(e) => pick(visible, e.target.checked)}
+                />
+              </TableHead>
               <TableHead className="w-[20%]">名称</TableHead>
               <TableHead className="w-[22%]">IP</TableHead>
               <TableHead className="w-[12%]">状态</TableHead>
@@ -943,6 +1255,15 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 onDragEnter={() => dragging !== null && move(order.findIndex((node) => node.id === dragging), index)}
                 onDrop={(e) => { e.preventDefault(); save(order.map((node) => node.id)) }}
               >
+                <TableCell className="pr-0">
+                  <input
+                    type="checkbox"
+                    aria-label={`选中 ${n.name}`}
+                    className="accent-primary"
+                    checked={selected.has(n.id)}
+                    onChange={(e) => pick([n], e.target.checked)}
+                  />
+                </TableCell>
                 <TableCell>
                   <div className="flex items-center gap-2">
                     <button
@@ -953,7 +1274,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                       // is the full one exactly while nothing is filtered out.
                       disabled={searching}
                       className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
-                      title={searching ? "清空搜索后可拖动排序" : "拖动排序"}
+                      title={searching ? "清空搜索和分组筛选后可拖动排序" : "拖动排序"}
                       aria-label={`拖动 ${n.name} 排序`}
                       onDragStart={(e) => {
                         orderBeforeDrag.current = order.map((node) => node.id)
@@ -974,7 +1295,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                     >
                       <GripVertical className="size-4" />
                     </button>
-                    <div className="min-w-0 font-medium">{n.name}</div>
+                    <div className="min-w-0">
+                      <div className="font-medium">{n.name}</div>
+                      {n.group && <div className="truncate text-xs text-muted-foreground">{n.group}</div>}
+                    </div>
                     {n.country && (
                       <Badge
                         variant="outline"
@@ -1033,14 +1357,14 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             ))}
             {nodes.length === 0 && (
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={8} className="py-10 text-center text-sm text-muted-foreground">
                   还没有节点，右上角添加
                 </TableCell>
               </TableRow>
             )}
             {searching && nodes.length > 0 && !visible.length && (
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={8} className="py-10 text-center text-sm text-muted-foreground">
                   没有匹配的节点
                 </TableCell>
               </TableRow>
@@ -1058,9 +1382,30 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {editing && (
         <NodeForm
           node={editing}
+          groups={groupsOf(nodes)}
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />
+      )}
+      {batchEditing && (
+        <BatchEdit
+          nodes={chosen}
+          groups={groupsOf(nodes)}
+          onClose={() => setBatchEditing(false)}
+          onSaved={() => { setSelected(new Set()); refresh() }}
+        />
+      )}
+      {batchDeleting && (
+        <ConfirmDialog
+          title={`删除 ${chosen.length} 台节点？`}
+          description={`${sample(chosen)}。历史指标、流量记录和凭证一并删除，不可恢复。`}
+          confirmLabel={`删除 ${chosen.length} 台`}
+          busy={removing}
+          onClose={() => setBatchDeleting(false)}
+          onConfirm={removeChosen}
+        >
+          <UninstallHint command={uninstall} many />
+        </ConfirmDialog>
       )}
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
@@ -1084,22 +1429,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           onClose={() => setDeleting(null)}
           onConfirm={remove}
         >
-          {/* Deleting the node leaves the agent running on the machine, retrying
-              with a token the hub no longer accepts. */}
-          {uninstall && (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <Label className="text-sm font-medium">卸载 agent</Label>
-                <Button variant="ghost" size="sm" onClick={() => copy(uninstall)}>
-                  <Copy className="size-4" /> 复制
-                </Button>
-              </div>
-              <Command>{uninstall}</Command>
-              <p className="text-xs text-muted-foreground">
-                在这台机器上以 root 执行，停止 agent，删除二进制、env 文件和服务文件。
-              </p>
-            </div>
-          )}
+          <UninstallHint command={uninstall} />
         </ConfirmDialog>
       )}
     </div>
@@ -1670,15 +2000,11 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
   const [busy, setBusy] = useState(false)
 
   async function apply(targets: Node[], on: boolean) {
+    const ids = targets.filter((n) => !!n.notify !== on).map((n) => n.id)
+    if (!ids.length) return
     setBusy(true)
     try {
-      // Awaited in turn, the requests would cost one round trip per node, and
-      // the two-second stream would render each one as it lands.
-      await Promise.all(
-        targets
-          .filter((n) => !!n.notify !== on)
-          .map((n) => api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })),
-      )
+      await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { notify: on } }) })
     } catch (e) {
       toast.error((e as Error).message)
     } finally {

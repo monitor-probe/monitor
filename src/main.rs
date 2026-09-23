@@ -451,6 +451,8 @@ async fn main() -> Result<()> {
         .route("/api/nodes", post(api::create_node))
         .route("/api/register-window", post(api::open_register).delete(api::close_register))
         .route("/api/nodes/order", put(api::reorder_nodes))
+        .route("/api/nodes/batch", put(api::update_nodes))
+        .route("/api/nodes/delete", post(api::delete_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
