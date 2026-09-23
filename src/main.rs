@@ -158,8 +158,9 @@ pub fn proxied(app: &App, url: String) -> String {
 /// bounds how many may run, closing the same gap as the password gate in `auth`.
 ///
 /// Four, because a node installs once: the load is a burst, not a sustained
-/// workload. A batch install or upgrade run in parallel -- ansible, pssh,
-/// `xargs -P` -- arrives as exactly that burst, so a request past the four waits
+/// workload. A batch install or upgrade sent to many machines at once -- by an
+/// SSH client broadcasting one command, a provider's boot script, a parallel
+/// tool -- arrives as exactly that burst, so a request past the four waits
 /// its turn for up to [`RELAY_WAIT`] rather than being refused at once, which
 /// would fail eight of twelve parallel downloads within 2 ms. The semaphore is
 /// FIFO, and a waiting request holds its connection alone: no fetch, no buffer.
