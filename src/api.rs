@@ -817,39 +817,38 @@ pub async fn update_node(
     }
 }
 
+/// What a batch may set: the settings the panel applies across a selection.
+/// An allowlist, so a field added to [`NodePatch`] later, possibly one that
+/// describes a single machine, is refused here until it is listed.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BatchPatch {
+    group: Option<String>,
+    notify: Option<bool>,
+}
+
 #[derive(Deserialize)]
 pub struct NodeBatch {
     ids: Vec<i64>,
     #[serde(default)]
-    patch: NodePatch,
+    patch: BatchPatch,
 }
 
 /// Applies one patch to every selected node, all or none.
-///
-/// Limited to settings a batch can share. A name, a note, an address or a
-/// country describes one machine: applied to a selection it would read the same
-/// on every node, which is never what was meant. The order has its own route.
 pub async fn update_nodes(
     _: Admin,
     State(app): State<Shared>,
     body: Result<Json<NodeBatch>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(NodeBatch { mut ids, mut patch })) = body else { return bad("invalid batch") };
+    let Ok(Json(NodeBatch { mut ids, patch })) = body else {
+        return bad("invalid batch: only group and notify apply to several nodes at once");
+    };
     ids.sort_unstable();
     ids.dedup();
     if ids.is_empty() {
         return bad("no nodes selected");
     }
-    let p = &patch;
-    if p.name.is_some()
-        || p.sort.is_some()
-        || p.remark.is_some()
-        || p.country_pin.is_some()
-        || p.ipv4_pin.is_some()
-        || p.ipv6_pin.is_some()
-    {
-        return bad("name, order, note, addresses and country are set one node at a time");
-    }
+    let mut patch = NodePatch { group: patch.group, notify: patch.notify, ..Default::default() };
     if let Some(message) = patch_error(&mut patch) {
         return bad(message);
     }
@@ -2340,14 +2339,14 @@ mod tests {
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         assert_eq!(group(a), "香港", "a refused batch leaves every node as it was");
 
-        for refused in
-            [json!({"name": "x"}), json!({"ipv4_pin": "1.2.3.4"}), json!({"group": "g".repeat(33)})]
-        {
-            let r = update_nodes(Admin, state(), batch(vec![a], refused.clone())).await;
-            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{refused}");
+        // Only the listed fields deserialize, so the extractor refuses the rest.
+        for refused in [json!({"name": "x"}), json!({"ipv4_pin": "1.2.3.4"}), json!({"public": false})] {
+            assert!(serde_json::from_value::<BatchPatch>(refused.clone()).is_err(), "{refused}");
         }
+        let r = update_nodes(Admin, state(), batch(vec![a], json!({"group": "g".repeat(33)}))).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            update_nodes(Admin, state(), batch(vec![], json!({"public": false}))).await.status(),
+            update_nodes(Admin, state(), batch(vec![], json!({"notify": false}))).await.status(),
             StatusCode::BAD_REQUEST
         );
 

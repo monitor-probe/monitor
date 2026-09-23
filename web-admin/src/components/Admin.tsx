@@ -83,10 +83,15 @@ function searchNodes(nodes: Node[], query: string) {
 }
 
 // A filter naming a group no node carries any more -- renamed, or its last node
-// deleted -- falls back to all rather than showing an empty list.
+// deleted -- falls back to all rather than showing an empty list; so does 未分组
+// once no group is left, since the dropdown that would clear it is hidden then.
+// Reset rather than masked, so the old filter does not return with a later group
+// of the same name.
 function useGroupFilter(nodes: Node[]) {
   const [filter, setFilter] = useState("all")
-  const valid = filter === "all" || filter === "none" || nodes.some((n) => n.group === filter.slice(1))
+  const valid = filter === "all"
+    || (filter === "none" ? nodes.some((n) => n.group) : nodes.some((n) => n.group === filter.slice(1)))
+  if (!valid) setFilter("all")
   return [valid ? filter : "all", setFilter] as const
 }
 
@@ -1792,31 +1797,29 @@ function ChannelCard({ title, configured, children }: { title: string; configure
 
 // Offline alerts are opt-in per node, so turning them on for a fleet needs one
 // place rather than one dialog per node. Ticks are a draft until 保存, like every
-// other form in the panel: a request per click made each tick wait on a round
-// trip and a refresh before it showed.
+// other form in the panel: a request per click would make each tick wait on a
+// round trip and a refresh before showing.
 function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const [draft, setDraft] = useState<Set<number> | null>(null)
+  // Only the ticks changed here, by node id. A snapshot of every node's state
+  // would send back a node another session switched meanwhile.
+  const [draft, setDraft] = useState<Map<number, boolean>>(new Map())
   const [saving, setSaving] = useState(false)
-  const saved = new Set(nodes.filter((n) => n.notify).map((n) => n.id))
-  const chosen = draft ?? saved
+  const on = (n: Node) => draft.get(n.id) ?? !!n.notify
+  const chosen = new Set(nodes.filter(on).map((n) => n.id))
   // Against the live list, so a node deleted meanwhile is neither counted nor sent.
-  const turnOn = nodes.filter((n) => chosen.has(n.id) && !saved.has(n.id)).map((n) => n.id)
-  const turnOff = nodes.filter((n) => !chosen.has(n.id) && saved.has(n.id)).map((n) => n.id)
+  const turnOn = nodes.filter((n) => on(n) && !n.notify).map((n) => n.id)
+  const turnOff = nodes.filter((n) => !on(n) && n.notify).map((n) => n.id)
   const dirty = turnOn.length + turnOff.length > 0
 
   // Kept after a save until the list reports it, so the ticks do not flash back
-  // to the old state for a round trip; dropped then, so a change made in another
-  // session shows through. Adjusted during render rather than in an effect, as
-  // it follows from props alone.
-  if (draft && !dirty && !saving) setDraft(null)
+  // to the old state for a round trip. Adjusted during render rather than in an
+  // effect, as it follows from props alone.
+  if (draft.size && !dirty && !saving) setDraft(new Map())
 
-  const pick = (list: Node[], on: boolean) =>
+  const pick = (list: Node[], value: boolean) =>
     setDraft((old) => {
-      const next = new Set(old ?? saved)
-      for (const n of list) {
-        if (on) next.add(n.id)
-        else next.delete(n.id)
-      }
+      const next = new Map(old)
+      for (const n of list) next.set(n.id, value)
       return next
     })
 
@@ -1841,13 +1844,13 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
       <div>
         <h3 className="text-sm font-medium">离线通知</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          按节点打开，默认关。已打开 {saved.size} / {nodes.length} 台
+          按节点打开，默认关。已打开 {nodes.filter((n) => n.notify).length} / {nodes.length} 台
           {pending.length > 0 && <span className="text-foreground">，待保存：{pending.join("、")}</span>}
         </p>
       </div>
       <NodePicker nodes={nodes} chosen={chosen} onPick={pick} disabled={saving} />
       <div className="flex justify-end gap-2">
-        <Button size="sm" variant="ghost" disabled={!dirty || saving} onClick={() => setDraft(null)}>撤销</Button>
+        <Button size="sm" variant="ghost" disabled={!dirty || saving} onClick={() => setDraft(new Map())}>撤销</Button>
         <Button size="sm" disabled={!dirty || saving} onClick={save}>保存</Button>
       </div>
     </Card>
