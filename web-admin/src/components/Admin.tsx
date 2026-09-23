@@ -536,7 +536,7 @@ function uninstallCommand(site: string) {
 }
 
 // Also the same for every node: install.sh reads the token and the hub address
-// from the machine's own env file. One line to paste into a loop over a fleet.
+// from the machine's own env file.
 function upgradeCommand(site: string) {
   return scriptCommand(site, () => ["--upgrade"])
 }
@@ -2236,10 +2236,8 @@ function Update({ versions, reload, nodes, site, refusal }: {
                       发布说明
                     </a>
                   </Button>
-                  {/* Every way of running one command on many machines, from pasting it
-                      into each to a loop over the copied host list. */}
                   <Button size="sm" variant="ghost" asChild>
-                    <a href={`${DOCS}/install/batch`} target="_blank" rel="noreferrer">
+                    <a href="https://monitor-document.pages.dev/install/batch" target="_blank" rel="noreferrer">
                       批量升级的做法
                     </a>
                   </Button>
@@ -2249,8 +2247,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
               <p className="text-xs text-muted-foreground">{refusal}</p>
             )}
             {/* Grouped by version so any number of nodes reads as a few lines, and
-                bounded in height; the list itself goes out through the copy
-                button, one name per line, which is what a loop over hosts reads. */}
+                bounded in height; the copy button gives one name per line. */}
             <div className="space-y-3 border-t pt-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs text-muted-foreground">
@@ -2294,10 +2291,6 @@ function Update({ versions, reload, nodes, site, refusal }: {
     </div>
   )
 }
-
-/** The documentation site, where the panel's "how" links point. Anchors are
- *  percent-encoded so the address survives whatever copies it. */
-const DOCS = "https://monitor-document.pages.dev"
 
 // Each area is its own route rather than a tab, so a page can be linked to and a
 // reload returns to the same section.
