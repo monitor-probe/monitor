@@ -76,7 +76,7 @@ fi
 # Names the node a registration creates. A token belongs to a node that already
 # has a name, which the panel changes; silently dropping the flag there would
 # read as a rename that never happened.
-[ -z "$NAME" ] || [ -n "$REGISTER" ] ||
+[ -z "$NAME" ] || [ -z "$TOKEN" ] ||
 	{ echo "--name applies only with --register; rename an existing node in the panel" >&2; exit 2; }
 # A setting of this machine, kept by a rerun without the flag for the reason
 # given for --iface below: the batch command carries none at the default. It is

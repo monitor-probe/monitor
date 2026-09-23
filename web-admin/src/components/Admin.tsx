@@ -524,10 +524,10 @@ function ifaceArg(iface: string | undefined) {
 // One command for a batch of machines. The key belongs to the hub, is valid only
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
-// sent to every machine as it is. The default interval is left out, as an
+// sent to every machine as it is. An interval left untouched is left out, as an
 // untouched --iface is: a rerun then keeps what the machine already has.
-function registerCommand(site: string, key: string, seconds: number, iface: string | undefined) {
-  const interval = seconds === 1 ? [] : [`--interval ${seconds}`]
+function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined) {
+  const interval = seconds === undefined ? [] : [`--interval ${seconds}`]
   return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...interval, ...ifaceArg(iface)])
 }
 
@@ -584,7 +584,7 @@ function RegisterDialog({ site, reg, onClose }: {
 }) {
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.seconds, iface.flag) : ""
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.edited ? interval.seconds : undefined, iface.flag) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -641,11 +641,13 @@ function RegisterDialog({ site, reg, onClose }: {
   )
 }
 
-// The reporting interval both install dialogs offer, kept in one place because
-// the batch command carries the same flag for every machine it runs on.
+// The reporting interval both install dialogs offer. `edited` stays false until
+// the field is changed, including back to 1.
 function useIntervalOption() {
-  const [typed, setTyped] = useState("1")
-  return { typed, setTyped, seconds: Math.min(3600, Math.max(1, Math.round(Number(typed) || 1))) }
+  const [typed, setTyped] = useState<string>()
+  const text = typed ?? "1"
+  const seconds = Math.min(3600, Math.max(1, Math.round(Number(text) || 1)))
+  return { typed: text, setTyped, edited: typed !== undefined, seconds }
 }
 
 function IntervalOption({ option, batch = false }: { option: ReturnType<typeof useIntervalOption>; batch?: boolean }) {
