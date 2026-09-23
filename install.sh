@@ -57,7 +57,7 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$ENV_FILE"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
@@ -280,6 +280,10 @@ else
 	}
 fi
 install -d -m 0755 "$ROOT"
+# Kept until the new binary has proved it starts; see not_started. Never over
+# an existing copy: a run that died before that check left an unproven binary
+# in $BIN, and the copy is the one that ran before it.
+[ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
 install -m 0755 "$TMP" "$BIN"
 
 # The token lives in a root-only environment file rather than the unit, keeping
@@ -295,6 +299,23 @@ MONITOR_TOKEN=$TOKEN
 ENV
 	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
 )
+
+# The new agent is not running. The binary it replaced is put back and started
+# again, so a failed upgrade leaves the machine reporting as before; the unit
+# and env file just written suit that binary as well, since an upgrade keeps the
+# token and the settings. A first install has nothing to put back.
+not_started() {
+	echo "monitor-agent did not start; see: $1" >&2
+	[ -f "$BIN.old" ] || exit 1
+	mv -f "$BIN.old" "$BIN"
+	if [ "$INIT" = openrc ]; then
+		rc-service monitor-agent restart >/dev/null 2>&1 || true
+	else
+		systemctl restart monitor-agent || true
+	fi
+	echo "the previous monitor-agent binary is back in place and was restarted" >&2
+	exit 1
+}
 
 if [ "$INIT" = openrc ]; then
 	cat >"$RC_FILE" <<RC
@@ -321,6 +342,7 @@ RC
 	chmod 0755 "$RC_FILE"
 	rc-update add monitor-agent default >/dev/null
 	rc-service monitor-agent restart
+	rm -f "$BIN.old"
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
 	exit 0
 fi
@@ -370,8 +392,6 @@ systemctl restart monitor-agent
 # Checked inside that window, so a batch run shows the failure on the machine
 # where it happened rather than a line reading "installed".
 sleep 3
-systemctl is-active --quiet monitor-agent || {
-	echo "monitor-agent did not start; see: journalctl -u monitor-agent -n 20" >&2
-	exit 1
-}
+systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
+rm -f "$BIN.old"
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
