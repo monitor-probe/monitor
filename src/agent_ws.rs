@@ -345,7 +345,8 @@ fn country_source(ip: &str, ipv4: &str, ipv6: &str) -> Option<IpAddr> {
 /// reads as a new question and the gate never closes. Only the time is
 /// recorded. The cost is that a node genuinely changing address within the hour
 /// acquires its badge when the hour is up, and an empty column is already a
-/// permitted state.
+/// permitted state. Returning to the address held just before is not a change:
+/// `Db::save_facts` restores that answer from the row without asking.
 static ASKED: OnceLock<Mutex<HashMap<i64, Instant>>> = OnceLock::new();
 const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 

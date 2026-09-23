@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS node (
   -- The address `country` belongs to: a public interface address the agent
   -- reported, else `ip`. Empty when neither is public.
   country_ip TEXT NOT NULL DEFAULT '',
+  -- The answered pair `country_ip` / `country` held before the source last
+  -- changed. A hello taken before every interface is up picks the other family,
+  -- and the next one returns; the address returned to takes its answer back
+  -- from here instead of waiting out the hourly lookup limit the detour spent.
+  -- One pair suffices: a machine's sources are its v4, or the exit in front of
+  -- it, and its v6.
+  country_prev_ip TEXT NOT NULL DEFAULT '',
+  country_prev TEXT NOT NULL DEFAULT '',
   -- Set in the panel. When not empty it is the country shown, in place of the
   -- looked-up one, which goes on updating underneath.
   country_pin TEXT NOT NULL DEFAULT '',
@@ -152,7 +160,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -273,6 +281,11 @@ fn migrate_to_7(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "group_name TEXT NOT NULL DEFAULT ''")
 }
 
+fn migrate_to_8(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "country_prev_ip TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "country_prev TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -306,6 +319,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 7 {
         migrate_to_7(&tx)?;
+    }
+    if from < 8 {
+        migrate_to_8(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -797,7 +813,9 @@ impl Db {
     ///
     /// A new source invalidates the previous country, so the two move together in
     /// one statement: `SET` reads the row as it was, so the comparison is against
-    /// the stored address rather than the one being written.
+    /// the stored address rather than the one being written. The pair replaced
+    /// moves to `country_prev_ip` / `country_prev` if it had an answer, and a
+    /// source equal to that address takes its answer back without a lookup.
     pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str, source: &str) -> Result<bool> {
         // The same rule `api::agent_register` applies to the name it receives:
         // these values come from an unvouched machine, control characters break
@@ -822,7 +840,12 @@ impl Db {
             "UPDATE node SET hostname=?2, os=?3, kernel=?4, arch=?5, virt=?6, cpu_name=?7,
                              cpu_cores=?8, mem_total=?9, swap_total=?10, disk_total=?11,
                              agent_version=?12, ip=?13, ipv4=?14, ipv6=?15, country_ip=?16,
-                             country=CASE WHEN country_ip=?16 THEN country ELSE '' END
+                             country=CASE WHEN country_ip=?16 THEN country
+                                          WHEN country_prev_ip=?16 THEN country_prev ELSE '' END,
+                             country_prev_ip=CASE WHEN country_ip=?16 OR country='' THEN country_prev_ip
+                                                  ELSE country_ip END,
+                             country_prev=CASE WHEN country_ip=?16 OR country='' THEN country_prev
+                                               ELSE country END
              WHERE id=?1",
             params![
                 id,
@@ -2054,6 +2077,34 @@ mod tests {
         // Nothing public to look up: no country, and none owed.
         assert!(!db.save_facts(id, &facts, "192.168.1.2", "").unwrap());
         assert_eq!(stored(), "");
+    }
+
+    /// A reboot: the first hello carries only the v6, the next one the v4 again.
+    /// The detour spends the node's hourly lookup, so the address returned to
+    /// must be answered from the row.
+    #[test]
+    fn a_country_returns_with_the_address_it_came_from() {
+        let db = db();
+        let id = node(&db, 1);
+        let facts = serde_json::json!({});
+        let save = |source: &str| db.save_facts(id, &facts, "198.51.100.4", source).unwrap();
+        let stored = || db.node(id).unwrap().unwrap().country;
+        let (v4, v6) = ("198.51.100.4", "2001:db8::5");
+
+        save(v4);
+        db.set_country(id, "RU", v4).unwrap();
+        assert!(save(v6), "an address never answered is asked about");
+        db.set_country(id, "US", v6).unwrap();
+        assert!(!save(v4), "the address before it is not asked about again");
+        assert_eq!(stored(), "RU");
+        assert!(!save(v6), "nor, after that, the one in between");
+        assert_eq!(stored(), "US");
+
+        // Addresses never answered pass through without displacing the answer.
+        assert!(save("203.0.113.9"));
+        assert!(save("203.0.113.10"));
+        assert!(!save(v6));
+        assert_eq!(stored(), "US");
     }
 
     /// A hub before schema 5 looked every country up from `ip`. After the
