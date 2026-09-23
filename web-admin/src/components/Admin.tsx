@@ -226,7 +226,7 @@ function GroupInput({ groups, value, onChange }: { groups: string[]; value: stri
   const id = useId()
   return (
     <>
-      <Input list={id} maxLength={32} value={value} onChange={(e) => onChange(e.target.value)} placeholder="未分组" />
+      <Input list={id} maxLength={13} value={value} onChange={(e) => onChange(e.target.value)} placeholder="未分组" />
       <datalist id={id}>
         {groups.map((g) => <option key={g} value={g} />)}
       </datalist>
@@ -279,7 +279,7 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
-          <Field label="分组名" hint="公开页可见，最多 32 字；留空为移出分组">
+          <Field label="分组名" hint="公开页可见，最多 13 字；留空为移出分组">
             <GroupInput groups={groupsOf(nodes)} value={name} onChange={setName} />
           </Field>
           <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />

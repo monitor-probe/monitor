@@ -544,15 +544,16 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
     None
 }
 
-/// A theme shows the group as a tab label, so it is held to a short one.
-const MAX_GROUP: usize = 32;
+/// A theme shows the group as a tab label or a section title, so it is held to a
+/// length that fits one line on a 390 px phone.
+const MAX_GROUP: usize = 13;
 
 /// Trims a group name, or refuses it. Refused rather than truncated: the panel
 /// would otherwise report saved a name that is not the one stored.
 fn group_error(group: &mut String) -> Option<&'static str> {
     *group = group.trim().to_owned();
     if group.chars().count() > MAX_GROUP || group.chars().any(char::is_control) {
-        return Some("group must be at most 32 characters, without control characters");
+        return Some("group must be at most 13 characters, without control characters");
     }
     None
 }
@@ -2408,7 +2409,11 @@ mod tests {
         for refused in [json!({"name": "x"}), json!({"ipv4_pin": "1.2.3.4"}), json!({"public": false})] {
             assert!(serde_json::from_value::<BatchPatch>(refused.clone()).is_err(), "{refused}");
         }
-        let r = update_nodes(Admin, state(), batch(vec![a], json!({"group": "g".repeat(33)}))).await;
+        // Counted in characters, not bytes: thirteen of them take 39 bytes.
+        let r = update_nodes(Admin, state(), batch(vec![a], json!({"group": "港".repeat(MAX_GROUP)}))).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r =
+            update_nodes(Admin, state(), batch(vec![a], json!({"group": "港".repeat(MAX_GROUP + 1)}))).await;
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             update_nodes(Admin, state(), batch(vec![], json!({"notify": false}))).await.status(),
