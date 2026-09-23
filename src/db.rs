@@ -766,30 +766,13 @@ impl Db {
 
     /// False when no node has this id.
     pub fn delete_node(&self, id: i64) -> Result<bool> {
-        Ok(self.delete_nodes(&[id])? > 0)
-    }
-
-    /// Deletes every node in `ids` and returns how many existed. An id already
-    /// gone is not an error: the caller wanted it gone.
-    ///
-    /// One transaction per node, with the connection released between them.
-    /// Clearing a node's latency history -- 100,800 rows at a week of ten probes
-    /// a minute -- measured 50 to 80 ms, so one transaction over a hundred nodes
-    /// would hold every agent's report back for about six seconds.
-    pub fn delete_nodes(&self, ids: &[i64]) -> Result<usize> {
-        let mut deleted = 0;
-        for id in ids {
-            let mut conn = self.conn();
-            let tx = conn.transaction()?;
-            // `ping_record` carries no foreign key -- it is WITHOUT ROWID and
-            // keyed for the chart query -- so it is cleared explicitly. SQLite
-            // reassigns a deleted node's id to the next node created, which
-            // would otherwise inherit the removed machine's latency chart.
-            tx.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
-            deleted += tx.execute("DELETE FROM node WHERE id = ?1", [id])?;
-            tx.commit()?;
-        }
-        Ok(deleted)
+        let conn = self.conn();
+        // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
+        // for the chart query -- so it is cleared explicitly. SQLite reassigns a
+        // deleted node's id to the next node created, which would otherwise
+        // inherit the removed machine's latency chart.
+        conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
+        Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
 
     /// Replaces a node's token, which immediately locks out the old one. False
@@ -1285,7 +1268,7 @@ impl Db {
     /// Deletes a probe and the results filed under it.
     ///
     /// `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed for
-    /// the chart query -- so it is cleared explicitly, as in `delete_nodes`.
+    /// the chart query -- so it is cleared explicitly, as in `delete_node`.
     /// SQLite reassigns a deleted probe's id to the next one created, and the
     /// chart selects on `task_id IN (assignments for this node)`: without this
     /// the new probe would draw the removed one's latency under its own name,

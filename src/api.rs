@@ -866,14 +866,14 @@ pub async fn update_nodes(
 }
 
 #[derive(Deserialize)]
-pub struct NodeIds {
+pub struct NodeOrder {
     ids: Vec<i64>,
 }
 
 /// The list must name every node exactly once, checked inside the transaction
 /// that renumbers rather than here: re-reading the node list first would only
 /// race the write it guards.
-pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<NodeIds>) -> Response {
+pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<NodeOrder>) -> Response {
     match app.db.reorder_nodes(&order.ids) {
         Ok(()) => {
             invalidate_snapshot(&app);
@@ -890,46 +890,15 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Ok(false) => return no_such_node(),
         Err(e) => return fail(e),
     }
-    disconnect(&app, &[id]);
+    // The token is checked only at the handshake, so deleting the row does not
+    // end a connection already open on it; dropping the sender does. Without
+    // this the agent would keep reporting under an id SQLite reassigns to the
+    // next node created, which would then appear online on another node's
+    // metrics. Dropped after the delete, so the reconnect that follows finds no
+    // token to accept. The same reasoning applies in `reset_token` below.
+    app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
-}
-
-/// Deletes the selected nodes. Ids already gone are skipped rather than
-/// refused, so a list read before another tab deleted some still succeeds.
-/// Off the runtime, since each node's latency history takes tens of ms to clear.
-pub async fn delete_nodes(
-    _: Admin,
-    State(app): State<Shared>,
-    Json(NodeIds { ids }): Json<NodeIds>,
-) -> Response {
-    if ids.is_empty() {
-        return bad("no nodes selected");
-    }
-    let (shared, list) = (app.clone(), ids.clone());
-    match tokio::task::spawn_blocking(move || shared.db.delete_nodes(&list)).await {
-        Ok(Ok(deleted)) => {
-            disconnect(&app, &ids);
-            Json(json!({"deleted": deleted})).into_response()
-        }
-        Ok(Err(e)) => fail(e),
-        Err(e) => fail(e),
-    }
-}
-
-/// Ends the sessions of deleted nodes. The token is checked only at the
-/// handshake, so deleting the row does not end a connection already open on
-/// it; dropping the sender does. Without this the agent would keep reporting
-/// under an id SQLite reassigns to the next node created, which would then
-/// appear online on another node's metrics. Dropped after the delete, so the
-/// reconnect that follows finds no token to accept. The same reasoning applies
-/// in `reset_token` below.
-fn disconnect(app: &App, ids: &[i64]) {
-    let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
-    for id in ids {
-        agents.remove(id);
-    }
-    drop(agents);
-    invalidate_snapshot(app);
 }
 
 /// Issues a fresh token, invalidating the old one immediately.
@@ -2383,10 +2352,6 @@ mod tests {
         );
 
         assert!(live_snapshot(&app, false).as_str().contains(r#""group":"香港""#), "the group is public");
-
-        let r = delete_nodes(Admin, state(), Json(NodeIds { ids: vec![a, 999] })).await;
-        assert_eq!(r.status(), StatusCode::OK);
-        assert!(app.db.node(a).unwrap().is_none() && app.db.node(b).unwrap().is_some());
     }
 
     /// A write naming a node that no longer exists, such as one deleted from
