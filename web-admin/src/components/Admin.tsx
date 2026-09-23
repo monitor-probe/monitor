@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -9,6 +9,7 @@ import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -221,16 +222,131 @@ function OptionRow({ title, hint, toggle = false, below, children }: {
 
 
 // Free text, with the groups already in use offered, so a group is picked
-// rather than retyped, where a typo would start a second one.
-function GroupInput({ groups, value, onChange }: { groups: string[]; value: string; onChange: (value: string) => void }) {
+// rather than retyped, where a typo would start a second one. A list of its own
+// rather than a <datalist>: Chrome draws that as a tooltip and filters it by the
+// text already in the box, so a grouped node was offered only its own group.
+// The whole list shows on opening; typing narrows it.
+function GroupInput({ nodes, value, onChange }: {
+  nodes: Pick<Node, "group">[]
+  value: string
+  onChange: (value: string) => void
+}) {
   const id = useId()
+  const [open, setOpen] = useState(false)
+  const [typed, setTyped] = useState(false)
+  const [active, setActive] = useState(0)
+  const anchor = useRef<HTMLDivElement>(null)
+  const counts = new Map<string, number>()
+  for (const n of nodes) if (n.group) counts.set(n.group, (counts.get(n.group) ?? 0) + 1)
+  const name = value.trim()
+  const query = typed ? name.toLowerCase() : ""
+  const matches = [...counts.keys()].filter((g) => g.toLowerCase().includes(query))
+  // "" is 未分组, offered last while the list is not being narrowed.
+  const items = query ? matches : [...matches, ""]
+  const fresh = typed && name !== "" && !counts.has(name)
+  const shown = open && (matches.length > 0 || fresh)
+
+  useEffect(() => {
+    if (shown) document.getElementById(`${id}-${active}`)?.scrollIntoView({ block: "nearest" })
+  }, [id, active, shown])
+
+  const show = () => {
+    setTyped(false)
+    setActive(Math.max(0, [...counts.keys(), ""].indexOf(name)))
+    setOpen(true)
+  }
+  const pick = (group: string) => {
+    onChange(group)
+    setTyped(false)
+    setOpen(false)
+  }
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault()
+      if (!shown) return show()
+      const step = e.key === "ArrowDown" ? 1 : -1
+      setActive((i) => (i + step + items.length) % items.length)
+    } else if (e.key === "Enter" && shown && items[active] !== undefined) {
+      e.preventDefault()
+      pick(items[active])
+    }
+  }
+
+  if (!counts.size) {
+    return <Input maxLength={13} value={value} onChange={(e) => onChange(e.target.value)} placeholder="未分组" />
+  }
   return (
-    <>
-      <Input list={id} maxLength={13} value={value} onChange={(e) => onChange(e.target.value)} placeholder="未分组" />
-      <datalist id={id}>
-        {groups.map((g) => <option key={g} value={g} />)}
-      </datalist>
-    </>
+    <Popover open={shown} onOpenChange={setOpen}>
+      <PopoverAnchor asChild>
+        <div ref={anchor} className="relative">
+          <Input
+            role="combobox"
+            aria-expanded={shown}
+            aria-controls={id}
+            aria-autocomplete="list"
+            aria-activedescendant={shown && items[active] !== undefined ? `${id}-${active}` : undefined}
+            maxLength={13}
+            value={value}
+            placeholder="未分组"
+            className="pr-9"
+            onChange={(e) => {
+              onChange(e.target.value)
+              setTyped(true)
+              setActive(0)
+              setOpen(true)
+            }}
+            onClick={show}
+            onBlur={() => setOpen(false)}
+            onKeyDown={onKeyDown}
+          />
+          {/* Not a tab stop, and keeps the focus in the box it opens a list for. */}
+          <button
+            type="button"
+            tabIndex={-1}
+            aria-label="选择分组"
+            className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted-foreground"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              if (shown) return setOpen(false)
+              anchor.current?.querySelector("input")?.focus()
+              show()
+            }}
+          >
+            <ChevronDown className={`size-4 opacity-50 transition-transform ${shown ? "rotate-180" : ""}`} />
+          </button>
+        </div>
+      </PopoverAnchor>
+      <PopoverContent
+        align="start"
+        className="w-(--radix-popover-trigger-width) p-1"
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        onCloseAutoFocus={(e) => e.preventDefault()}
+        // The box and its button sit outside the list; pressing them is not a dismissal.
+        onInteractOutside={(e) => anchor.current?.contains(e.target as Element) && e.preventDefault()}
+        onMouseDown={(e) => e.preventDefault()}
+      >
+        <div role="listbox" id={id} aria-label="已有分组" className="max-h-60 overflow-y-auto">
+          {items.map((group, i) => (
+            <div key={group || "\0"}>
+              {group === "" && <div className="-mx-1 my-1 h-px bg-border" />}
+              <div
+                id={`${id}-${i}`}
+                role="option"
+                aria-selected={group === name}
+                onMouseEnter={() => setActive(i)}
+                onClick={() => pick(group)}
+                className={`relative flex cursor-default items-center gap-2 rounded-sm py-1.5 pr-8 pl-2 text-sm select-none ${i === active ? "bg-accent text-accent-foreground" : ""}`}
+              >
+                <span className={`truncate ${group ? "" : "text-muted-foreground"}`}>{group || "未分组"}</span>
+                {group && <span className="tnum ml-auto shrink-0 text-xs text-muted-foreground">{counts.get(group)} 台</span>}
+                {group === name && <Check className="absolute right-2 size-4" />}
+              </div>
+            </div>
+          ))}
+          {fresh && <p className="px-2 py-1.5 text-xs text-muted-foreground">新分组「{name}」，保存后生效</p>}
+        </div>
+      </PopoverContent>
+    </Popover>
   )
 }
 
@@ -280,7 +396,7 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
         </DialogHeader>
         <div className="space-y-4">
           <Field label="分组名" hint="公开页可见，最多 13 字；留空为移出分组">
-            <GroupInput groups={groupsOf(nodes)} value={name} onChange={setName} />
+            <GroupInput nodes={nodes} value={name} onChange={setName} />
           </Field>
           <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
         </div>
@@ -368,9 +484,9 @@ function CreateNode({ onClose, onSaved }: {
   )
 }
 
-function NodeForm({ node, groups, onClose, onSaved }: {
+function NodeForm({ node, nodes, onClose, onSaved }: {
   node: Node
-  groups: string[]
+  nodes: Node[]
   onClose: () => void
   onSaved: () => void
 }) {
@@ -444,7 +560,7 @@ function NodeForm({ node, groups, onClose, onSaved }: {
                 <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
               </Field>
               <Field label="分组" hint="公开页可见，留空为未分组">
-                <GroupInput groups={groups} value={form.group ?? ""} onChange={(v) => set("group", v)} />
+                <GroupInput nodes={nodes} value={form.group ?? ""} onChange={(v) => set("group", v)} />
               </Field>
               <Field label="备注" className="sm:col-span-2">
                 <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="仅管理员可见" />
@@ -1187,7 +1303,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {editing && (
         <NodeForm
           node={editing}
-          groups={groupsOf(nodes)}
+          nodes={nodes}
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />
