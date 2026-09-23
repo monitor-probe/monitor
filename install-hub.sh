@@ -88,10 +88,10 @@ press() {
 # that version's rules. The release publishes this script and hashes it
 # alongside the binary, so a saved copy measures itself before the menu or the
 # install and, when stale, replaces itself and hands the same request to the
-# new copy. No answer is asked for, since nobody wants the stale rules and an
-# unattended run could not give one. The new copy is held to the checksum file
-# the binary is, so it is trusted exactly as far as the binary the install
-# fetches.
+# new copy. The replacement is unconditional: the stale rules are never the
+# wanted ones, and an unattended run cannot answer a prompt. The new copy is
+# held to the checksum file the binary is, so it is trusted exactly as far as
+# the binary the install fetches.
 #
 # A piped run has no file to measure and needs none: it was fetched a moment
 # ago. The marker keeps `curl | sh`, whose $0 is "sh", from measuring a file of
