@@ -680,15 +680,16 @@ fn renew_online_nodes(app: &App) -> Result<()> {
 /// next hour.
 async fn housekeeping(app: Shared) {
     loop {
+        // First, so the midnight pass does not wait on pruning.
+        if let Err(e) = renew_online_nodes(&app) {
+            warn!("rolling expiry dates failed: {e:#}");
+        }
         let keep = app.db.retention_days();
         if let Err(e) = app.db.prune(keep) {
             warn!("pruning history failed: {e:#}");
         }
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
-        }
-        if let Err(e) = renew_online_nodes(&app) {
-            warn!("rolling expiry dates failed: {e:#}");
         }
         // After the roll-over, so the digest lists dates as they now stand.
         match notify::expiry_digest(&app, Local::now()) {
