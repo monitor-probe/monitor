@@ -83,6 +83,91 @@ export function changes<T extends object>(initial: T, values: Partial<T>): Parti
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== initial[key as keyof T])) as Partial<T>
 }
 
+/** One field of the settings form a theme declares under `config` in its `theme.json`. */
+export type ConfigField = {
+  key: string
+  type: "string" | "text" | "number" | "boolean" | "select"
+  label?: string
+  help?: string
+  default: unknown
+  options?: { value: string; label?: string }[]
+  min?: number
+  max?: number
+}
+
+/** A heading between fields. It holds no value. */
+export type ConfigTitle = { type: "title"; label: string }
+
+const CONFIG_TYPES = ["string", "text", "number", "boolean", "select"]
+
+/** Whether `value` is one the field can hold, the same test a theme applies to what it reads. */
+export function fits(field: ConfigField, value: unknown): boolean {
+  switch (field.type) {
+    case "boolean":
+      return typeof value === "boolean"
+    case "number":
+      return typeof value === "number" && Number.isFinite(value)
+        && (field.min === undefined || value >= field.min) && (field.max === undefined || value <= field.max)
+    case "select":
+      return !!field.options?.some((option) => option.value === value)
+    default:
+      return typeof value === "string"
+  }
+}
+
+/**
+ * The entries of a theme's form the panel can draw, headings included, in the
+ * manifest's order. The manifest is the theme author's, so a malformed entry is
+ * left out rather than failing the form: a heading without a label, a
+ * duplicate key, an unknown type, a select whose options are not all non-empty
+ * strings (the dropdown cannot hold an empty value), or a default the field
+ * could not hold.
+ */
+export function configForm(config: unknown): (ConfigField | ConfigTitle)[] {
+  if (!Array.isArray(config)) return []
+  const seen = new Set<string>()
+  return config.filter((field): field is ConfigField | ConfigTitle => {
+    if (typeof field !== "object" || field === null) return false
+    if (field.type === "title") return typeof field.label === "string" && field.label !== ""
+    const { key, type, options, min, max } = field
+    const ok = typeof key === "string" && key !== "" && !seen.has(key) && CONFIG_TYPES.includes(type)
+      && (type !== "select" || (Array.isArray(options) && options.every((o) => typeof o?.value === "string" && o.value !== "")))
+      && [min, max].every((bound) => bound === undefined || typeof bound === "number")
+      && fits(field, field.default)
+    if (ok) seen.add(key)
+    return ok
+  })
+}
+
+/** The entries of the form that hold a value. */
+export function configFields(config: unknown): ConfigField[] {
+  return configForm(config).filter((entry): entry is ConfigField => entry.type !== "title")
+}
+
+/** The value each field shows: the saved one while the field can still hold it, else the default. */
+export function configValues(fields: ConfigField[], saved: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(fields.map((f) => [f.key, fits(f, saved[f.key]) ? saved[f.key] : f.default]))
+}
+
+/**
+ * What the panel stores: only the fields that differ from their defaults, so a
+ * default the theme changes later reaches every site that never altered it.
+ * Keys the current form does not declare are kept -- a field a newer version
+ * dropped returns with a downgrade.
+ */
+export function configOverrides(
+  fields: ConfigField[],
+  saved: Record<string, unknown>,
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...saved }
+  for (const field of fields) {
+    if (values[field.key] === field.default) delete next[field.key]
+    else next[field.key] = values[field.key]
+  }
+  return next
+}
+
 export const GIB = 1024 ** 3
 
 /**

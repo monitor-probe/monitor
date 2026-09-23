@@ -442,6 +442,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
         .route("/api/ws", get(api::live_ws))
+        .route("/api/themes/{short}/config", get(api::theme_config))
         // Sign-in.
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -465,6 +466,7 @@ async fn main() -> Result<()> {
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
         .route("/api/themes/{short}/update", post(api::update_theme))
+        .route("/api/themes/{short}/config", put(api::save_theme_config))
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))

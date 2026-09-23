@@ -41,6 +41,12 @@ pub struct Theme {
     pub version: String,
     pub author: String,
     pub url: String,
+    /// The settings form the panel draws for this theme. Passed through
+    /// unparsed: a malformed field costs that one field in the panel rather than
+    /// removing the whole theme from the list, and a hub predating the field
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
     #[serde(default)]
     pub selected: bool,
     /// Set only for the copy embedded in the binary. Never read from a manifest:
@@ -162,7 +168,7 @@ fn read_inside(root: &Path, relative: &str) -> Option<Vec<u8>> {
 /// name and anything carrying a path separator. `default` is admitted: an
 /// installed copy of the built-in theme takes that name and is served in its
 /// place, leaving the embedded one as the fallback beneath it.
-fn valid_short(short: &str) -> bool {
+pub fn valid_short(short: &str) -> bool {
     !short.is_empty() && short.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, badIfaceName, behind, changes, currentIface, GIB, ifaceChoice, ifaceSpec, outdatedAgents, provisioningSite, trafficCorrection, upload, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { addresses, api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configValues, currentIface, GIB, ifaceChoice, ifaceSpec, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -1302,6 +1302,112 @@ type Theme = {
   // 内置主题在二进制里，没有目录可删。装上一份同名的会顶替它，那一份就是普通
   // 主题，删掉之后内置的重新顶上。
   builtin: boolean
+  // theme.json 里声明的设置表单，原样转过来，由 configFields 挑出能画的字段。
+  config?: unknown
+}
+
+// 主题在 theme.json 里声明的设置。hub 只存与默认值不同的项，其余由主题用自己的默认值补上，
+// 所以主题作者日后改了某个默认值，没动过这一项的站点会跟着变。
+function ThemeSettings({ theme, saved, onClose }: {
+  theme: Theme
+  saved: Record<string, unknown>
+  onClose: () => void
+}) {
+  const form = configForm(theme.config)
+  const fields = configFields(theme.config)
+  const [values, setValues] = useState(() => configValues(fields, saved))
+  const [saving, setSaving] = useState(false)
+  const set = (key: string, value: unknown) => setValues((old) => ({ ...old, [key]: value }))
+  const label = (field: ConfigField) => field.label || field.key
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault()
+    // 数字框编辑时存的是输入框里的原文；是否为空、是否越界已由浏览器按 required/min/max 拦下。
+    const typed = Object.fromEntries(
+      fields.map((f) => [f.key, f.type === "number" ? Number(values[f.key]) : values[f.key]]),
+    )
+    setSaving(true)
+    try {
+      await api(`/themes/${theme.short}/config`, {
+        method: "PUT",
+        body: JSON.stringify(configOverrides(fields, saved, typed)),
+      })
+      toast.success("主题设置已保存，公开页刷新后生效")
+      onClose()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{theme.name} 设置</DialogTitle>
+          <DialogDescription className="leading-relaxed">
+            保存后公开页刷新即生效，更新、重装主题都不会丢失。这里填的内容所有访客都能看到，不要填密码或密钥。
+          </DialogDescription>
+        </DialogHeader>
+        <form className="space-y-4" onSubmit={save}>
+          {form.map((field, index) =>
+            field.type === "title" ? (
+              <h3 key={`title-${index}`} className="pt-2 text-sm font-semibold first:pt-0">{field.label}</h3>
+            ) : field.type === "boolean" ? (
+              <OptionRow key={field.key} title={label(field)} hint={field.help} toggle>
+                <Switch checked={values[field.key] as boolean} onCheckedChange={(v) => set(field.key, v)} />
+              </OptionRow>
+            ) : (
+              <Field key={field.key} label={label(field)} hint={field.help}>
+                {field.type === "text" ? (
+                  <textarea
+                    rows={4}
+                    className={`${TEXT_BOX} text-sm`}
+                    value={values[field.key] as string}
+                    onChange={(e) => set(field.key, e.target.value)}
+                  />
+                ) : field.type === "select" ? (
+                  <Select value={values[field.key] as string} onValueChange={(v) => set(field.key, v)}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {field.options!.map((o) => (
+                        <SelectItem key={o.value} value={o.value}>{o.label || o.value}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : field.type === "number" ? (
+                  <Input
+                    type="number"
+                    required
+                    step="any"
+                    min={field.min}
+                    max={field.max}
+                    value={String(values[field.key])}
+                    onChange={(e) => set(field.key, e.target.value)}
+                  />
+                ) : (
+                  <Input value={values[field.key] as string} onChange={(e) => set(field.key, e.target.value)} />
+                )}
+              </Field>
+            ),
+          )}
+          <DialogFooter className="border-t pt-4">
+            <Button
+              type="button"
+              variant="ghost"
+              className="sm:mr-auto"
+              onClick={() => setValues(Object.fromEntries(fields.map((f) => [f.key, f.default])))}
+            >
+              恢复默认
+            </Button>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>保存</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function Themes() {
@@ -1309,6 +1415,7 @@ function Themes() {
   const [busy, setBusy] = useState("")
   const [doomed, setDoomed] = useState<Theme | null>(null)
   const [zoomed, setZoomed] = useState<Theme | null>(null)
+  const [configuring, setConfiguring] = useState<{ theme: Theme; saved: Record<string, unknown> } | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
   const load = () =>
@@ -1357,6 +1464,16 @@ function Themes() {
       toast.error((e as Error).message)
     } finally {
       setBusy("")
+    }
+  }
+
+  // Read on opening rather than inside the dialog, so the form starts from what
+  // is saved instead of flashing the defaults first.
+  async function configure(theme: Theme) {
+    try {
+      setConfiguring({ theme, saved: await api(`/themes/${theme.short}/config`) })
+    } catch (e) {
+      toast.error((e as Error).message)
     }
   }
 
@@ -1445,6 +1562,11 @@ function Themes() {
                 <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
                   {theme.selected ? "使用中" : "使用"}
                 </Button>
+                {configFields(theme.config).length > 0 && (
+                  <Button size="icon" variant="ghost" title="主题设置" onClick={() => configure(theme)}>
+                    <SlidersHorizontal />
+                  </Button>
+                )}
                 {updatable(theme) && (
                   <Button
                     size="icon"
@@ -1491,6 +1613,8 @@ function Themes() {
           </DialogContent>
         </Dialog>
       )}
+
+      {configuring && <ThemeSettings {...configuring} onClose={() => setConfiguring(null)} />}
 
       {doomed && (
         <ConfirmDialog
@@ -1605,8 +1729,9 @@ function SettingsTab() {
   )
 }
 
-const TEXTAREA =
-  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+const TEXT_BOX =
+  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+const TEXTAREA = `${TEXT_BOX} font-mono text-xs`
 
 // One offline alert, filled in the way the hub fills a template: in a single pass,
 // JSON-escaped for the webhook body. Previews only; nothing here is sent.

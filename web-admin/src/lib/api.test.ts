@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, badIfaceName, behind, changes, currentIface, GIB, ifaceChoice, ifaceSpec, isPublic, loopbackOrigin, outdatedAgents, provisionRefusal, provisioningSite, trafficCorrection } from "./api.ts"
+import { addresses, badIfaceName, behind, changes, configFields, configForm, configOverrides, configValues, currentIface, fits, GIB, ifaceChoice, ifaceSpec, isPublic, loopbackOrigin, outdatedAgents, provisionRefusal, provisioningSite, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -108,3 +108,30 @@ assert.equal(ifaceSpec(ifaceChoice("enp1s0,-enp5s0")), "enp1s0,-enp5s0")
 assert.equal(currentIface({ metrics: null }), undefined)
 assert.equal(currentIface({ metrics: {} as never }), "")
 assert.equal(currentIface({ metrics: { iface: "eth1,-eth0" } as never }), "eth1,-eth0")
+
+// A theme's form: malformed fields drop out one by one, a saved value the field
+// can no longer hold shows the default, and only changes from a default are stored.
+const entries = [
+  { type: "title", label: "外观" },
+  { key: "notice", type: "text", default: "" },
+  { key: "layout", type: "select", default: "grid", options: [{ value: "grid" }, { value: "table" }] },
+  { key: "refresh", type: "number", default: 5, min: 1, max: 60 },
+  { key: "dark", type: "boolean", default: false },
+  { key: "notice", type: "string", default: "duplicate" },
+  { key: "odd", type: "color", default: "#000" },
+  { key: "bare", type: "select", default: "a" },
+  { key: "blank", type: "select", default: "", options: [{ value: "" }, { value: "a" }] },
+  { key: "wrong", type: "boolean", default: "yes" },
+  { key: "range", type: "number", default: 0, min: 1 },
+  "not a field",
+  { type: "title" },
+]
+assert.deepEqual(configForm(entries).map((f) => (f.type === "title" ? `# ${f.label}` : f.key)), ["# 外观", "notice", "layout", "refresh", "dark"])
+const form = configFields(entries)
+assert.deepEqual(form.map((f) => f.key), ["notice", "layout", "refresh", "dark"])
+assert.deepEqual(configFields({ notice: "x" }), [])
+const saved = { layout: "cards", refresh: 10, legacy: 1 }
+const initial = configValues(form, saved)
+assert.deepEqual(initial, { notice: "", layout: "grid", refresh: 10, dark: false })
+assert.equal(fits(form[2], 61), false)
+assert.deepEqual(configOverrides(form, saved, { ...initial, refresh: 5, dark: true }), { legacy: 1, dark: true })
