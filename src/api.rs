@@ -1582,6 +1582,65 @@ pub async fn delete_theme(_: Admin, State(app): State<Shared>, Path(short): Path
     }
 }
 
+/// Where a theme's saved settings live. Keyed by `short` in the database rather
+/// than stored beside the theme, so updating, reinstalling or deleting the
+/// theme leaves them in place, and a backup carries them.
+fn theme_config_key(short: &str) -> String {
+    format!("theme_config:{short}")
+}
+
+/// The settings saved for one theme in the panel: only the fields changed from
+/// the defaults its `theme.json` declares, which the theme fills in itself.
+/// Any theme may be named, installed or not, so a theme under development
+/// reads its own settings from whichever hub it proxies to.
+///
+/// Anonymous, under the same condition as `/api/nodes`. One request is one
+/// primary-key read answering at most 64 KiB, the router's body limit having
+/// bounded the write. That is the cost class of `/api/me`, so there is no gate:
+/// on a three-core hub (debug build), 120 concurrent requests for a 60 KiB
+/// value held the panel's `/api/nodes` at a 230 ms median, against 160 ms
+/// under the same load on `/api/me`.
+///
+/// A failed read answers 500 rather than `{}`: the panel saves on top of what
+/// it reads, so an empty answer would erase every saved override.
+pub async fn theme_config(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(short): Path<String>,
+) -> Response {
+    if !authed(&app, &headers) && !app.public_page() {
+        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+    }
+    if !crate::frontend::valid_short(&short) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match app.db.lookup(&theme_config_key(&short)) {
+        Ok(saved) => {
+            let saved = saved.unwrap_or_else(|| "{}".into());
+            ([(header::CONTENT_TYPE, "application/json")], saved).into_response()
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Replaces a theme's saved settings. Values are not checked against the
+/// theme's declared fields: the theme must validate what it reads regardless,
+/// since a value saved under one version of the theme meets the next.
+pub async fn save_theme_config(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(short): Path<String>,
+    Json(values): Json<serde_json::Map<String, Value>>,
+) -> Response {
+    if !crate::frontend::valid_short(&short) || !crate::frontend::selectable(&app, &short) {
+        return bad("theme is not installed");
+    }
+    match app.db.set(&theme_config_key(&short), &Value::Object(values).to_string()) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => fail(e),
+    }
+}
+
 pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
     match crate::frontend::themes(&app) {
         Ok(themes) => Json(json!({"themes": themes})).into_response(),
@@ -2351,6 +2410,34 @@ mod tests {
         );
 
         assert!(live_snapshot(&app, false).as_str().contains(r#""group":"香港""#), "the group is public");
+    }
+
+    /// What the panel saves is what an anonymous visitor reads, under the same
+    /// condition as the node list, and only an installed theme takes a write.
+    #[tokio::test]
+    async fn saved_theme_settings_reach_visitors_while_the_status_page_is_open() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let read = |short: &str| theme_config(state(), HeaderMap::new(), Path(short.to_owned()));
+        let body = |r: Response| async { axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap() };
+
+        assert_eq!(&body(read("default").await).await[..], b"{}", "nothing saved reads as no overrides");
+        let values = json!({"notice": "维护中", "show_price": false}).as_object().unwrap().clone();
+        let saved = save_theme_config(Admin, state(), Path("default".into()), Json(values.clone())).await;
+        assert_eq!(saved.status(), StatusCode::NO_CONTENT);
+        let read_back: Value = serde_json::from_slice(&body(read("default").await).await).unwrap();
+        assert_eq!(read_back, Value::Object(values.clone()));
+
+        let missing = save_theme_config(Admin, state(), Path("aurora".into()), Json(values.clone())).await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "a theme that is not installed takes no write");
+        assert_eq!(read("../etc").await.status(), StatusCode::NOT_FOUND);
+
+        app.db.set("public_page", "off").unwrap();
+        assert_eq!(
+            read("default").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "a closed status page hides them too"
+        );
     }
 
     /// A write naming a node that no longer exists, such as one deleted from

@@ -590,11 +590,16 @@ impl Db {
     // ---- settings ----
 
     pub fn get(&self, key: &str) -> Option<String> {
-        self.conn()
+        self.lookup(key).ok().flatten()
+    }
+
+    /// As [`Db::get`], with a failed read kept apart from an absent key, for a
+    /// caller that would otherwise act on "nothing saved".
+    pub fn lookup(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
             .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten()
+            .optional()?)
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
