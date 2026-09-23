@@ -2250,14 +2250,18 @@ function Update({ versions, reload, nodes, site, refusal }: {
             ) : (
               <p className="text-xs text-muted-foreground">{refusal}</p>
             )}
-            {/* Grouped by version so any number of nodes reads as a few lines, and
-                bounded in height. */}
+            {/* Collapsed until asked for, grouped by version, and bounded in height
+                once open, so any number of nodes stays one line on the page. */}
             {outdated.length > 0 && (
-              <div className="space-y-3 border-t pt-3">
-                <div className="text-xs text-muted-foreground">
-                  {offline ? `其中 ${offline} 台离线` : "待升级的节点"}
-                </div>
-                <div className="max-h-60 space-y-3 overflow-auto">
+              <details className="group border-t pt-3">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-md text-xs text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+                  <span className="flex items-center gap-1.5">
+                    <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
+                    待升级的节点
+                  </span>
+                  {offline > 0 && <span>其中 {offline} 台离线</span>}
+                </summary>
+                <div className="mt-3 max-h-60 space-y-3 overflow-auto">
                   {byVersion(outdated).map(([version, group]) => (
                     <div key={version} className="space-y-1.5">
                       <div className="text-xs text-muted-foreground">v{version} · {group.length} 台</div>
@@ -2276,7 +2280,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
                     </div>
                   ))}
                 </div>
-              </div>
+              </details>
             )}
           </>
         )}
