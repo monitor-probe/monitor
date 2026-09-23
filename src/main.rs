@@ -164,6 +164,9 @@ pub fn proxied(app: &App, url: String) -> String {
 /// its turn for up to [`RELAY_WAIT`] rather than being refused at once, which
 /// would fail eight of twelve parallel downloads within 2 ms. The semaphore is
 /// FIFO, and a waiting request holds its connection alone: no fetch, no buffer.
+/// Waiters are not counted, so how many can wait is bounded by the connections
+/// the process may hold, the same bound as for a client that connects and then
+/// sends nothing.
 const RELAY_SLOTS: usize = 4;
 static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RELAY_SLOTS);
 
@@ -849,7 +852,7 @@ mod tests {
             (1..RELAY_SLOTS).map(|_| RELAY_GATE.try_acquire().expect("up to the limit")).collect();
         let body = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
         tokio::task::yield_now().await;
-        assert!(RELAY_GATE.try_acquire().is_err(), "the request past the limit must be refused");
+        assert!(RELAY_GATE.try_acquire().is_err(), "every slot is taken");
 
         // A body that ends, or a connection that dies, returns the slot
         // immediately rather than waiting out the deadline.

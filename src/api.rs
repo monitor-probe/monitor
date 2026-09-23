@@ -2571,9 +2571,9 @@ mod tests {
 
     /// `PUBLIC_HOURS` bounds one window; this bounds how many are built
     /// concurrently. Each holds the connection the agents report through for its
-    /// entire scan, and the path takes no credentials -- the same arrangement
-    /// `RELAY_GATE` and `PASSWORD_GATE` enforce on the other two anonymous paths
-    /// that make this process work hard.
+    /// entire scan, and the path takes no credentials. `PASSWORD_GATE` refuses the
+    /// same way; `RELAY_GATE` queues briefly instead, as a batch install is one
+    /// burst of legitimate requests.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
         let app = std::sync::Arc::new(app());

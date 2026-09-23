@@ -221,7 +221,7 @@ done
 # run through such a relay leaves each machine on the agent it had, rather than
 # on bytes that cannot start while this script reports success.
 [ "$(head -c 4 "$TMP")" = "$(printf '\177ELF')" ] ||
-	{ echo "the download is not a Linux executable: $(head -n 1 "$TMP" | cut -c1-200)" >&2; exit 1; }
+	{ echo "the download is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
