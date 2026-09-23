@@ -118,24 +118,32 @@ export function fits(field: ConfigField, value: unknown): boolean {
 /**
  * The entries of a theme's form the panel can draw, headings included, in the
  * manifest's order. The manifest is the theme author's, so a malformed entry is
- * left out rather than failing the form: a heading without a label, a
- * duplicate key, an unknown type, a select whose options are not all non-empty
- * strings (the dropdown cannot hold an empty value), or a default the field
- * could not hold.
+ * left out rather than failing the form: a heading without a label or without
+ * a field under it, a duplicate key, an unknown type, a label or help that is
+ * not text (rendering one would throw and blank the panel), a select whose
+ * options are not all non-empty strings (the dropdown cannot hold an empty
+ * value), or a default the field could not hold.
  */
 export function configForm(config: unknown): (ConfigField | ConfigTitle)[] {
   if (!Array.isArray(config)) return []
   const seen = new Set<string>()
-  return config.filter((field): field is ConfigField | ConfigTitle => {
+  const text = (value: unknown) => value === undefined || typeof value === "string"
+  const drawable = config.filter((field): field is ConfigField | ConfigTitle => {
     if (typeof field !== "object" || field === null) return false
     if (field.type === "title") return typeof field.label === "string" && field.label !== ""
-    const { key, type, options, min, max } = field
+    const { key, type, label, help, options, min, max } = field
     const ok = typeof key === "string" && key !== "" && !seen.has(key) && CONFIG_TYPES.includes(type)
-      && (type !== "select" || (Array.isArray(options) && options.every((o) => typeof o?.value === "string" && o.value !== "")))
+      && text(label) && text(help)
+      && (type !== "select" || (Array.isArray(options)
+        && options.every((o) => typeof o?.value === "string" && o.value !== "" && text(o.label))))
       && [min, max].every((bound) => bound === undefined || typeof bound === "number")
       && fits(field, field.default)
     if (ok) seen.add(key)
     return ok
+  })
+  return drawable.filter((entry, i) => {
+    const next = drawable[i + 1]
+    return entry.type !== "title" || (next !== undefined && next.type !== "title")
   })
 }
 
@@ -146,8 +154,8 @@ export function configFields(config: unknown): ConfigField[] {
 
 /**
  * The form split at its headings. Fields ahead of the first heading form a
- * section of their own, and a heading with no field under it is dropped, so
- * every section listed has something to show.
+ * section of their own; `configForm` has already dropped every heading with no
+ * field under it, so every section has something to show.
  */
 export function configSections(form: (ConfigField | ConfigTitle)[]): { label: string; fields: ConfigField[] }[] {
   const sections: { label: string; fields: ConfigField[] }[] = []
@@ -158,7 +166,7 @@ export function configSections(form: (ConfigField | ConfigTitle)[]): { label: st
       sections[sections.length - 1].fields.push(entry)
     }
   }
-  return sections.filter((section) => section.fields.length)
+  return sections
 }
 
 /** The value each field shows: the saved one while the field can still hold it, else the default. */

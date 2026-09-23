@@ -1527,6 +1527,9 @@ fn theme_config_key(short: &str) -> String {
 /// on a three-core hub (debug build), 120 concurrent requests for a 60 KiB
 /// value held the panel's `/api/nodes` at a 230 ms median, against 160 ms
 /// under the same load on `/api/me`.
+///
+/// A failed read answers 500 rather than `{}`: the panel saves on top of what
+/// it reads, so an empty answer would erase every saved override.
 pub async fn theme_config(
     State(app): State<Shared>,
     headers: HeaderMap,
@@ -1538,8 +1541,13 @@ pub async fn theme_config(
     if !crate::frontend::valid_short(&short) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let saved = app.db.get(&theme_config_key(&short)).unwrap_or_else(|| "{}".into());
-    ([(header::CONTENT_TYPE, "application/json")], saved).into_response()
+    match app.db.lookup(&theme_config_key(&short)) {
+        Ok(saved) => {
+            let saved = saved.unwrap_or_else(|| "{}".into());
+            ([(header::CONTENT_TYPE, "application/json")], saved).into_response()
+        }
+        Err(e) => fail(e),
+    }
 }
 
 /// Replaces a theme's saved settings. Values are not checked against the

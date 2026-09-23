@@ -123,8 +123,13 @@ const entries = [
   { key: "blank", type: "select", default: "", options: [{ value: "" }, { value: "a" }] },
   { key: "wrong", type: "boolean", default: "yes" },
   { key: "range", type: "number", default: 0, min: 1 },
+  { key: "i18n", type: "string", default: "", label: { zh: "公告", en: "Notice" } },
+  { key: "hinted", type: "boolean", default: true, help: 1 },
+  { key: "labelled", type: "select", default: "a", options: [{ value: "a", label: { zh: "甲" } }] },
   "not a field",
   { type: "title" },
+  { type: "title", label: "空" },
+  { type: "title", label: "末尾" },
 ]
 assert.deepEqual(configForm(entries).map((f) => (f.type === "title" ? `# ${f.label}` : f.key)), ["# 外观", "notice", "layout", "refresh", "dark"])
 const form = configFields(entries)

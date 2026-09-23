@@ -1317,7 +1317,7 @@ function ThemeSettings({ theme, saved, onClose }: {
   onClose: () => void
 }) {
   const form = configForm(theme.config)
-  const fields = configFields(theme.config)
+  const fields = form.filter((entry): entry is ConfigField => entry.type !== "title")
   const sections = configSections(form)
   const large = fields.length > 6
   const paged = large && sections.length > 1
@@ -1326,8 +1326,10 @@ function ThemeSettings({ theme, saved, onClose }: {
   const [saving, setSaving] = useState(false)
   const set = (key: string, value: unknown) => setValues((old) => ({ ...old, [key]: value }))
   const label = (field: ConfigField) => field.label || field.key
-  // A number box holds its text while being edited.
-  const typed = (f: ConfigField) => (f.type === "number" ? Number(values[f.key]) : values[f.key])
+  // A number box holds its text while being edited; an empty one holds no
+  // number, where Number("") would read as 0.
+  const typed = (f: ConfigField) =>
+    f.type !== "number" ? values[f.key] : values[f.key] === "" ? NaN : Number(values[f.key])
   const differs = (f: ConfigField) => typed(f) !== f.default
 
   async function save(e: React.FormEvent) {
@@ -1335,7 +1337,7 @@ function ThemeSettings({ theme, saved, onClose }: {
     // The browser checks required/min/max only on the boxes on screen; a
     // section switched away from is no longer rendered, so its numbers are
     // checked here and the offending one brought back into view.
-    const invalid = fields.find((f) => f.type === "number" && (values[f.key] === "" || !fits(f, typed(f))))
+    const invalid = fields.find((f) => f.type === "number" && !fits(f, typed(f)))
     if (invalid) {
       setCurrent(Math.max(0, sections.findIndex((section) => section.fields.includes(invalid))))
       const range =
