@@ -1791,32 +1791,65 @@ function ChannelCard({ title, configured, children }: { title: string; configure
 }
 
 // Offline alerts are opt-in per node, so turning them on for a fleet needs one
-// place rather than one dialog per node.
+// place rather than one dialog per node. Ticks are a draft until 保存, like every
+// other form in the panel: a request per click made each tick wait on a round
+// trip and a refresh before it showed.
 function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const [busy, setBusy] = useState(false)
+  const [draft, setDraft] = useState<Set<number> | null>(null)
+  const [saving, setSaving] = useState(false)
+  const saved = new Set(nodes.filter((n) => n.notify).map((n) => n.id))
+  const chosen = draft ?? saved
+  // Against the live list, so a node deleted meanwhile is neither counted nor sent.
+  const turnOn = nodes.filter((n) => chosen.has(n.id) && !saved.has(n.id)).map((n) => n.id)
+  const turnOff = nodes.filter((n) => !chosen.has(n.id) && saved.has(n.id)).map((n) => n.id)
+  const dirty = turnOn.length + turnOff.length > 0
 
-  async function apply(targets: Node[], on: boolean) {
-    const ids = targets.filter((n) => !!n.notify !== on).map((n) => n.id)
-    if (!ids.length) return
-    setBusy(true)
+  // Kept after a save until the list reports it, so the ticks do not flash back
+  // to the old state for a round trip; dropped then, so a change made in another
+  // session shows through. Adjusted during render rather than in an effect, as
+  // it follows from props alone.
+  if (draft && !dirty && !saving) setDraft(null)
+
+  const pick = (list: Node[], on: boolean) =>
+    setDraft((old) => {
+      const next = new Set(old ?? saved)
+      for (const n of list) {
+        if (on) next.add(n.id)
+        else next.delete(n.id)
+      }
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
     try {
-      await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { notify: on } }) })
+      for (const [ids, on] of [[turnOn, true], [turnOff, false]] as const) {
+        if (ids.length) await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { notify: on } }) })
+      }
+      toast.success("离线通知已保存")
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       refresh()
-      setBusy(false)
+      setSaving(false)
     }
   }
 
-  const enabled = new Set(nodes.filter((n) => n.notify).map((n) => n.id))
+  const pending = [turnOn.length && `打开 ${turnOn.length} 台`, turnOff.length && `关闭 ${turnOff.length} 台`].filter(Boolean)
   return (
     <Card className="gap-4 p-5">
       <div>
         <h3 className="text-sm font-medium">离线通知</h3>
-        <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled.size} / {nodes.length} 台</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          按节点打开，默认关。已打开 {saved.size} / {nodes.length} 台
+          {pending.length > 0 && <span className="text-foreground">，待保存：{pending.join("、")}</span>}
+        </p>
       </div>
-      <NodePicker nodes={nodes} chosen={enabled} onPick={apply} disabled={busy} />
+      <NodePicker nodes={nodes} chosen={chosen} onPick={pick} disabled={saving} />
+      <div className="flex justify-end gap-2">
+        <Button size="sm" variant="ghost" disabled={!dirty || saving} onClick={() => setDraft(null)}>撤销</Button>
+        <Button size="sm" disabled={!dirty || saving} onClick={save}>保存</Button>
+      </div>
     </Card>
   )
 }
