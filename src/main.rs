@@ -333,10 +333,15 @@ fn parse_args() -> Result<Args> {
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
-                     --site is only needed behind a reverse proxy, where the address the\n\
-                     panel is reached on is not the one agents should use. Left out, the\n\
-                     hub answers on whatever ip:port it is asked, and the panel builds\n\
-                     install commands from the address in the browser's bar.\n\
+                     --site is the https:// domain agents should use. Left out, the hub\n\
+                     answers on whatever ip:port it is asked, and the panel builds install\n\
+                     commands from the address in the browser's bar, which behind a TLS\n\
+                     reverse proxy is already right. It is needed where agents reach the\n\
+                     hub by another name than the panel's; where the panel is opened\n\
+                     through an SSH tunnel, whose loopback address no node can reach and\n\
+                     which adds no node without it; and where the proxy sends no\n\
+                     X-Forwarded-Proto, since it then sets the session cookie's Secure\n\
+                     flag. A value that is not an https:// domain disables adding nodes.\n\
                      --reset-password replaces the emergency password, signs every session\n\
                      out, prints the new password and exits. The database must exist.",
                     env!("CARGO_PKG_VERSION")
