@@ -62,10 +62,11 @@ CREATE TABLE IF NOT EXISTS node (
   -- The address `country` belongs to: a public interface address the agent
   -- reported, else `ip`. Empty when neither is public.
   country_ip TEXT NOT NULL DEFAULT '',
-  -- The answered pair `country_ip` / `country` held before the source last
-  -- changed. A hello taken before every interface is up picks the other family,
-  -- and the next one returns; the address returned to takes its answer back
-  -- from here instead of waiting out the hourly lookup limit the detour spent.
+  -- The last answered pair `country_ip` / `country` before the current one;
+  -- an address never answered does not displace it. A hello taken before
+  -- every interface is up picks the other family, and the next one returns;
+  -- the address returned to takes its answer back from here instead of
+  -- waiting out the hourly lookup limit the detour spent.
   -- One pair suffices: a machine's sources are its v4, or the exit in front of
   -- it, and its v6.
   country_prev_ip TEXT NOT NULL DEFAULT '',
@@ -2058,7 +2059,7 @@ mod tests {
         assert!(!save("198.51.100.4"), "the same address asks nothing a second time");
         assert_eq!(stored(), "US");
         assert!(save("203.0.113.9"), "a new address is a new question");
-        assert_eq!(stored(), "", "and the answer to the old one is gone");
+        assert_eq!(stored(), "", "and the old answer no longer shows");
         assert!(db.country_owed(id, "203.0.113.9").unwrap(), "owed until an answer lands");
         assert!(!db.country_owed(id, "198.51.100.4").unwrap(), "nothing is owed for an address left behind");
 
@@ -2100,7 +2101,7 @@ mod tests {
         assert!(!save(v6), "nor, after that, the one in between");
         assert_eq!(stored(), "US");
 
-        // Addresses never answered pass through without displacing the answer.
+        // Addresses never answered pass through without displacing the last answer.
         assert!(save("203.0.113.9"));
         assert!(save("203.0.113.10"));
         assert!(!save(v6));
