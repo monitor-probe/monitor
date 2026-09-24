@@ -242,7 +242,7 @@ pub async fn github_callback(
         let shown = if error == "access_denied" {
             "在 GitHub 上取消了授权"
         } else {
-            "GitHub 拒绝了这次登录"
+            "GitHub 拒绝了这次登录，原因见 hub 日志"
         };
         return sign_in_failed(
             &app,
@@ -317,8 +317,16 @@ fn urlencode(value: &str) -> String {
         .collect()
 }
 
-/// What a sign-in says when GitHub could not be asked.
-const UNREACHABLE: &str = "hub 连不上 GitHub，检查它的网络后重新登录";
+/// What a sign-in says when a request to GitHub fails: unanswered is the hub's
+/// network, an answer that does not decode is GitHub's.
+fn github_failed(e: reqwest::Error) -> anyhow::Error {
+    let shown = if e.is_decode() {
+        "GitHub 的回复无法识别，稍后重新登录"
+    } else {
+        "hub 连不上 GitHub，检查它的网络后重新登录"
+    };
+    anyhow::Error::from(e).context(Shown(shown.into()))
+}
 
 /// Exchanges the code for a token and checks the login against the allow list,
 /// returning the accepted login.
@@ -347,12 +355,10 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
         .json(&serde_json::json!({"client_id": id, "client_secret": secret, "code": code}))
         .send()
         .await
-        .context("token request")
-        .context(Shown(UNREACHABLE.into()))?
+        .map_err(github_failed)?
         .json()
         .await
-        .context("token response")
-        .context(Shown(UNREACHABLE.into()))?;
+        .map_err(github_failed)?;
     let Some(access) = token.access_token else {
         // Typically an expired code, or a client secret that no longer matches.
         let reason = token.error_description.unwrap_or_else(|| "no access token".into());
@@ -371,15 +377,14 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
         .header(header::USER_AGENT, "monitor-hub")
         .send()
         .await
-        .context("user request")
-        .context(Shown(UNREACHABLE.into()))?;
+        .map_err(github_failed)?;
     let status = response.status();
-    let body = response.text().await.context("user response").context(Shown(UNREACHABLE.into()))?;
+    let body = response.text().await.map_err(github_failed)?;
     // Decoding an error page into GithubUser would report "missing field login"
     // instead of GitHub's actual message.
     let user: GithubUser = serde_json::from_str(&body)
         .with_context(|| format!("user response ({status}): {}", body.chars().take(200).collect::<String>()))
-        .context(Shown(UNREACHABLE.into()))?;
+        .context(Shown(format!("GitHub 没有返回用户信息（HTTP {}），重新登录再试", status.as_u16())))?;
 
     if !allowed.contains(&user.login.to_lowercase()) {
         // The list stays in the log and out of the reason, which travels back in

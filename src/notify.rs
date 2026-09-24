@@ -67,21 +67,21 @@ pub const DEFAULT_BODY: &str =
     r#"{"event":"{{event}}","node":"{{node}}","title":"{{title}}","message":"{{message}}"}"#;
 pub const DEFAULT_TEXT: &str = "{{title}}\n{{message}}";
 
-/// Numeric settings as `(key, min, max, default)`.
-const NUMBERS: [(&str, i64, i64, i64); 3] = [
+/// Numeric settings as `(key, min, max, default, the panel's name for it)`.
+const NUMBERS: [(&str, i64, i64, i64, &str); 3] = [
     // Minutes a node may stay away before it is reported. Agents reconnect within
     // seconds of a network or hub interruption, which one minute already covers.
     // Capped at FLAP_GRACE: a longer grace would outwait a flapping node too, and
     // the absence clock, kept in memory, restarts with the hub, so every restart
     // during an outage would delay its alert by up to one more grace period.
     // Nodes expected to stay down for hours have their alerts switched off.
-    ("notify_grace", 1, FLAP_GRACE / 60, 3),
+    ("notify_grace", 1, FLAP_GRACE / 60, 3, "离线宽限期"),
     // Percent of the allowance that raises the first traffic alert; 0 disables
     // traffic alerts.
-    ("notify_traffic", 0, 100, 80),
+    ("notify_traffic", 0, 100, 80, "流量提醒"),
     // Days ahead an expiry is listed; 0 disables both expiry reminders and
     // renewal notices.
-    ("notify_expiry", 0, 365, 7),
+    ("notify_expiry", 0, 365, 7, "到期提醒"),
 ];
 
 /// Credentials, reported to the panel only as set or unset. A webhook URL is
@@ -89,7 +89,7 @@ const NUMBERS: [(&str, i64, i64, i64); 3] = [
 const SECRETS: [&str; 3] = ["notify_telegram_token", "notify_webhook_url", "notify_webhook_headers"];
 
 fn number(app: &App, key: &str) -> i64 {
-    let (_, min, max, default) =
+    let (_, min, max, default, _) =
         NUMBERS.iter().copied().find(|(k, ..)| *k == key).expect("a numeric setting");
     app.db.get(key).and_then(|v| v.parse().ok()).filter(|n| (min..=max).contains(n)).unwrap_or(default)
 }
@@ -121,13 +121,8 @@ pub fn settings(app: &App, out: &mut serde_json::Map<String, Value>) {
 
 /// Why a notification setting cannot be stored, or `None` when it can.
 pub fn setting_error(key: &str, value: &str) -> Option<String> {
-    if let Some((_, min, max, _)) = NUMBERS.iter().find(|(k, ..)| *k == key) {
+    if let Some((_, min, max, _, label)) = NUMBERS.iter().find(|(k, ..)| *k == key) {
         let fits = value.parse::<i64>().is_ok_and(|n| (*min..=*max).contains(&n));
-        let label = match key {
-            "notify_grace" => "离线宽限期",
-            "notify_traffic" => "流量提醒",
-            _ => "到期提醒",
-        };
         return (!fits).then(|| format!("{label}要填 {min} 到 {max} 之间的整数"));
     }
     let only = |s: &str, extra: &[u8]| {

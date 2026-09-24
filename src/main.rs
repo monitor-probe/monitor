@@ -471,11 +471,6 @@ async fn main() -> Result<()> {
     tokio::spawn(notify::watch(app.clone()));
 
     let router = Router::new()
-        // Agents.
-        .route("/api/agent/ws", get(agent_ws::handler))
-        .route("/api/agent/register", post(api::agent_register))
-        .route("/install.sh", get(install_script))
-        .route("/agent/{arch}", get(agent_binary))
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
@@ -528,6 +523,17 @@ async fn main() -> Result<()> {
                 .with_state(app.clone()),
         )
         .layer(axum::middleware::map_response(api::plain_errors))
+        // Agents, merged after that layer: `install.sh` and the agent print these
+        // replies beside their own English output, so they are left as written.
+        .merge(
+            Router::new()
+                .route("/api/agent/ws", get(agent_ws::handler))
+                .route("/api/agent/register", post(api::agent_register))
+                .route("/install.sh", get(install_script))
+                .route("/agent/{arch}", get(agent_binary))
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+                .with_state(app.clone()),
+        )
         // Excludes the agent binary and database backups: both are already
         // compressed and both are megabytes, so deflating them would consume the
         // cores argon2 and the SQLite writer share for no gain.

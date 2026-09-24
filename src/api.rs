@@ -95,7 +95,11 @@ pub async fn plain_errors(response: Response) -> Response {
         s if s.is_server_error() => INTERNAL,
         _ => "请求格式不对",
     };
-    answer(status, text)
+    // Only the body is replaced: a 405 keeps its `Allow`, for one.
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/plain; charset=utf-8"));
+    Response::from_parts(parts, text.into())
 }
 
 // ---- read paths, shared between the panel and the public page ----
@@ -1267,6 +1271,7 @@ async fn append(
     chunk: &Chunk,
     body: axum::body::Body,
 ) -> Result<u64, anyhow::Error> {
+    use anyhow::Context;
     use std::io::Write;
     use std::pin::Pin;
 
@@ -1275,7 +1280,8 @@ async fn append(
     while let Some(piece) =
         std::future::poll_fn(|cx| futures_core::Stream::poll_next(Pin::new(&mut stream), cx)).await
     {
-        let piece = piece?;
+        // The client went away mid-piece, as a cancelled upload does.
+        let piece = piece.context(crate::Shown("上传中断了，请重新上传".into()))?;
         received += piece.len() as u64;
         if chunk.offset + received > chunk.total {
             refuse!("这一片超出了声明的文件大小");
@@ -1649,6 +1655,7 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
         Ok(release) => release,
         Err(e) => {
             let why = match e.status().map(|s| s.as_u16()) {
+                None if e.is_decode() => "GitHub 的回复无法识别，稍后再试",
                 Some(404) => "这个仓库还没有正式 release",
                 // Unauthenticated callers get 60 requests an hour per address.
                 Some(403 | 429) => "GitHub 限制了这台机器的请求次数，过一小时再试",

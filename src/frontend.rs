@@ -283,19 +283,23 @@ pub fn install<R: Read>(themes: &Path, archive: R, expect: Option<&str>) -> Resu
 /// gzip'd tar at all.
 const DAMAGED: &str = "主题包损坏或不完整（可能没下载完），重新下载 theme.tar.gz 再试";
 
-/// Tells a failure to read the archive from a failure to write it out. Reading
-/// fails with these kinds -- `UnexpectedEof` where the stream stops short,
-/// `InvalidInput` for a corrupt or non-gzip stream -- and writing with others,
-/// such as a full disk or a permission, which are this machine's to fix.
-fn unreadable(e: std::io::Error) -> anyhow::Error {
-    use std::io::ErrorKind::{InvalidData, InvalidInput, UnexpectedEof};
-    let damaged = matches!(e.kind(), UnexpectedEof | InvalidInput | InvalidData);
-    let e = anyhow::Error::from(e);
-    if damaged {
-        e.context(crate::Shown(DAMAGED.into()))
-    } else {
-        e
-    }
+/// The answer to an archive whose entries cannot all be written: a file and a
+/// directory under one name, or a name the filesystem refuses.
+const TANGLED: &str = "主题包里有同名的文件和目录，或者文件名过长，包本身有问题，请联系主题作者";
+
+/// Tells a failure the archive caused from one of this machine's. Reading fails
+/// with `UnexpectedEof` where the stream stops short and `InvalidInput` for a
+/// corrupt or non-gzip one; a layout that cannot be written fails with the
+/// second group. Anything else -- a full disk, a permission -- is this machine's
+/// to fix.
+fn archive_error(e: std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind::*;
+    let shown = match e.kind() {
+        UnexpectedEof | InvalidInput | InvalidData => DAMAGED,
+        NotADirectory | IsADirectory | AlreadyExists | InvalidFilename => TANGLED,
+        _ => return e.into(),
+    };
+    anyhow::Error::from(e).context(crate::Shown(shown.into()))
 }
 
 fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
@@ -327,7 +331,7 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
         expanded += size;
         // Rejects an entry whose path escapes `into` -- absolute, `..`, or via
         // a symlinked parent -- reporting `false` rather than an error.
-        if !entry.unpack_in(into).map_err(unreadable)? {
+        if !entry.unpack_in(into).map_err(archive_error)? {
             refuse!("主题包里的路径越出了主题目录");
         }
     }
@@ -509,16 +513,19 @@ mod tests {
         assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v3");
         assert!(!base.join("aurora/dist/old.js").exists(), "the replaced theme must not leave files behind");
 
-        // A theme the hub cannot serve, a name that cannot be a directory, and
-        // a symlink -- the entry type that writes where the path check cannot
-        // look.
+        // A file where a directory must go, a theme the hub cannot serve, a name
+        // that cannot be a directory, and a symlink -- the entry type that
+        // writes where the path check cannot look.
         for bad in [
+            pack(&[("theme.json", manifest), ("dist", b"x"), ("dist/index.html", b"x")], None),
             pack(&[("theme.json", manifest)], None),
             pack(&[("theme.json", r#"{"name":"x","short":"../evil","description":"","version":"1","author":"a","url":""}"#.as_bytes()), ("dist/index.html", b"x")], None),
             pack(&[("theme.json", manifest), ("dist/index.html", b"x")], Some(("dist/link", "/etc/passwd"))),
             pack(&[("dist/index.html", b"x")], None),
         ] {
-            assert!(install(&base, bad, None).is_err());
+            // A reason for the panel, never the 500 of a failure on this machine.
+            let Err(e) = install(&base, bad, None) else { panic!("a bad package installed") };
+            assert!(e.downcast_ref::<crate::Shown>().is_some(), "{e:#}");
         }
         // A download cut short says so, rather than quoting the decoder.
         pack(&[("theme.json", manifest), ("dist/index.html", b"v9")], None);

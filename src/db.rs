@@ -1337,7 +1337,12 @@ impl Db {
                 "INSERT OR IGNORE INTO ping_node (task_id, node_id) VALUES (?1,?2)",
                 params![id, node],
             )
-            .with_context(|| crate::Shown(format!("节点 {node} 不存在，可能已被删除")))?;
+            .map_err(|e| match e.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::ConstraintViolation) => {
+                    anyhow::Error::from(e).context(crate::Shown(format!("节点 {node} 不存在，可能已被删除")))
+                }
+                _ => e.into(),
+            })?;
         }
         // Queried from the table after the rows are in rather than counted from
         // the request: an update changes this task's own assignments, so
@@ -2449,6 +2454,14 @@ mod tests {
         assert!(db.node(id).unwrap().is_none());
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 0);
         assert!(!db.all_traffic().contains_key(&id));
+        // Ticked in an editor opened before the delete: named, not a 500.
+        let gone = db.save_ping_task(&probe(vec![id])).unwrap_err();
+        let expected = format!("节点 {id} 不存在，可能已被删除");
+        assert_eq!(
+            gone.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()),
+            Some(expected.as_str()),
+            "{gone:#}"
+        );
 
         // `ping_record` has no foreign key to cascade through, and SQLite reassigns
         // the deleted id to the next node created: without the sweep in
