@@ -210,11 +210,16 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     // included so the install command can be displayed without reissuing it.
     if full {
         let held = (node.ipv4.as_str(), node.ipv6.as_str());
-        let shown = addresses(&node.ip, held, (&node.ipv4_pin, &node.ipv6_pin));
-        // What each family shows with its pin cleared, for the edit form to
-        // offer as the fallback.
-        let auto = addresses(&node.ip, held, ("", ""));
-        let auto = |v6: bool| auto.iter().find(|(a, _)| a.contains(':') == v6).map_or("", |(a, _)| a);
+        let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
+        let shown = addresses(&node.ip, held, (pin4, pin6));
+        // What each family shows with its own pin cleared and the other's kept,
+        // for the edit form to offer as the fallback.
+        let auto = |pins, v6: bool| {
+            addresses(&node.ip, held, pins)
+                .into_iter()
+                .find(|(a, _)| a.contains(':') == v6)
+                .map_or("", |(a, _)| a)
+        };
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
@@ -223,8 +228,8 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["ipv6_pin"] = json!(node.ipv6_pin);
         view["addresses"] =
             shown.iter().map(|(address, source)| json!({"address": address, "source": source})).collect();
-        view["ipv4_auto"] = json!(auto(false));
-        view["ipv6_auto"] = json!(auto(true));
+        view["ipv4_auto"] = json!(auto(("", pin6), false));
+        view["ipv6_auto"] = json!(auto((pin4, ""), true));
         view["interval"] = json!(current.and_then(Agent::interval));
         view["country_pin"] = json!(node.country_pin);
         view["country_auto"] = json!(node.country);
@@ -2412,7 +2417,8 @@ mod tests {
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
         // Disclosing the token would let any visitor impersonate the node.
-        for hidden in ["ip", "addresses", "ipv4_auto", "remark", "hostname", "token", "interval"] {
+        for hidden in ["ip", "addresses", "ipv4_auto", "ipv6_auto", "remark", "hostname", "token", "interval"]
+        {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert!(
@@ -2526,6 +2532,18 @@ mod tests {
             (&view["ipv4_auto"], &view["ipv6_auto"]),
             (&json!("203.0.113.7"), &json!("2401:b60:1c::5"))
         );
+
+        // Private addresses show only when nothing public is known, so the pin
+        // the other family keeps decides: v4 falls back to nothing while the v6
+        // pin stands.
+        let lan = node(&app, "lan", true);
+        app.db
+            .save_facts(lan, &json!({"ipv4": "192.168.1.5", "ipv6": "fd00::5"}), "192.168.1.2", "")
+            .unwrap();
+        let patch: NodePatch = serde_json::from_value(json!({"ipv6_pin": "2001:db8::9"})).unwrap();
+        app.db.update_node(lan, &patch).unwrap();
+        let view = visible_nodes(&app, true).unwrap().into_iter().find(|v| v["id"] == lan).unwrap();
+        assert_eq!((&view["ipv4_auto"], &view["ipv6_auto"]), (&json!(""), &json!("fd00::5")));
     }
 
     #[tokio::test]
