@@ -17,6 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A v* tag can be neither moved nor deleted, so one that disagrees with the
+      # version the binary reports stops here, before anything is published.
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          V=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [ "$GITHUB_REF_NAME" = "$V" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $V"; exit 1; }
+
       # The default theme arrives as a published archive, verified against the
       # hash in web-theme.pin. Run on the runner rather than left to build.rs,
       # because the cross container below does not necessarily carry curl; it
