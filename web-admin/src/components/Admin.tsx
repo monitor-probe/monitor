@@ -35,80 +35,121 @@ const TRAFFIC_MODES: Record<string, string> = {
 // it crosses, each skipping the last, and a skipped transition rejects `ready`.
 function animate(update: () => void) {
   if (document.startViewTransition) document.startViewTransition(() => flushSync(update)).ready.catch(() => {})
-  else update()
+  else flushSync(update)
 }
 
 // Drag-to-reorder for a table whose order the hub stores at `/${path}/order`.
 // Rows are displaced while the pointer is down and the whole order is saved on
-// drop, so a filtered table must disable its handles: the index a row reports is
-// then not its place in `order`.
-function useDragOrder<T extends { id: number }>(items: T[], path: string, onSaved: () => void) {
+// release, so a filtered table must disable its handles: the rows on screen are
+// then not `order`.
+function useDragOrder<T extends { id: number }>(items: T[], path: string, reload: () => void) {
   const [manualOrder, setManualOrder] = useState<number[]>([])
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
+  // The order last asked for. A view transition renders it a frame or more
+  // later, and a repeated key or a quick drag must build on it rather than on
+  // the order still on screen.
+  const pending = useRef<number[] | null>(null)
+  const body = useRef<HTMLTableSectionElement | null>(null)
+  // One save in flight at a time, so two quick reorders reach the hub in order.
+  const saving = useRef<Promise<unknown>>(Promise.resolve())
   const byId = new Map(items.map((item) => [item.id, item]))
   const orderedIds = new Set(manualOrder)
   const order = [
     ...manualOrder.map((id) => byId.get(id)).filter((item): item is T => Boolean(item)),
     ...items.filter((item) => !orderedIds.has(item.id)),
   ]
-  const ids = () => order.map((item) => item.id)
+  const ids = () => pending.current ?? order.map((item) => item.id)
 
-  // While a view transition runs, Chrome hit-tests drag events to the root
-  // element rather than the row under the pointer, so releasing during a row's
-  // 150 ms slide would count as a drop outside the table and restore the order.
-  // The body fills the viewport, so the root is otherwise never the target.
+  // Once the hub lists this order, its list is followed again, so a reorder made
+  // in another tab appears here instead of being overwritten by the next drag.
+  if (dragging === null && manualOrder.length && manualOrder.join() === items.map((item) => item.id).join()) {
+    setManualOrder([])
+  }
+
+  // Handled on the document by where the pointer is, not by the row under it:
+  // while a view transition runs, Chrome hit-tests drag events to the root
+  // element, so row handlers would miss every row crossed during a 150 ms slide,
+  // and a release then would count as a drop outside the table. Re-attached on
+  // every render, since `order` changes as rows are displaced.
   useEffect(() => {
-    if (dragging === null) return
-    const accept = (e: DragEvent) => { if (e.target === document.documentElement) e.preventDefault() }
-    document.addEventListener("dragover", accept)
-    document.addEventListener("drop", accept)
-    return () => {
-      document.removeEventListener("dragover", accept)
-      document.removeEventListener("drop", accept)
+    const rows = body.current
+    if (dragging === null || !rows) return
+    const over = (e: DragEvent) => {
+      const table = rows.getBoundingClientRect()
+      if (e.clientX < table.left || e.clientX > table.right || e.clientY < table.top || e.clientY > table.bottom) return
+      e.preventDefault()
+      if (e.type === "drop") return
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move"
+      const at = [...rows.rows].findIndex((row) => {
+        const r = row.getBoundingClientRect()
+        return e.clientY >= r.top && e.clientY < r.bottom
+      })
+      // By position rather than by the row there, which may be one a pending
+      // transition has yet to move.
+      if (at >= 0) move(dragging, at)
     }
-  }, [dragging])
+    document.addEventListener("dragover", over)
+    document.addEventListener("drop", over)
+    return () => {
+      document.removeEventListener("dragover", over)
+      document.removeEventListener("drop", over)
+    }
+  })
 
-  function move(from: number, to: number) {
-    if (from < 0 || to < 0 || to >= order.length || from === to) return
-    const next = [...order]
+  // A transition superseded before it ran applies nothing: a later move, or a
+  // refused save falling back to the hub's order, has replaced it.
+  function show(next: number[]) {
+    pending.current = next
+    animate(() => {
+      if (pending.current !== next) return
+      pending.current = null
+      setManualOrder(next)
+    })
+  }
+
+  function move(id: number, to: number) {
+    const next = [...ids()]
+    const from = next.indexOf(id)
+    if (from < 0 || to < 0 || to >= next.length || from === to) return
     next.splice(to, 0, ...next.splice(from, 1))
-    const moved = next.map((item) => item.id)
-    animate(() => setManualOrder(moved))
-    return moved
+    show(next)
+    return next
   }
 
   // Dropped outside the table or cancelled with Escape: the order is restored.
   function cancel() {
     setDragging(null)
-    const rollback = orderBeforeDrag.current
-    if (rollback.length) animate(() => setManualOrder(rollback))
+    if (orderBeforeDrag.current.length) show(orderBeforeDrag.current)
   }
 
   function save(next: number[]) {
     setDragging(null)
-    const rollback = orderBeforeDrag.current
-    if (!rollback.length || next.join() === rollback.join()) return
+    const before = orderBeforeDrag.current
+    if (!before.length || next.join() === before.join()) return
     orderBeforeDrag.current = next
-    api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) }).then(onSaved, (e: Error) => {
-      setManualOrder(rollback)
+    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
+    // A refusal falls back to whatever the hub holds, which a save queued
+    // behind it may still change.
+    saving.current = saving.current.then(put).then(reload, (e: Error) => {
+      pending.current = null
+      setManualOrder([])
+      reload()
       toast.error(e.message)
     })
   }
 
   return {
     order,
-    row: (id: number, index: number) => ({
+    row: (id: number) => ({
       style: { viewTransitionName: `${path}-${id}` },
       "data-dragging": dragging === id || undefined,
       className: "transition-opacity data-[dragging]:opacity-40",
-      onDragOver: (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = "move" },
-      onDragEnter: () => { if (dragging !== null) move(order.findIndex((item) => item.id === dragging), index) },
-      onDrop: (e: React.DragEvent) => { e.preventDefault(); save(ids()) },
     }),
-    handle: (id: number, index: number) => ({
-      onDragStart: (e: React.DragEvent) => {
+    handle: (id: number) => ({
+      onDragStart: (e: React.DragEvent<HTMLElement>) => {
         orderBeforeDrag.current = ids()
+        body.current = e.currentTarget.closest("tbody")
         setDragging(id)
         e.dataTransfer.effectAllowed = "move"
         // Firefox refuses to start a drag without a payload.
@@ -120,7 +161,7 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, onSave
         if (!delta) return
         e.preventDefault()
         orderBeforeDrag.current = ids()
-        const next = move(index, index + delta)
+        const next = move(id, ids().indexOf(id) + delta)
         if (next) save(next)
       },
     }),
@@ -1255,12 +1296,12 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             </TableRow>
           </TableHeader>
           <TableBody>
-            {visible.map((n, index) => (
-              <TableRow key={n.id} {...drag.row(n.id, index)}>
+            {visible.map((n) => (
+              <TableRow key={n.id} {...drag.row(n.id)}>
                 <TableCell>
                   <div className="flex items-center gap-2">
                     <DragHandle
-                      {...drag.handle(n.id, index)}
+                      {...drag.handle(n.id)}
                       name={n.name}
                       disabled={searching}
                       title={searching ? "清空搜索和分组筛选后可拖动排序" : undefined}
@@ -1546,11 +1587,11 @@ function Ping({ nodes }: { nodes: Node[] }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {drag.order.map((t, index) => (
-              <TableRow key={t.id} {...drag.row(t.id, index)}>
+            {drag.order.map((t) => (
+              <TableRow key={t.id} {...drag.row(t.id)}>
                 <TableCell className="font-medium">
                   <div className="flex items-center gap-2">
-                    <DragHandle {...drag.handle(t.id, index)} name={t.name} />
+                    <DragHandle {...drag.handle(t.id)} name={t.name} />
                     {t.name}
                   </div>
                 </TableCell>

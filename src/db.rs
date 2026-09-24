@@ -1542,12 +1542,21 @@ impl Db {
         // which probes first appear; bucket by bucket, that would be whichever
         // probe happened to answer inside the window's partial first bucket.
         let rank: HashMap<i64, usize> = conn
-            .prepare("SELECT id FROM ping_task ORDER BY sort, id")?
+            .prepare_cached("SELECT id FROM ping_task ORDER BY sort, id")?
             .query_map([], |r| r.get(0))?
             .enumerate()
             .map(|(i, id)| id.map(|id| (id, i)))
             .collect::<Result<_, _>>()?;
-        out.sort_by_cached_key(|row| row["task_id"].as_i64().and_then(|id| rank.get(&id).copied()));
+        // Sorted after releasing the connection the agents write through. A
+        // probe missing from the rank, which the assignment filter in
+        // `PING_ROWS` rules out today, goes last rather than taking the first
+        // colour.
+        drop(rows);
+        drop(stmt);
+        drop(conn);
+        out.sort_by_cached_key(|row| {
+            row["task_id"].as_i64().and_then(|id| rank.get(&id).copied()).unwrap_or(usize::MAX)
+        });
         // Unrounded: the caller decides how to render it, and rounding here would
         // turn 0.14% into the 0% that denotes no loss at all.
         let loss: serde_json::Map<String, serde_json::Value> = totals
