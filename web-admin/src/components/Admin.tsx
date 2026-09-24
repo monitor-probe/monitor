@@ -225,7 +225,8 @@ function OptionRow({ title, hint, toggle = false, below, children }: {
 // rather than retyped, where a typo would start a second one. A list of its own
 // rather than a <datalist>: Chrome draws that as a tooltip and filters it by the
 // text already in the box, so a grouped node was offered only its own group.
-// The whole list shows on opening; typing narrows it.
+// The whole list shows on opening; typing narrows it without highlighting, so
+// Enter keeps a new name that merely prefixes an existing one.
 function GroupInput({ nodes, value, onChange }: {
   nodes: Pick<Node, "group">[]
   value: string
@@ -235,7 +236,7 @@ function GroupInput({ nodes, value, onChange }: {
   const [open, setOpen] = useState(false)
   const [typed, setTyped] = useState(false)
   const [active, setActive] = useState(0)
-  const anchor = useRef<HTMLDivElement>(null)
+  const input = useRef<HTMLInputElement>(null)
   const counts = new Map<string, number>()
   for (const n of nodes) if (n.group) counts.set(n.group, (counts.get(n.group) ?? 0) + 1)
   const name = value.trim()
@@ -264,11 +265,13 @@ function GroupInput({ nodes, value, onChange }: {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault()
       if (!shown) return show()
-      const step = e.key === "ArrowDown" ? 1 : -1
-      setActive((i) => (i + step + items.length) % items.length)
-    } else if (e.key === "Enter" && shown && items[active] !== undefined) {
+      if (!items.length) return
+      const down = e.key === "ArrowDown"
+      setActive((i) => (i < 0 ? (down ? 0 : items.length - 1) : (i + (down ? 1 : -1) + items.length) % items.length))
+    } else if (e.key === "Enter" && shown) {
       e.preventDefault()
-      pick(items[active])
+      if (items[active] !== undefined) pick(items[active])
+      else setOpen(false)
     }
   }
 
@@ -278,8 +281,9 @@ function GroupInput({ nodes, value, onChange }: {
   return (
     <Popover open={shown} onOpenChange={setOpen}>
       <PopoverAnchor asChild>
-        <div ref={anchor} className="relative">
+        <div className="relative">
           <Input
+            ref={input}
             role="combobox"
             aria-expanded={shown}
             aria-controls={id}
@@ -292,11 +296,10 @@ function GroupInput({ nodes, value, onChange }: {
             onChange={(e) => {
               onChange(e.target.value)
               setTyped(true)
-              setActive(0)
+              setActive(-1)
               setOpen(true)
             }}
             onClick={show}
-            onBlur={() => setOpen(false)}
             onKeyDown={onKeyDown}
           />
           {/* Not a tab stop, and keeps the focus in the box it opens a list for. */}
@@ -308,7 +311,7 @@ function GroupInput({ nodes, value, onChange }: {
             onMouseDown={(e) => {
               e.preventDefault()
               if (shown) return setOpen(false)
-              anchor.current?.querySelector("input")?.focus()
+              input.current?.focus()
               show()
             }}
           >
@@ -322,7 +325,7 @@ function GroupInput({ nodes, value, onChange }: {
         onOpenAutoFocus={(e) => e.preventDefault()}
         onCloseAutoFocus={(e) => e.preventDefault()}
         // The box and its button sit outside the list; pressing them is not a dismissal.
-        onInteractOutside={(e) => anchor.current?.contains(e.target as Element) && e.preventDefault()}
+        onInteractOutside={(e) => input.current?.parentElement?.contains(e.target as Element) && e.preventDefault()}
         onMouseDown={(e) => e.preventDefault()}
       >
         <div role="listbox" id={id} aria-label="已有分组" className="max-h-60 overflow-y-auto">
