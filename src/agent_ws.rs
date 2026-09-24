@@ -13,13 +13,14 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use chrono::{DateTime, Local};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::auth::node_ip;
+use crate::db::Db;
 use crate::{App, Shared};
 
 /// How often a quiet agent is probed, and how long the hub waits for any frame
@@ -27,11 +28,39 @@ use crate::{App, Shared};
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const SILENCE: Duration = Duration::from_secs(120);
 
+/// Reports closer together than this are dropped. The agent's floor is one
+/// second; half of it leaves room for two reports the network has bunched.
+const REPORT_SPACING: Duration = Duration::from_millis(500);
+
+/// Probe results admitted per window: twice what the busiest honest node sends
+/// in one -- every probe it may run, each at the shortest interval -- since a
+/// window can straddle two rounds.
+const RESULT_WINDOW: Duration = Duration::from_secs(Db::MIN_PROBE_INTERVAL as u64);
+const RESULTS_PER_WINDOW: u32 = 2 * Db::MAX_PROBES_PER_NODE as u32;
+
 /// Distinguishes one agent session on a node from the next. A connection can
 /// remain nominally open for up to SILENCE, long enough for the agent to have
 /// given up and reconnected; without this tag a late teardown would remove the
 /// live session that replaced it.
 static SESSION: AtomicU64 = AtomicU64::new(0);
+
+/// When the hub received a frame, read from both clocks at once: the wall clock
+/// for stamps and calendar dates, the monotonic one for durations.
+#[derive(Debug, Clone, Copy)]
+pub struct Arrival {
+    pub tick: Instant,
+    pub at: DateTime<Local>,
+}
+
+impl Arrival {
+    pub fn now() -> Self {
+        Self { tick: Instant::now(), at: Local::now() }
+    }
+
+    fn minute(&self) -> i64 {
+        self.at.timestamp().div_euclid(60)
+    }
+}
 
 /// One connected agent. Held in memory only, and rebuilt within one report
 /// interval of a hub restart.
@@ -50,23 +79,22 @@ pub struct Agent {
     /// The latest report, or `Null` between connecting and the first one.
     pub metrics: serde_json::Value,
     pub last_seen: i64,
-    /// Wall-clock minute this session has already accounted for. A history row
-    /// is written when a report arrives past it.
-    pub last_minute: i64,
-    /// `(monotonic instant, total_rx, total_tx)` as of the last history row, so
-    /// the next one carries the average rate over the interval. Without it a row
-    /// would hold a single instantaneous reading -- a 1-in-60 sample of the
-    /// minute it describes. See [`report`].
+    /// The wall-clock minute this session last wrote a history row for, or the
+    /// one it opened in. A row is written when a report arrives past it.
     ///
-    /// An `Instant` rather than the wall clock the stamp comes from, because this
-    /// is a duration. NTP stepping the clock backwards -- a fresh boot correcting
-    /// itself, a restored snapshot -- makes a wall-clock difference negative, and
-    /// the `.max(1)` guarding the division would then divide a whole minute of
-    /// bytes by one second. The agent computes the same quantity against
-    /// `std::time::Instant` for the same reason.
-    pub mark: Option<(Instant, i64, i64)>,
-    /// Running mean of the minute in progress, for the same reason.
+    /// No row is written for the minute a session opens in. The session it
+    /// replaced has already written that row from the reports of a whole
+    /// minute, which the new session's first report would overwrite with a
+    /// single sample.
+    last_minute: Option<i64>,
+    /// The reading the next history row measures its network rate from. See
+    /// [`report`].
+    mark: Option<Mark>,
+    /// Running mean of the minute in progress.
     minute: Minute,
+    /// When this session's first and latest reports arrived, and how many came
+    /// after the first. See [`Agent::interval`].
+    reports: Option<(Instant, Instant, u32)>,
 }
 
 impl Agent {
@@ -76,15 +104,40 @@ impl Agent {
             tx,
             metrics: serde_json::Value::Null,
             last_seen: 0,
-            // The minute in progress rather than zero. Its row is already on
-            // disk, written by the session this one replaces from the mean of a
-            // whole minute; a reconnect's first report would otherwise overwrite
-            // it with the single sample that opened the new session.
-            last_minute: Utc::now().timestamp() / 60,
+            last_minute: None,
             mark: None,
             minute: Minute::default(),
+            reports: None,
         }
     }
+
+    /// The interval the agent reports at, in whole seconds: the mean spacing of
+    /// this session's reports, `None` before the second. The agent does not
+    /// state its own, and a reinstall keeps it unless told otherwise, so the
+    /// install dialog shows this as what it would keep.
+    pub fn interval(&self) -> Option<u64> {
+        let (first, last, spacings) = self.reports?;
+        (spacings > 0)
+            .then(|| (last.duration_since(first).as_secs_f64() / f64::from(spacings)).round() as u64)
+    }
+}
+
+/// Where a history row's network rate starts: the kernel's counters as a report
+/// carried them, so the chart integrates to the bytes the traffic row books.
+/// Without it a row would hold the agent's reading of a single second -- a 1-in-60
+/// sample of the minute it describes.
+///
+/// `tick` is an `Instant` rather than the wall clock, because the rate divides by
+/// a duration. NTP stepping the clock backwards -- a fresh boot correcting
+/// itself, a restored snapshot -- makes a wall-clock difference negative, and the
+/// `.max(1)` guarding the division would then divide a whole minute of bytes by
+/// one second. The agent computes its own rate against `Instant` for the same
+/// reason.
+#[derive(Debug)]
+struct Mark {
+    tick: Instant,
+    epoch: String,
+    counters: (i64, i64),
 }
 
 /// Fields a history row carries as the mean of its minute rather than the single
@@ -92,8 +145,8 @@ impl Agent {
 /// real load that a point sample would report as idle.
 ///
 /// `load` is absent because no history row carries it: it is a live figure read
-/// from the report. `net_rx` and `net_tx` are absent because [`report`] fills
-/// them from the accumulator, which is exact.
+/// from the report. `net_rx` and `net_tx` are absent because [`report`] derives
+/// them from the kernel's counters, which is exact.
 const MEAN_FLOAT: [&str; 1] = ["cpu"];
 const MEAN_INT: [&str; 6] = ["mem_used", "swap_used", "disk_used", "tcp", "udp", "procs"];
 
@@ -128,6 +181,74 @@ impl Minute {
             let mean = if slot < MEAN_FLOAT.len() { json!(mean) } else { json!(mean.round() as i64) };
             obj.insert((*key).to_owned(), mean);
         }
+    }
+}
+
+/// What one connection may cost the hub, and the probe results it has yet to
+/// file. Local to the connection, unlike [`Agent`], which others read.
+///
+/// A node token is enough to send frames at any rate, and each is parsed and
+/// most are written: unbounded, 34,209 reports over one connection in ten
+/// seconds would have the hub write 93 MB (measured). The agent's own pace is
+/// known, so what exceeds it is dropped: reports faster than its one-second
+/// floor, a second hello, and results beyond [`Db::MAX_PROBES_PER_NODE`]
+/// probes each run every [`Db::MIN_PROBE_INTERVAL`] seconds.
+///
+/// ponytail: the caps start afresh with each connection, so a token reconnecting
+/// in a loop costs two commits per handshake -- the hello, and the first
+/// report's `last_seen` -- rather than a few per minute. An honest agent cannot
+/// do this, as it doubles its wait after a short session. A per-node limit on
+/// handshakes if it is ever observed; reissuing the token ends it meanwhile.
+#[derive(Debug, Default)]
+struct Session {
+    greeted: bool,
+    last_report: Option<Instant>,
+    /// Start of the current result window and the results admitted in it.
+    window: Option<(Instant, u32)>,
+    /// Whether a dropped or unusable frame has been logged; see [`Session::complain`].
+    complained: bool,
+    /// Probe results as `(task_id, ts, latency)`, filed a minute at a time
+    /// because each commit writes at least one page.
+    results: Vec<(i64, i64, i64)>,
+}
+
+impl Session {
+    fn admit_report(&mut self, tick: Instant) -> bool {
+        if self.last_report.is_some_and(|last| tick.saturating_duration_since(last) < REPORT_SPACING) {
+            return false;
+        }
+        self.last_report = Some(tick);
+        true
+    }
+
+    fn admit_result(&mut self, tick: Instant) -> bool {
+        let (start, admitted) = self.window.get_or_insert((tick, 0));
+        if tick.saturating_duration_since(*start) >= RESULT_WINDOW {
+            (*start, *admitted) = (tick, 0);
+        }
+        *admitted += 1;
+        *admitted <= RESULTS_PER_WINDOW
+    }
+
+    /// Logs the first dropped or unusable frame of a session as a warning and
+    /// the rest at debug: a peer that sends one tends to send thousands, and each
+    /// line is a journal write.
+    fn complain(&mut self, node_id: i64, what: impl std::fmt::Display) {
+        if std::mem::replace(&mut self.complained, true) {
+            debug!("node {node_id}: {what}");
+        } else {
+            warn!("node {node_id}: {what}; more of these on this connection are logged at debug");
+        }
+    }
+
+    /// Files the probe results gathered so far. Taken rather than kept on a
+    /// failure, so a database that refuses them cannot grow the buffer.
+    fn file_results(&mut self, app: &App, node_id: i64) -> Result<()> {
+        let results = std::mem::take(&mut self.results);
+        if results.is_empty() {
+            return Ok(());
+        }
+        app.db.insert_pings(node_id, &results)
     }
 }
 
@@ -169,11 +290,11 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
-    let session = SESSION.fetch_add(1, Ordering::Relaxed);
+    let tag = SESSION.fetch_add(1, Ordering::Relaxed);
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
+    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
     info!("node {node_id} connected from {ip}");
 
     // Send the probe list before the first report arrives.
@@ -187,6 +308,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     // connection lasts; otherwise it would wait for the next hello, which on a
     // steady link is days away.
     let mut owed: Option<String> = None;
+    let mut session = Session::default();
 
     let outcome = loop {
         tokio::select! {
@@ -216,20 +338,22 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
             inbound = socket.recv() => {
                 last_frame = Instant::now();
                 match inbound {
-                // Every report contends for the single database connection, which
-                // a restore or vacuum can hold for seconds. Without this, agents
+                // A frame can wait on the single database connection, which a
+                // restore or vacuum can hold for seconds. Without this, agents
                 // would park every worker thread on that lock and starve the rest
                 // of the runtime -- the panel, the public page, the shutdown
                 // signal.
-                Some(Ok(Message::Text(text))) =>
-                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text)) {
-                    Ok(Some(source)) => {
-                        locate(app.clone(), node_id, source.clone());
-                        owed = Some(source);
+                Some(Ok(Message::Text(text))) => {
+                    let arrival = Arrival::now();
+                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text, &mut session, arrival)) {
+                        Ok(Some(source)) => {
+                            locate(app.clone(), node_id, source.clone());
+                            owed = Some(source);
+                        }
+                        Ok(None) => {}
+                        Err(e) => session.complain(node_id, format_args!("unusable message: {e:#}")),
                     }
-                    Ok(None) => {}
-                    Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
-                },
+                }
                 Some(Ok(Message::Close(_))) | None => break Ok(()),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Err(e.into()),
@@ -238,50 +362,108 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
         }
     };
 
-    if release(&app, node_id, session) {
+    let ended = release(&app, node_id, tag);
+    if ended.is_some() {
         info!("node {node_id} went offline");
     }
+    tokio::task::block_in_place(|| close(&app, node_id, ended.as_ref(), &mut session));
     outcome
 }
 
-/// Drops a node's connection state, but only while `session` is still the one
-/// holding it. Returns whether anything was released.
+/// Drops a node's connection state, but only while the session tagged `tag` is
+/// still the one holding it, and returns what it held.
 ///
 /// A teardown can arrive up to SILENCE after the agent gave up, by which time a
 /// reconnect may have installed a newer session under the same node id; clearing
 /// that one would mark a node offline while it is reporting normally.
-fn release(app: &App, node_id: i64, session: u64) -> bool {
+fn release(app: &App, node_id: i64, tag: u64) -> Option<Agent> {
     let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
-    if !agents.get(&node_id).is_some_and(|a| a.session == session) {
-        return false;
+    if !agents.get(&node_id).is_some_and(|a| a.session == tag) {
+        return None;
     }
-    agents.remove(&node_id);
-    true
+    agents.remove(&node_id)
+}
+
+/// Files what an ended session still held: the node's held reading, the probe
+/// results not yet filed, and when the node was last seen, with the capacities
+/// it last reported.
+///
+/// All of it for a session that ended on its own, which [`release`] reports as
+/// `ended`. One a reconnect replaced files its probe results alone: they
+/// arrived on this connection and no other, while its successor files newer
+/// figures of the rest, and an older `last_seen` would move that back. One the
+/// panel ended, by deleting the node, reissuing its token or restoring the
+/// database, files nothing.
+fn close(app: &App, node_id: i64, ended: Option<&Agent>, session: &mut Session) {
+    if ended.is_none() && !app.agents.read().unwrap_or_else(|e| e.into_inner()).contains_key(&node_id) {
+        return;
+    }
+    if let Err(e) = session.file_results(app, node_id) {
+        warn!("node {node_id}: filing its last probe results failed: {e:#}");
+    }
+    let Some(agent) = ended else { return };
+    book_held(app, Some(node_id));
+    if agent.last_seen > 0 {
+        if let Err(e) = app.db.touch_seen(node_id, agent.last_seen, &agent.metrics) {
+            warn!("node {node_id}: recording when it was last seen failed: {e:#}");
+        }
+    }
 }
 
 /// Handles one inbound frame and returns the address a country lookup is now
 /// owed for, if any. The lookup itself is an outbound request and happens off
 /// this path; see `locate`.
-fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<Option<String>> {
+fn dispatch(
+    app: &App,
+    node_id: i64,
+    ip: &str,
+    text: &str,
+    session: &mut Session,
+    arrival: Arrival,
+) -> Result<Option<String>> {
     let rpc: Rpc = serde_json::from_str(text)?;
+    // Results gathered in an earlier minute are filed on the next frame of any
+    // kind: reports arrive every few seconds even where every probe runs once an
+    // hour. A failure is logged rather than returned, which would discard the
+    // frame that happened to trigger it.
+    if session.results.first().is_some_and(|&(_, ts, _)| ts.div_euclid(60) != arrival.minute()) {
+        if let Err(e) = session.file_results(app, node_id) {
+            session.complain(node_id, format_args!("filing probe results failed: {e:#}"));
+        }
+    }
     match rpc.method.as_str() {
         "hello" => {
+            if std::mem::replace(&mut session.greeted, true) {
+                session.complain(node_id, "a second hello on one connection was ignored");
+                return Ok(None);
+            }
             let field = |k: &str| rpc.params.get(k).and_then(|v| v.as_str()).unwrap_or("");
             let source =
                 country_source(ip, field("ipv4"), field("ipv6")).map_or_else(String::new, |a| a.to_string());
             let owed = app.db.save_facts(node_id, &rpc.params, ip, &source)?;
             return Ok(owed.then_some(source));
         }
-        "report" => report(app, node_id, rpc.params)?,
+        // Dropped quietly: two reports the network bunched are how an honest
+        // agent trips this.
+        "report" if !session.admit_report(arrival.tick) => {
+            debug!("node {node_id}: a report within {REPORT_SPACING:?} of the last was dropped")
+        }
+        "report" => report(app, node_id, rpc.params, arrival)?,
+        "ping.result" if !session.admit_result(arrival.tick) => session.complain(
+            node_id,
+            format_args!(
+                "more than {RESULTS_PER_WINDOW} probe results within {RESULT_WINDOW:?} were dropped"
+            ),
+        ),
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
             // A missing reading is not a reading of -1: `close_bucket` counts
             // every negative latency as a lost packet, so defaulting here would
-            // render a malformed frame as an outage. The accumulator follows the
-            // same rule for a counter it cannot read.
+            // render a malformed frame as an outage. A report follows the same
+            // rule for a counter it cannot read.
             let latency = rpc.params.get("latency_ms").and_then(|v| v.as_i64());
             if let (true, Some(latency)) = (task_id > 0, latency) {
-                app.db.insert_ping(node_id, task_id, Utc::now().timestamp(), latency)?;
+                session.results.push((task_id, arrival.at.timestamp(), latency));
             }
         }
         other => debug!("node {node_id} sent unknown method {other}"),
@@ -294,10 +476,10 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<Option<Stri
 /// TUN-mode proxies), multicast and reserved. On the v6 side only 2000::/3
 /// counts, which leaves out ULA, link-local and loopback.
 ///
-/// The agent ranks its interface addresses by the same ranges and the panel
-/// decides by them which addresses to show; the three lists are to be changed
-/// together.
-fn public(ip: IpAddr) -> bool {
+/// The agent ranks its interface addresses by the same ranges, and
+/// `api::addresses` decides by them which to show; the two lists are to be
+/// changed together.
+pub(crate) fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, c, _] = v4.octets();
@@ -345,7 +527,8 @@ fn country_source(ip: &str, ipv4: &str, ipv6: &str) -> Option<IpAddr> {
 /// reads as a new question and the gate never closes. Only the time is
 /// recorded. The cost is that a node genuinely changing address within the hour
 /// acquires its badge when the hour is up, and an empty column is already a
-/// permitted state.
+/// permitted state. Returning to the last address answered before the current
+/// one is not a change: `Db::save_facts` restores that answer without asking.
 static ASKED: OnceLock<Mutex<HashMap<i64, Instant>>> = OnceLock::new();
 const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 
@@ -385,9 +568,9 @@ fn locate(app: Shared, node_id: i64, source: String) {
     });
 }
 
-/// Figures the hub folds into a report on the way out. They never arrive from an
-/// agent and are therefore not part of the contract one must meet.
-const INJECTED: [&str; 4] = ["total_rx", "total_tx", "month_rx", "month_tx"];
+/// Figures `api::node_view` fills into `metrics` from the traffic row. They never
+/// arrive from an agent and are therefore not part of the contract one must meet.
+pub(crate) const INJECTED: [&str; 4] = ["total_rx", "total_tx", "month_rx", "month_tx"];
 
 /// Everything an agent must send, derived from the public view rather than
 /// restated a third time: this list, `api::PUBLIC_METRICS` and the check below
@@ -417,15 +600,99 @@ fn numeric_fields() -> impl Iterator<Item = &'static str> {
 
 /// Reports, once per connection, when a report omits fields the hub depends on.
 /// A version number cannot serve here: an agent that renames a field carries a
-/// higher version, not a lower one.
+/// higher version, not a lower one. An empty `boot_id` counts as omitted, since
+/// no reading can be taken without one.
 fn check_contract(node_id: i64, metrics: &serde_json::Value) {
-    let missing: Vec<&str> = report_fields().filter(|k| metrics.get(k).is_none()).collect();
+    let missing: Vec<&str> =
+        report_fields().filter(|k| metrics.get(k).is_none_or(|v| v.is_null() || *v == "")).collect();
     if !missing.is_empty() {
-        warn!("node {node_id} reports without {missing:?}: those columns will read zero and the default theme will void this node's live view, so this agent and this hub are out of step");
+        // scripts/e2e.sh fails on "reports without"; the two change together.
+        warn!("node {node_id} reports without {missing:?}: this agent and this hub are out of step, and what depends on those fields -- traffic, charts, the default theme's live view -- will not show them");
     }
 }
 
-fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()> {
+/// One report's pair of kernel byte counters, the span they belong to, and when
+/// the hub received them.
+#[derive(Debug)]
+pub struct Reading {
+    /// The agent's `boot_id`: comparable readings share it.
+    epoch: String,
+    counters: (i64, i64),
+    arrival: Arrival,
+    /// Whether this reading has been booked into the traffic row.
+    booked: bool,
+}
+
+impl Reading {
+    /// Whether `next` continues this reading's span. A new epoch or a counter
+    /// that moved backwards leaves nothing to subtract.
+    fn continued_by(&self, next: &Reading) -> bool {
+        self.epoch == next.epoch && next.counters.0 >= self.counters.0 && next.counters.1 >= self.counters.1
+    }
+}
+
+/// Holds a node's newest reading and books it into the traffic row about once a
+/// minute rather than with every report.
+///
+/// Each booking is a commit that writes at least one page. Booked with every
+/// report, the traffic row would be most of what the hub writes: measured at
+/// 1.04 GB in 7.3 hours for eight nodes reporting every second, against an 8 MB
+/// database. Holding a reading back loses nothing, because the kernel counter
+/// keeps counting: a later booking takes in everything since the last reading
+/// booked. Skipping the readings in between gives the same totals as booking
+/// all of them, provided every break is booked on both sides:
+///
+/// - no reading held: book this one, which aligns the baseline or takes in what
+///   the node counted while away;
+/// - a break: book the held reading as the last of its span, then this one as
+///   the first of the next;
+/// - a new minute: book the held reading, dated by its own arrival, so a byte
+///   moved before midnight still counts toward that day; where it was already
+///   booked (reports a minute or more apart) book this one;
+/// - otherwise book nothing.
+///
+/// Per node rather than per session, and booked under one lock. A session
+/// holding its own reading would, once a reconnect had replaced it, hold an
+/// older reading than its successor; booking that as it closed would move the
+/// baseline back and count the difference twice.
+///
+/// ponytail: one lock for every node, held across a booking, so a report waits
+/// while another node's booking waits on the database. Per-node locks if a slow
+/// query ever holds reports up behind one.
+fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
+    let book = |r: &Reading| app.db.accumulate(node_id, &r.epoch, r.counters, r.arrival.at);
+    let mut held = app.readings.lock().unwrap_or_else(|e| e.into_inner());
+    // Whether the held reading, then this one, is booked.
+    let (book_last, book_this) = match held.get(&node_id) {
+        None => (false, true),
+        Some(last) if !last.continued_by(&reading) => (!last.booked, true),
+        Some(last) if last.arrival.minute() != reading.arrival.minute() => (!last.booked, last.booked),
+        Some(_) => (false, false),
+    };
+    if book_last {
+        book(&held[&node_id])?;
+    }
+    if book_this {
+        book(&reading)?;
+    }
+    held.insert(node_id, Reading { booked: book_this, ..reading });
+    Ok(())
+}
+
+/// Books held readings not yet booked: one node's as its session ends, every
+/// node's as the hub stops. Otherwise a node that reboots before reporting again
+/// takes the bytes since its last booking with it.
+pub fn book_held(app: &App, node: Option<i64>) {
+    let mut held = app.readings.lock().unwrap_or_else(|e| e.into_inner());
+    for (id, reading) in held.iter_mut().filter(|(id, r)| !r.booked && node.is_none_or(|n| n == **id)) {
+        match app.db.accumulate(*id, &reading.epoch, reading.counters, reading.arrival.at) {
+            Ok(_) => reading.booked = true,
+            Err(e) => warn!("node {id}: booking its last reading failed: {e:#}"),
+        }
+    }
+}
+
+fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival) -> Result<()> {
     // Missing fields remain compatible with older agents, while malformed values
     // must not become a live frame that can crash a browser. Counter validation
     // is separate: a missing or null kernel reading must not alter its
@@ -441,72 +708,69 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
             "invalid load"
         );
     }
-    let now = Utc::now().timestamp();
-    // Read once, alongside the wall clock: the stamp is a point in time taken
-    // from `now`, while the rate below is a duration taken from this.
-    let tick = Instant::now();
-    // A placeholder rather than the empty string, which `accumulate` reads as
-    // the absence of a baseline. An agent sending no boot_id -- an older build,
-    // or a host without the file -- would otherwise realign on every report and
-    // never book a byte.
-    let boot_id = metrics.get("boot_id").and_then(|v| v.as_str()).filter(|b| !b.is_empty()).unwrap_or("-");
-    // No reading is not a reading of zero; see `accumulate`. Anything that is
-    // not a non-negative i64 is likewise no reading -- a u64 beyond the signed
-    // range, a float, or a negative value. Negatives are rejected above and must
-    // not survive here either: `accumulate` stores whatever it receives as the
-    // next baseline, and a negative baseline would make the following report's
-    // delta the counter plus its magnitude.
+    // No reading is not a reading of zero: booking zero would align the
+    // baseline to it and book the next report's lifetime counter as one delta.
+    // Anything that is not a non-negative i64 is likewise no reading -- a u64
+    // beyond the signed range, a float, or a negative value -- and so is a pair
+    // without an epoch, which cannot say whether it continues the last one.
     let counter = |k: &str| metrics.get(k).and_then(|v| v.as_i64()).filter(|n| *n >= 0);
-    let counters = counter("net_rx_total").zip(counter("net_tx_total"));
-    let traffic = app.db.accumulate(node_id, boot_id, counters)?;
-
-    // The UI displays the hub's accumulated figures, so they are folded into the
-    // live payload while the raw kernel counters remain a wire-protocol detail.
-    if let Some(obj) = metrics.as_object_mut() {
-        obj.insert("total_rx".into(), json!(traffic.total_rx));
-        obj.insert("total_tx".into(), json!(traffic.total_tx));
-        obj.insert("month_rx".into(), json!(traffic.month_rx));
-        obj.insert("month_tx".into(), json!(traffic.month_tx));
+    let reading = metrics
+        .get("boot_id")
+        .and_then(|v| v.as_str())
+        .filter(|e| !e.is_empty())
+        .zip(counter("net_rx_total").zip(counter("net_tx_total")))
+        .map(|(epoch, counters)| Reading { epoch: epoch.to_owned(), counters, arrival, booked: false });
+    let span = reading.as_ref().map(|r| (r.epoch.clone(), r.counters));
+    if let Some(reading) = reading {
+        file(app, node_id, reading)?;
     }
 
-    let minute = now / 60;
+    let minute = arrival.minute();
     let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
     // Absence means the session was retired mid-flight: the panel rotated the
-    // token, or the socket is unwinding. The bytes above remain booked; there is
-    // simply no longer a session to attribute them to.
+    // token, or the socket is unwinding. The reading above remains filed; there
+    // is simply no longer a session to attribute the rest to.
     let Some(entry) = agents.get_mut(&node_id) else { return Ok(()) };
     let first = entry.last_seen == 0;
     if first {
         check_contract(node_id, &metrics);
     }
     // History holds one row per minute; the live view receives every report.
-    let store = entry.last_minute != minute;
+    let store = *entry.last_minute.get_or_insert(minute) != minute;
     entry.metrics = metrics.clone();
-    entry.last_seen = now;
+    entry.last_seen = arrival.at.timestamp();
+    entry.reports = Some(match entry.reports {
+        Some((first, _, n)) => (first, arrival.tick, n + 1),
+        None => (arrival.tick, arrival.tick, 0),
+    });
     entry.minute.add(&metrics);
 
     // The stored row summarises the interval since the previous row rather than
-    // the instant it is stamped with: the network rate from the totals this hub
-    // observed climb, every other averaged field from the mean of the reports in
-    // between. This is what makes the chart integrate to the totals beside it.
-    // The live view retains the report as it arrived.
+    // the instant it is stamped with: the network rate from the kernel's
+    // counters over that interval, every other averaged field from the mean of
+    // the reports in between. The live view retains the report as it arrived.
+    //
+    // Measured within one span only. At a break the row keeps the agent's own
+    // reading, and the mark restarts from the new span.
     let row = store.then(|| {
         let mut row = metrics.clone();
         entry.minute.write_into(&mut row);
-        if let (Some((since, rx0, tx0)), Some(obj)) = (entry.mark, row.as_object_mut()) {
-            let elapsed = tick.saturating_duration_since(since).as_secs().max(1) as i64;
-            obj.insert("net_rx".into(), json!((traffic.total_rx - rx0).max(0) / elapsed));
-            obj.insert("net_tx".into(), json!((traffic.total_tx - tx0).max(0) / elapsed));
+        if let (Some((epoch, (rx, tx))), Some(mark), Some(obj)) = (&span, &entry.mark, row.as_object_mut()) {
+            if mark.epoch == *epoch {
+                let elapsed = arrival.tick.saturating_duration_since(mark.tick).as_secs().max(1) as i64;
+                obj.insert("net_rx".into(), json!((rx - mark.counters.0).max(0) / elapsed));
+                obj.insert("net_tx".into(), json!((tx - mark.counters.1).max(0) / elapsed));
+            }
         }
-        entry.last_minute = minute;
-        entry.mark = Some((tick, traffic.total_rx, traffic.total_tx));
+        entry.last_minute = Some(minute);
         entry.minute = Minute::default();
         row
     });
-    // A session that has just started measures the next row's rate from its own
-    // first report; without a mark the row would carry the agent's instantaneous
-    // reading rather than the average over the interval.
-    entry.mark.get_or_insert((tick, traffic.total_rx, traffic.total_tx));
+    if let Some((epoch, counters)) = span {
+        if row.is_some() || entry.mark.as_ref().is_none_or(|m| m.epoch != epoch) {
+            entry.mark = Some(Mark { tick: arrival.tick, epoch, counters });
+        }
+    }
     drop(agents);
 
     if let Some(row) = &row {
@@ -515,7 +779,7 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     // "Offline since" is read from this column, so a session ending before its
     // first minute boundary must still leave a mark.
     if row.is_some() || first {
-        app.db.touch_seen(node_id, now)?;
+        app.db.touch_seen(node_id, arrival.at.timestamp(), &metrics)?;
     }
     Ok(())
 }
@@ -548,8 +812,10 @@ pub fn push_ping_tasks(app: &App) {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::*;
-    use crate::db::{Db, Node, PingTask};
+    use crate::db::{Node, PingTask};
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
@@ -557,7 +823,10 @@ mod tests {
 
     fn node(app: &App) -> i64 {
         app.db
-            .create_node(&Node { name: "n".into(), traffic_reset_day: 1, ..Default::default() }, "tok")
+            .create_node(
+                &Node { name: "n".into(), traffic_reset_day: 1, ..Default::default() },
+                &crate::auth::random_token(),
+            )
             .unwrap()
     }
 
@@ -570,6 +839,27 @@ mod tests {
         (id, rx)
     }
 
+    /// A frame arriving `ms` milliseconds after 23:58 on 31 January: a new minute
+    /// every 60 s, and midnight with the start of the billing period at 120 s.
+    fn at_ms(ms: u64) -> Arrival {
+        static START: OnceLock<Instant> = OnceLock::new();
+        let start = *START.get_or_init(Instant::now);
+        let base = Local.with_ymd_and_hms(2026, 1, 31, 23, 58, 0).unwrap();
+        Arrival {
+            tick: start + Duration::from_millis(ms),
+            at: base + chrono::Duration::milliseconds(ms as i64),
+        }
+    }
+
+    fn at(secs: u64) -> Arrival {
+        at_ms(secs * 1_000)
+    }
+
+    /// One frame on `session`, `secs` into the test's clock.
+    fn send(app: &App, id: i64, session: &mut Session, secs: u64, text: &str) -> Result<Option<String>> {
+        dispatch(app, id, "ip", text, session, at(secs))
+    }
+
     fn report_json(boot: &str, rx: i64, tx: i64) -> String {
         json!({
             "jsonrpc": "2.0", "method": "report",
@@ -579,18 +869,55 @@ mod tests {
         .to_string()
     }
 
+    fn probe(app: &App, node: i64, name: &str) -> i64 {
+        app.db
+            .save_ping_task(&PingTask {
+                name: name.into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![node],
+                ..Default::default()
+            })
+            .unwrap()
+    }
+
+    fn result_json(task: i64, latency: i64) -> String {
+        json!({"jsonrpc": "2.0", "method": "ping.result", "params": {"task_id": task, "latency_ms": latency}})
+            .to_string()
+    }
+
+    fn results(app: &App, id: i64) -> Vec<(i64, i64)> {
+        let mut seen: Vec<(i64, i64)> = app
+            .db
+            .ping_records(id, 0, 60)
+            .unwrap()
+            .0
+            .iter()
+            .map(|r| (r["task_id"].as_i64().unwrap(), r["latency"].as_i64().unwrap()))
+            .collect();
+        // Sorted rather than indexed: rows landing in one second come back in
+        // no particular order.
+        seen.sort();
+        seen
+    }
+
+    fn total_rx(app: &App, id: i64) -> i64 {
+        app.db.all_traffic()[&id].total_rx
+    }
+
     #[test]
     fn malformed_reports_leave_the_last_good_frame_and_counters_untouched() {
         let app = app();
         let (id, _held) = connect(&app);
-        dispatch(&app, id, "ip", &report_json("boot", 1_000, 500)).unwrap();
+        let mut session = Session::default();
+        send(&app, id, &mut session, 0, &report_json("boot", 1_000, 500)).unwrap();
         let good = app.agents.read().unwrap()[&id].metrics.clone();
         for bad in [json!({"load":null}), json!({"load":[1,"bad",3]}), json!({"cpu":"bad"}), json!([])] {
-            assert!(report(&app, id, bad).is_err());
+            assert!(report(&app, id, bad, at(30)).is_err());
             assert_eq!(app.agents.read().unwrap()[&id].metrics, good);
         }
-        dispatch(&app, id, "ip", &report_json("boot", 2_000, 600)).unwrap();
-        assert_eq!(app.db.all_traffic()[&id].total_rx, 1_000);
+        send(&app, id, &mut session, 60, &report_json("boot", 2_000, 600)).unwrap();
+        assert_eq!(total_rx(&app, id), 1_000);
     }
 
     /// The lifetime total must never decrease, and must never book bytes nobody
@@ -601,13 +928,19 @@ mod tests {
     fn a_hostile_counter_can_neither_inflate_the_total_nor_wrap_it() {
         let app = app();
         let (id, _held) = connect(&app);
-        let total = || app.db.all_traffic()[&id].total_rx;
-
-        // Both counters, always: `report` pairs them, so omitting one makes the
-        // pair unreadable and every assertion below pass for that reason rather
-        // than the one under test.
+        // A minute apart, so each reading that is one gets booked. Both
+        // counters, always: `report` pairs them, so omitting one makes the pair
+        // unreadable and every assertion below pass for that reason rather than
+        // the one under test.
+        let minute = std::cell::Cell::new(0);
         let send = |boot: &str, rx: serde_json::Value| {
-            report(&app, id, json!({"boot_id": boot, "net_rx_total": rx, "net_tx_total": 0}))
+            minute.set(minute.get() + 1);
+            report(
+                &app,
+                id,
+                json!({"boot_id": boot, "net_rx_total": rx, "net_tx_total": 0}),
+                at(minute.get() * 60),
+            )
         };
 
         // A negative reading is rejected and, critically, does not survive as the
@@ -615,13 +948,13 @@ mod tests {
         // delta its own value plus 5 GB.
         assert!(send("b", json!(-5_000_000_000i64)).is_err());
         send("b", json!(1_000)).unwrap();
-        assert_eq!(total(), 0, "a node that moved nothing books nothing");
+        assert_eq!(total_rx(&app, id), 0, "a node that moved nothing books nothing");
 
         // Nor does a u64 beyond the signed range, which `as_i64` cannot read: no
         // reading, so the baseline is unchanged.
         send("b", json!(u64::MAX)).unwrap();
         send("b", json!(2_000)).unwrap();
-        assert_eq!(total(), 1_000, "only the 1 000 bytes this hub watched climb");
+        assert_eq!(total_rx(&app, id), 1_000, "only the 1 000 bytes this hub watched climb");
 
         // The total saturates rather than wrapping. A plain `+=` would wrap to
         // i64::MIN in release builds, where overflow checks are disabled,
@@ -631,7 +964,24 @@ mod tests {
             .unwrap();
         send("c", json!(0)).unwrap();
         send("c", json!(i64::MAX)).unwrap();
-        assert_eq!(total(), i64::MAX, "the total clamps; it never goes backwards");
+        assert_eq!(total_rx(&app, id), i64::MAX, "the total clamps; it never goes backwards");
+    }
+
+    /// No reading is not a reading of zero, and a pair of counters without an
+    /// epoch is no reading: neither books anything or moves the baseline, so the
+    /// next real reading is a delta rather than a lifetime counter.
+    #[test]
+    fn a_report_without_an_epoch_or_counters_is_no_reading() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let report_at =
+            |minute: u64, params: serde_json::Value| report(&app, id, params, at(minute * 60)).unwrap();
+        report_at(0, json!({"boot_id": "b", "net_rx_total": 1_000, "net_tx_total": 0}));
+        report_at(1, json!({"net_rx_total": 50_000, "net_tx_total": 0}));
+        report_at(2, json!({"boot_id": "", "net_rx_total": 60_000, "net_tx_total": 0}));
+        report_at(3, json!({"boot_id": "b", "cpu": 1.0}));
+        report_at(4, json!({"boot_id": "b", "net_rx_total": 3_000, "net_tx_total": 0}));
+        assert_eq!(total_rx(&app, id), 2_000, "the baseline is still the last reading taken");
     }
 
     /// The contract check is what makes a cross-repository rename visible.
@@ -646,7 +996,7 @@ mod tests {
             assert!(fields.contains(&needed), "{needed} reaches the theme, so a rename has to warn");
         }
         // boot_id and the two kernel counters extend the contract beyond the
-        // public view; the four the hub folds in are not the agent's
+        // public view; the four the hub fills in are not the agent's
         // responsibility.
         for injected in INJECTED {
             assert!(!fields.contains(&injected), "{injected} is the hub's own, not part of the contract");
@@ -659,48 +1009,67 @@ mod tests {
         assert!(!numeric.contains(&"load") && !numeric.contains(&"boot_id"));
     }
 
-    /// A burst of reports within one minute: each advances the live view and the
-    /// running totals, while history takes one row on the minute boundary.
+    /// A minute of reports a second apart: each moves the live view, history
+    /// takes one row stamped on the boundary, and the traffic row is booked as
+    /// the minute turns rather than with every report.
     #[test]
-    fn a_burst_of_reports_moves_the_live_view_but_writes_one_history_row() {
+    fn a_minute_of_reports_writes_one_row_and_books_traffic_as_it_turns() {
         let app = app();
         let (id, _held) = connect(&app);
-        let minute = Utc::now().timestamp() / 60 * 60;
-        // A session already running when this minute opened: the first report of
-        // a new one lands within a minute already accounted for, which is the
-        // reconnect case below.
-        app.agents.write().unwrap().get_mut(&id).unwrap().last_minute -= 1;
+        let mut session = Session::default();
+        for second in 0..60 {
+            send(&app, id, &mut session, second, &report_json("boot-a", 1_000 + second as i64 * 100, 0))
+                .unwrap();
+        }
+        assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx_total"], 6_900, "the live view follows");
+        assert_eq!(total_rx(&app, id), 0, "within the minute nothing past the baseline is booked");
+        assert!(
+            app.db.metrics(id, 0, 60).unwrap().is_empty(),
+            "a session writes no row for its first minute"
+        );
 
-        dispatch(&app, id, "1.2.3.4", &report_json("boot-a", 1_000, 500)).unwrap();
-        dispatch(&app, id, "1.2.3.4", &report_json("boot-a", 3_000, 1_500)).unwrap();
-
-        let live = app.agents.read().unwrap();
-        let entry = live.get(&id).unwrap();
-        assert_eq!(entry.metrics["cpu"], 12.5);
-        // The first report establishes the baseline, so only the second counts.
-        assert_eq!(entry.metrics["total_rx"], 2_000);
-        assert_eq!(entry.metrics["total_tx"], 1_000);
-        assert_eq!(entry.metrics["month_rx"], 2_000);
-        assert_eq!(entry.last_minute, minute / 60, "the minute already written is remembered");
-        drop(live);
-
+        send(&app, id, &mut session, 60, &report_json("boot-a", 7_000, 0)).unwrap();
+        // The minute's last reading, 59 s in, is what the boundary books; the
+        // reading that crossed it waits for the next.
+        assert_eq!(total_rx(&app, id), 5_900);
+        let rows = app.db.metrics(id, 0, 60).unwrap();
+        assert_eq!(rows.len(), 1, "a minute of reports is one row");
         // History rows are keyed by (node, ts), so counting them proves nothing on
         // its own: reports a second apart collapse onto one row with or without
         // the minute gate. The stamp is what demonstrates it.
-        let rows = app.db.metrics(id, 0, 60).unwrap();
-        assert_eq!(rows.len(), 1, "a minute of reports is one row");
-        assert_eq!(rows[0]["ts"], minute, "stamped on the minute, not on the report");
-        // Written on the same branch, and the offline badge is measured from it.
-        assert!(app.db.node(id).unwrap().unwrap().last_seen >= minute, "last_seen is written too");
+        assert_eq!(rows[0]["ts"], at(60).minute() * 60, "stamped on the minute, not on the report");
+        assert_eq!(
+            app.db.node(id).unwrap().unwrap().last_seen,
+            at(60).at.timestamp(),
+            "last_seen is written too"
+        );
+    }
+
+    /// The interval a reinstall would keep, read from the reports: known from the
+    /// second, and not thrown by one delayed on the way.
+    #[test]
+    fn the_reporting_interval_is_the_mean_spacing_of_the_session() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let mut session = Session::default();
+        let interval = |app: &App| app.agents.read().unwrap()[&id].interval();
+        let report = report_json("boot-a", 0, 0);
+        dispatch(&app, id, "ip", &report, &mut session, at_ms(0)).unwrap();
+        assert_eq!(interval(&app), None, "one report has no spacing");
+        for ms in [5_000, 10_000, 17_900, 20_000, 25_000] {
+            dispatch(&app, id, "ip", &report, &mut session, at_ms(ms)).unwrap();
+        }
+        assert_eq!(interval(&app), Some(5), "a report held up for 2.9 s does not make it 8");
     }
 
     /// A history row describes the minute preceding it rather than the instant it
-    /// is stamped with: the network rate from the totals the hub observed climb,
-    /// everything else from the mean of the reports in between.
+    /// is stamped with: the network rate from the counters the kernel reported
+    /// over it, everything else from the mean of the reports in between.
     #[test]
     fn a_history_row_describes_its_whole_minute_not_one_instant() {
         let app = app();
         let (id, _held) = connect(&app);
+        let mut session = Session::default();
         let burst = |rx: i64, instant: i64, cpu: f64, mem: i64| {
             json!({"jsonrpc": "2.0", "method": "report",
                    "params": {"boot_id": "boot-a", "net_rx_total": rx, "net_tx_total": 0,
@@ -709,23 +1078,10 @@ mod tests {
             .to_string()
         };
 
-        // Busy for half the minute, then idle. The first reading is also the
-        // traffic baseline: nothing is booked until a second arrives.
-        dispatch(&app, id, "ip", &burst(1_000, 0, 100.0, 100)).unwrap();
-        // Rewind the bookkeeping by a minute so the next report crosses the
-        // boundary with a minute of elapsed time behind it. The mark is an
-        // `Instant` precisely because a wall-clock difference can be negative when
-        // NTP steps the clock; reverting the field to a timestamp fails to
-        // compile.
-        {
-            let mut agents = app.agents.write().unwrap();
-            let entry = agents.get_mut(&id).unwrap();
-            entry.last_minute -= 1;
-            entry.mark = Some((Instant::now() - Duration::from_secs(60), 0, 0));
-        }
-        // 60 MB arrived and the machine was busy for half the minute; by the next
-        // sample both have ended.
-        dispatch(&app, id, "ip", &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
+        // Busy for half the minute, then idle; 60 MB arrive in between, and by
+        // the next sample both have ended.
+        send(&app, id, &mut session, 0, &burst(1_000, 0, 100.0, 100)).unwrap();
+        send(&app, id, &mut session, 60, &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
 
         let row = &app.db.metrics(id, 0, 60).unwrap()[0];
         assert_eq!(row["net_rx"], 1_000_000, "60 MB over 60 s is 1 MB/s, not the agent's 0");
@@ -746,8 +1102,9 @@ mod tests {
     fn a_reconnect_leaves_the_minute_it_lands_in_alone() {
         let app = app();
         let (id, _held) = connect(&app);
-        app.agents.write().unwrap().get_mut(&id).unwrap().last_minute -= 1;
-        dispatch(&app, id, "ip", &report_json("boot-a", 1_000, 500)).unwrap();
+        let mut session = Session::default();
+        send(&app, id, &mut session, 0, &report_json("boot-a", 1_000, 500)).unwrap();
+        send(&app, id, &mut session, 60, &report_json("boot-a", 2_000, 500)).unwrap();
         let before = app.db.metrics(id, 0, 60).unwrap();
         assert_eq!(before.len(), 1, "the running session wrote the row for this minute");
 
@@ -758,40 +1115,148 @@ mod tests {
                           "params": {"boot_id": "boot-a", "cpu": 99.0, "net_rx_total": 9_000,
                                      "net_tx_total": 4_500}})
         .to_string();
-        dispatch(&app, id, "ip", &loud).unwrap();
-
+        send(&app, id, &mut Session::default(), 70, &loud).unwrap();
         assert_eq!(app.db.metrics(id, 0, 60).unwrap(), before, "the row keeps the minute it described");
-        // The bytes are still booked; only the history row is left untouched.
-        assert_eq!(app.agents.read().unwrap()[&id].metrics["total_rx"], 8_000);
     }
 
-    /// An agent sending no boot_id -- an older build, or a host without the file
-    /// -- still has its traffic accumulated. Reading the empty string as the
-    /// absence of a baseline would realign on every report and book nothing
-    /// indefinitely, with no outward sign.
+    /// Booking about once a minute must leave exactly what booking every report
+    /// leaves -- the total, the month and the day -- across everything that
+    /// breaks a span: midnight on the first of the month, a reboot, a counter
+    /// that shrinks under an agent predating the epoch digest, and reports
+    /// minutes apart.
+    ///
+    /// Two nodes receive the same readings: one through `file`, the other booked
+    /// on arrival.
     #[test]
-    fn traffic_accumulates_for_an_agent_that_sends_no_boot_id() {
+    fn holding_readings_back_books_what_booking_every_one_would() {
+        let app = app();
+        let (held, every) = (node(&app), node(&app));
+        let mut readings: Vec<(u64, &str, i64, i64)> = Vec::new();
+        for second in 0..150 {
+            let s = second as i64;
+            readings.push((second, "a", 10_000 + s * 1_000, 5_000 + s * 300));
+        }
+        // A reboot mid-minute: a new epoch, counters restarting near zero.
+        for second in 150..175 {
+            let s = second as i64 - 150;
+            readings.push((second, "b", 100 + s * 700, 50 + s * 200));
+        }
+        // An interface leaves the sum: tx drops within the epoch while rx climbs.
+        for second in 175..200 {
+            let s = second as i64 - 175;
+            readings.push((second, "b", 20_000 + s * 900, 1_000 + s * 100));
+        }
+        // Reports minutes apart, each in a minute of its own.
+        for (i, second) in [320, 450, 451, 700].into_iter().enumerate() {
+            readings.push((second, "b", 50_000 + i as i64 * 40_000, 4_000 + i as i64 * 3_000));
+        }
+
+        for (second, epoch, rx, tx) in readings {
+            let arrival = at(second);
+            file(&app, held, Reading { epoch: epoch.into(), counters: (rx, tx), arrival, booked: false })
+                .unwrap();
+            app.db.accumulate(every, epoch, (rx, tx), arrival.at).unwrap();
+        }
+        book_held(&app, Some(held));
+
+        let (kept, booked) = (app.db.stored_traffic(held), app.db.stored_traffic(every));
+        assert_eq!(kept, booked);
+        // The comparison is only as good as the boundary it spans.
+        assert_eq!(booked.month_start, "2026-02-01", "the period turned at midnight");
+        assert!(booked.day_rx > 0 && booked.total_rx > booked.day_rx, "bytes fell on both sides of midnight");
+    }
+
+    #[test]
+    fn a_reading_held_across_a_session_is_booked_when_it_closes() {
         let app = app();
         let (id, _held) = connect(&app);
-        let report = |rx: i64| {
-            json!({"jsonrpc": "2.0", "method": "report",
-                   "params": {"cpu": 1.0, "net_rx_total": rx, "net_tx_total": 0}})
-            .to_string()
-        };
-        dispatch(&app, id, "ip", &report(1_000)).unwrap();
-        dispatch(&app, id, "ip", &report(3_000)).unwrap();
-        assert_eq!(app.agents.read().unwrap()[&id].metrics["total_rx"], 2_000);
+        let task = probe(&app, id, "p");
+        let mut session = Session::default();
+        send(&app, id, &mut session, 0, &report_json("boot-a", 1_000, 0)).unwrap();
+        send(&app, id, &mut session, 10, &report_json("boot-a", 4_000, 0)).unwrap();
+        send(&app, id, &mut session, 11, &result_json(task, 42)).unwrap();
+        assert_eq!(total_rx(&app, id), 0);
+        assert!(results(&app, id).is_empty(), "results wait for the minute to turn");
 
-        // A report with no counters books nothing and, crucially, leaves the
-        // baseline unchanged so the next one is a delta.
-        let blind = json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": 1.0}}).to_string();
-        dispatch(&app, id, "ip", &blind).unwrap();
-        dispatch(&app, id, "ip", &report(4_000)).unwrap();
-        assert_eq!(
-            app.agents.read().unwrap()[&id].metrics["total_rx"],
-            3_000,
-            "a missing reading must not re-baseline the counter to zero"
-        );
+        let agent = release(&app, id, 1).expect("the session is still the node's");
+        close(&app, id, Some(&agent), &mut session);
+        assert_eq!(total_rx(&app, id), 3_000, "the held reading is booked");
+        assert_eq!(results(&app, id), vec![(task, 42)], "the gathered results are filed");
+        assert_eq!(app.db.node(id).unwrap().unwrap().last_seen, at(10).at.timestamp());
+    }
+
+    /// A reconnect replacing a half-open session leaves that session's probe
+    /// results to it alone: the minute before the link failed. A session the
+    /// panel ended files nothing.
+    #[test]
+    fn a_replaced_session_still_files_its_probe_results() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let task = probe(&app, id, "p");
+        let mut session = Session::default();
+        send(&app, id, &mut session, 0, &report_json("boot-a", 1_000, 0)).unwrap();
+        send(&app, id, &mut session, 10, &report_json("boot-a", 4_000, 0)).unwrap();
+        send(&app, id, &mut session, 11, &result_json(task, 42)).unwrap();
+
+        let (tx, _rx) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(id, Agent::new(2, tx));
+        let ended = release(&app, id, 1);
+        assert!(ended.is_none(), "the reconnect holds the node");
+        close(&app, id, ended.as_ref(), &mut session);
+        assert_eq!(results(&app, id), vec![(task, 42)], "no other connection received them");
+        assert_eq!(total_rx(&app, id), 0, "the held reading is the successor's to book");
+
+        let mut ended_by_panel = Session::default();
+        send(&app, id, &mut ended_by_panel, 12, &result_json(task, 7)).unwrap();
+        app.agents.write().unwrap().remove(&id);
+        close(&app, id, None, &mut ended_by_panel);
+        assert_eq!(results(&app, id), vec![(task, 42)]);
+    }
+
+    #[test]
+    fn a_hub_stopping_books_every_reading_it_held() {
+        let app = app();
+        let (a, b) = (node(&app), node(&app));
+        for (id, rx) in [(a, 1_000), (b, 5_000)] {
+            let reading =
+                |rx, secs| Reading { epoch: "e".into(), counters: (rx, 0), arrival: at(secs), booked: false };
+            file(&app, id, reading(rx, 0)).unwrap();
+            file(&app, id, reading(rx + 700, 5)).unwrap();
+        }
+        book_held(&app, None);
+        assert_eq!((total_rx(&app, a), total_rx(&app, b)), (700, 700));
+    }
+
+    /// A node token is enough to send frames at any rate. What exceeds the
+    /// agent's own pace is dropped, and nothing within it.
+    #[test]
+    fn a_connection_is_held_to_the_pace_of_an_agent() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let mut session = Session::default();
+        let hello = |name: &str| {
+            json!({"jsonrpc": "2.0", "method": "hello", "params": {"hostname": name}}).to_string()
+        };
+        send(&app, id, &mut session, 0, &hello("first")).unwrap();
+        send(&app, id, &mut session, 1, &hello("second")).unwrap();
+        assert_eq!(app.db.node(id).unwrap().unwrap().hostname, "first", "one hello per connection");
+
+        let cpu =
+            |value: f64| json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": value}}).to_string();
+        let live_cpu = || app.agents.read().unwrap()[&id].metrics["cpu"].clone();
+        dispatch(&app, id, "ip", &cpu(1.0), &mut session, at_ms(10_000)).unwrap();
+        dispatch(&app, id, "ip", &cpu(2.0), &mut session, at_ms(10_300)).unwrap();
+        assert_eq!(live_cpu(), 1.0, "a report 300 ms after the last is dropped");
+        dispatch(&app, id, "ip", &cpu(3.0), &mut session, at_ms(11_000)).unwrap();
+        assert_eq!(live_cpu(), 3.0, "one a second later is the agent's own pace");
+
+        let task = probe(&app, id, "p");
+        for _ in 0..RESULTS_PER_WINDOW + 10 {
+            send(&app, id, &mut session, 20, &result_json(task, 1)).unwrap();
+        }
+        assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize, "the excess of one window is dropped");
+        send(&app, id, &mut session, 25, &result_json(task, 1)).unwrap();
+        assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize + 1, "the next window admits again");
     }
 
     #[test]
@@ -802,7 +1267,7 @@ mod tests {
             "jsonrpc": "2.0", "method": "hello",
             "params": {"hostname": "vps-1", "os": "Debian 12", "cpu_cores": 4, "mem_total": 2048}
         });
-        dispatch(&app, id, "198.51.100.4", &hello.to_string()).unwrap();
+        dispatch(&app, id, "198.51.100.4", &hello.to_string(), &mut Session::default(), at(0)).unwrap();
 
         let n = app.db.node(id).unwrap().unwrap();
         assert_eq!(n.hostname, "vps-1");
@@ -834,74 +1299,76 @@ mod tests {
     }
 
     #[test]
+    fn public_means_globally_routable() {
+        let public = |ip: &str| public(ip.parse().unwrap());
+        for ip in [
+            "10.0.0.1",
+            "172.31.0.1",
+            "192.168.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.0.1",
+            "0.0.0.1",
+            "192.0.0.4",
+            "198.19.0.1",
+            "224.0.0.1",
+            "fd42::1",
+            "fe80::1",
+            "::1",
+        ] {
+            assert!(!public(ip), "{ip}");
+        }
+        for ip in
+            ["1.1.1.1", "100.128.0.1", "172.32.0.1", "192.0.1.1", "198.20.0.1", "2401:b60:1c::5", "3fff::1"]
+        {
+            assert!(public(ip), "{ip}");
+        }
+    }
+
+    #[test]
     fn a_hello_owes_a_lookup_only_for_a_public_source_without_a_country() {
         let app = app();
         let id = node(&app);
-        let hello = |ipv4: &str, ipv6: &str| {
-            json!({"jsonrpc": "2.0", "method": "hello", "params": {"ipv4": ipv4, "ipv6": ipv6}}).to_string()
+        // A connection each, as each hello opens one.
+        let hello = |ip: &str, ipv4: &str, ipv6: &str| {
+            let text = json!({"jsonrpc": "2.0", "method": "hello", "params": {"ipv4": ipv4, "ipv6": ipv6}});
+            dispatch(&app, id, ip, &text.to_string(), &mut Session::default(), at(0)).unwrap()
         };
-        let owed = dispatch(&app, id, "198.51.100.77", &hello("192.168.1.5", "2409:8a1e::5")).unwrap();
-        assert_eq!(owed.as_deref(), Some("2409:8a1e::5"));
+        assert_eq!(hello("198.51.100.77", "192.168.1.5", "2409:8a1e::5").as_deref(), Some("2409:8a1e::5"));
         app.db.set_country(id, "CN", "2409:8a1e::5").unwrap();
-        assert_eq!(dispatch(&app, id, "198.51.100.88", &hello("192.168.1.5", "2409:8a1e::5")).unwrap(), None);
+        assert_eq!(hello("198.51.100.88", "192.168.1.5", "2409:8a1e::5"), None);
         assert_eq!(app.db.node(id).unwrap().unwrap().country, "CN", "a new proxy exit changes nothing");
-        assert_eq!(dispatch(&app, id, "192.168.1.2", &hello("192.168.1.5", "")).unwrap(), None);
+        assert_eq!(hello("192.168.1.2", "192.168.1.5", ""), None);
     }
 
     #[test]
     fn ping_results_are_recorded_and_bad_ones_ignored() {
         let app = app();
         let id = node(&app);
+        let mut session = Session::default();
         // Assigned probes: a result is readable only through a node's current
         // assignments.
-        let probe = |name: &str| {
-            app.db
-                .save_ping_task(&PingTask {
-                    id: 0,
-                    name: name.into(),
-                    target: "1.1.1.1:443".into(),
-                    interval: 60,
-                    nodes: vec![id],
-                    ..Default::default()
-                })
-                .unwrap()
-        };
-        let (one, two) = (probe("one"), probe("two"));
-        let result = |task, latency| {
-            json!({"jsonrpc": "2.0", "method": "ping.result",
-                   "params": {"task_id": task, "latency_ms": latency}})
-            .to_string()
-        };
-        dispatch(&app, id, "ip", &result(one, 42)).unwrap();
+        let (one, two) = (probe(&app, id, "one"), probe(&app, id, "two"));
+        send(&app, id, &mut session, 0, &result_json(one, 42)).unwrap();
         // The rejected results carry task ids of their own: a bare count would be
         // satisfied by the key collapsing them onto a valid row.
-        dispatch(&app, id, "ip", &result(two, 15)).unwrap();
-        dispatch(&app, id, "ip", &result(0, 42)).unwrap(); // no such task
-        dispatch(&app, id, "ip", &result(-1, 42)).unwrap(); // nor this one
-                                                            // A frame carrying no reading. Defaulting to -1 would file it as a lost
-                                                            // packet, rendering a malformed frame as an outage.
-        dispatch(
-            &app,
-            id,
-            "ip",
-            &json!({"jsonrpc": "2.0", "method": "ping.result",
-                                         "params": {"task_id": one}})
-            .to_string(),
-        )
-        .unwrap();
+        send(&app, id, &mut session, 0, &result_json(two, 15)).unwrap();
+        send(&app, id, &mut session, 0, &result_json(0, 42)).unwrap(); // no such task
+        send(&app, id, &mut session, 0, &result_json(-1, 42)).unwrap(); // nor this one
+        send(&app, id, &mut session, 0, &result_json(99, 42)).unwrap(); // not this node's
+                                                                        // A frame carrying no reading. Defaulting to -1 would file it as a lost
+                                                                        // packet, rendering a malformed frame as an outage.
+        let blind = json!({"jsonrpc": "2.0", "method": "ping.result", "params": {"task_id": one}});
+        send(&app, id, &mut session, 0, &blind.to_string()).unwrap();
+        assert!(results(&app, id).is_empty(), "gathered until the minute turns");
 
-        // Sorted rather than indexed: both rows land in the same second and the
-        // query orders by timestamp.
-        let mut seen: Vec<(i64, i64)> = app
-            .db
-            .ping_records(id, 0, 60)
-            .unwrap()
-            .0
-            .iter()
-            .map(|r| (r["task_id"].as_i64().unwrap(), r["latency"].as_i64().unwrap()))
-            .collect();
-        seen.sort();
-        assert_eq!(seen, vec![(one, 42), (two, 15)], "each real task keeps its own result, and only those");
+        // Any frame of a later minute files them.
+        send(&app, id, &mut session, 60, r#"{"method":"whatever"}"#).unwrap();
+        assert_eq!(
+            results(&app, id),
+            vec![(one, 42), (two, 15)],
+            "each real task keeps its own result, and only those"
+        );
     }
 
     #[test]
@@ -930,14 +1397,14 @@ mod tests {
 
         // The ordinary case: the session ending is the one on record.
         connect(1);
-        assert!(release(&app, id, 1));
+        assert!(release(&app, id, 1).is_some());
         assert!(!live(), "its own teardown clears the node");
 
         // The race: the agent gave up and reconnected while the old socket was
         // half-open, so session 2 is live when session 1 unwinds.
         connect(1);
         connect(2);
-        assert!(!release(&app, id, 1), "a stale session must release nothing");
+        assert!(release(&app, id, 1).is_none(), "a stale session must release nothing");
         assert!(live(), "the reconnected agent stays online");
         assert!(app.agents.read().unwrap().contains_key(&id), "and keeps receiving probe pushes");
     }
@@ -946,8 +1413,9 @@ mod tests {
     fn junk_from_an_agent_is_rejected_without_taking_the_connection_down() {
         let app = app();
         let id = node(&app);
-        assert!(dispatch(&app, id, "ip", "not json").is_err());
+        let mut session = Session::default();
+        assert!(send(&app, id, &mut session, 0, "not json").is_err());
         // Unknown methods are ignored.
-        assert!(dispatch(&app, id, "ip", r#"{"method":"whatever"}"#).is_ok());
+        assert!(send(&app, id, &mut session, 0, r#"{"method":"whatever"}"#).is_ok());
     }
 }

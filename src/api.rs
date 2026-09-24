@@ -9,7 +9,7 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{Local, Utc};
+use chrono::{Local, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::debug;
@@ -18,7 +18,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -51,10 +51,10 @@ fn no_such_node() -> Response {
 
 // ---- read paths, shared between the panel and the public page ----
 
-/// Everything a report may expose under `metrics` on the public page: the agent
-/// contract minus the raw kernel counters, which are a wire-protocol detail
-/// disclosing a machine's entire lifetime traffic, plus the four figures the hub
-/// folds in itself. The panel sees the report as it arrived.
+/// Everything a report may expose under `metrics`: the agent contract minus the
+/// raw kernel counters, which are a wire-protocol detail disclosing a machine's
+/// entire lifetime traffic, plus the four traffic figures `node_view` fills in.
+/// The panel additionally sees `iface`.
 pub(crate) const PUBLIC_METRICS: [&str; 18] = [
     "uptime",
     "cpu",
@@ -76,20 +76,64 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
     "month_tx",
 ];
 
+/// The addresses the panel shows for a node, each with where it comes from: at
+/// most one per family, v4 first, the one the machine is reached by. The agent
+/// reports its interfaces; `ip` is where its connection arrived from, in dotted
+/// form for IPv4.
+///
+/// Per family an address set by hand comes first, then a public one on the
+/// interface. Failing both, where the interface holds only a private address of
+/// the family the connection used -- NAT, or a proxy in front -- the
+/// connection's public address, its exit, stands in. An exit in a family the
+/// interface does not hold is a translator such as NAT64 or WARP and is left
+/// out.
+///
+/// Private addresses appear only when nothing public is known, as where hub and
+/// node share a network and they are all there is. `ip` alone is the fallback
+/// for an agent reporting no interface.
+fn addresses<'a>(
+    ip: &'a str,
+    (ipv4, ipv6): (&'a str, &'a str),
+    (pin4, pin6): (&'a str, &'a str),
+) -> Vec<(&'a str, &'static str)> {
+    let public =
+        |a: &str, v6: bool| a.parse::<IpAddr>().is_ok_and(|a| a.is_ipv6() == v6 && agent_ws::public(a));
+    let family = |pin: &'a str, held: &'a str, v6: bool| {
+        if !pin.is_empty() {
+            Some((pin, "manual"))
+        } else if public(held, v6) {
+            Some((held, "interface"))
+        } else if !held.is_empty() && public(ip, v6) {
+            Some((ip, "exit"))
+        } else {
+            None
+        }
+    };
+    let shown: Vec<_> = [family(pin4, ipv4, false), family(pin6, ipv6, true)].into_iter().flatten().collect();
+    if !shown.is_empty() {
+        return shown;
+    }
+    let held: Vec<_> = [ipv4, ipv6].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "interface")).collect();
+    if !held.is_empty() {
+        return held;
+    }
+    [ip].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "connection")).collect()
+}
+
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
-fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool) -> Value {
-    // The three capacities arrive twice: once in `Facts`, sent at the handshake
-    // and stored, and again in every `Metrics`. A machine that gains a disk while
-    // the agent is running -- the agent re-reads its mount table every sample so
-    // that it appears -- then has a stored figure that is stale until the next
-    // reconnect, possibly days away. Using the report while a node is connected
+fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool, today: NaiveDate) -> Value {
+    // The three capacities arrive twice: once in `Facts`, sent at the handshake,
+    // and again in every `Metrics`. The stored figure follows the reports a
+    // minute at a time and as the session ends, so it lags a disk mounted while
+    // the agent runs -- the agent re-reads its mount table every sample so that
+    // it appears -- by up to a minute. Using the report while a node is connected
     // keeps every consumer of this view on one number: the card reads the live
     // metrics and the detail page reads these, and they previously showed the
-    // same machine two different capacities. Offline, the stored figure is all
-    // there is. No floor is applied: a host whose swap has just been disabled
-    // reports zero and means it. A node connected but not yet reporting holds
-    // `Null`, where `get` returns nothing and the stored figure stands.
+    // same machine two different capacities. Offline, the stored figure is the
+    // last one reported. No floor is applied: a host whose swap has just been
+    // disabled reports zero and means it. A node connected but not yet reporting
+    // holds `Null`, where `get` returns nothing and the stored figure stands.
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
@@ -100,6 +144,9 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // in, which is what a status page conveys, without locating it. The
         // address it was derived from remains behind the panel.
         "country": if node.country_pin.is_empty() { &node.country } else { &node.country_pin },
+        // Named by the operator for the status page to divide the list by, so
+        // public like the node's name. Empty is ungrouped.
+        "group": node.group,
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
@@ -122,6 +169,11 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "currency": node.currency,
         "billing_cycle": node.billing_cycle,
         "expires_at": node.expires_at,
+        // Counted on the hub's calendar, the one renewal follows. A page counting
+        // on the visitor's clock would, with the hub on UTC and the visitor on
+        // UTC+8, show every online node expired for eight hours each cycle
+        // before the hub rolls its date forward.
+        "expires_in": node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|d| (d - today).num_days()),
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
         "traffic_reset_day": node.traffic_reset_day,
@@ -136,23 +188,49 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
     });
-    // An allowlist rather than a denylist: the agent ships from its own
-    // repository, so a field added there would otherwise reach anonymous visitors
-    // the day it is released. No address, hostname or note may ever do so.
-    if !full {
-        if let Some(m) = view["metrics"].as_object_mut() {
-            m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()));
+    // An allowlist rather than a denylist, for the panel as well: the agent ships
+    // from its own repository, so a field added there would otherwise reach
+    // anonymous visitors the day it is released, and a node token in the wrong
+    // hands could fill the panel's frame with whatever it sends. No address,
+    // hostname or note may ever reach a visitor.
+    if let Some(m) = view["metrics"].as_object_mut() {
+        m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()) || (full && k == "iface"));
+        // The same figures as the top-level ones, from the same row. Both official
+        // themes refuse a node's live view without them.
+        for (key, value) in agent_ws::INJECTED.into_iter().zip([
+            traffic.total_rx,
+            traffic.total_tx,
+            traffic.month_rx,
+            traffic.month_tx,
+        ]) {
+            m.insert(key.into(), json!(value));
         }
     }
     // Address, private notes and the token never leave the panel. The token is
     // included so the install command can be displayed without reissuing it.
     if full {
+        let held = (node.ipv4.as_str(), node.ipv6.as_str());
+        let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
+        let shown = addresses(&node.ip, held, (pin4, pin6));
+        // What each family shows with its own pin cleared and the other's kept,
+        // for the edit form to offer as the fallback.
+        let auto = |pins, v6: bool| {
+            addresses(&node.ip, held, pins)
+                .into_iter()
+                .find(|(a, _)| a.contains(':') == v6)
+                .map_or("", |(a, _)| a)
+        };
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
         view["ipv6"] = json!(node.ipv6);
         view["ipv4_pin"] = json!(node.ipv4_pin);
         view["ipv6_pin"] = json!(node.ipv6_pin);
+        view["addresses"] =
+            shown.iter().map(|(address, source)| json!({"address": address, "source": source})).collect();
+        view["ipv4_auto"] = json!(auto(("", pin6), false));
+        view["ipv6_auto"] = json!(auto((pin4, ""), true));
+        view["interval"] = json!(current.and_then(Agent::interval));
         view["country_pin"] = json!(node.country_pin);
         view["country_auto"] = json!(node.country);
         view["remark"] = json!(node.remark);
@@ -169,10 +247,11 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     let traffic = app.db.all_traffic();
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
+    let today = Local::now().date_naive();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full))
+        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, today))
         .collect())
 }
 
@@ -432,18 +511,35 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
 
 // ---- panel write paths ----
 
-/// Names all three causes. A reverse proxy that does not preserve Host forwards
-/// its own upstream address, which is an IP and therefore never an https domain
-/// entry, while the admin reading this is already on the domain -- so the first
-/// clause alone would point them in the wrong direction. The third is `--site`,
-/// the one input to this decision that nothing about the request reveals: a hub
-/// started with `--site https://198.51.100.7` refuses every provisioning call
-/// from an otherwise valid https domain entry. `main` warns about that at
-/// startup; this is for whoever reads the panel rather than the journal.
+/// Names all three causes. `--site` is the one input to this decision that
+/// nothing about the request reveals: a hub started with
+/// `--site https://198.51.100.7` refuses every provisioning call from an
+/// otherwise valid https domain entry, and a tunnelled panel is refused until
+/// one is given. `main` warns about the first at startup; this is for whoever
+/// reads the panel rather than the journal.
 const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装节点；\
-     如果已经是域名访问，检查反向代理是否透传了 Host 与 X-Forwarded-Proto\
-     （见 https://monitor-document.pages.dev/install/reverse-proxy）；\
-     两者都没问题就检查 hub 的启动参数 --site，它必须是 https:// 加域名，不能是 IP、不能带路径";
+     从隧道或回环地址进面板时，给 hub 加 --site 指定节点可达的域名；\
+     --site 必须是 https:// 加域名，不能是 IP、不能带路径";
+
+/// Every browser sends `Origin` with these writes, so its absence points at a
+/// proxy clearing it. The panel judges from its own address bar and offers the
+/// button, which leaves this as the only account of why the hub refuses.
+const ORIGIN_MISSING: &str = "请求没有带 Origin 头。浏览器都会发送它，多半是反向代理清掉了\
+     （例如 proxy_set_header Origin \"\"），去掉那一行后再试";
+
+/// Whether this origin is the hub's own machine, which is what a tunnel into the
+/// panel leaves in the address bar. Nothing between that browser and the hub is
+/// in the clear -- it is the loopback interface, or the tunnel's own encryption
+/// -- so the entry is sound; what it lacks is an address a node could use, which
+/// is why it counts only alongside `--site`.
+fn loopback_origin(origin: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(origin) else { return false };
+    let Some(host) = url.host_str() else { return false };
+    // host_str keeps the brackets an IPv6 literal is written with.
+    let ip = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>();
+    matches!(url.scheme(), "http" | "https")
+        && (host == "localhost" || host.ends_with(".localhost") || ip.is_ok_and(|ip| ip.is_loopback()))
+}
 
 pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
     let url = reqwest::Url::parse(site).ok()?;
@@ -457,46 +553,50 @@ pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
     .then_some(url)
 }
 
-/// Host and the proxy's scheme describe this request; --site must not turn an IP
-/// entry point into a domain entry point. The listener remains behind the trusted
-/// reverse proxy, which must preserve Host and set X-Forwarded-Proto.
+/// Whether the browser sending this request is on an https domain entry, which
+/// is the only address the panel may build install commands from.
 ///
-/// Every refusal names which half failed. Without that, a proxy configured with a
-/// bare `proxy_pass` -- nginx then forwards `Host: 127.0.0.1:28080`, as does
-/// Apache under its default `ProxyPreserveHost Off` -- is indistinguishable from
-/// a genuine IP entry point: provisioning stops working across an upgrade, the
-/// message implicates the address bar, and nothing records the header actually
-/// responsible.
-fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
-        debug!("provisioning refused: the request carries no readable Host header");
-        return false;
-    };
-    let forwarded = crate::forwarded_proto(headers);
-    let https = forwarded.map_or_else(|| app.site.starts_with("https://"), |scheme| scheme == "https");
-    if !https || (!app.site.is_empty() && https_domain(&app.site).is_none()) {
-        debug!(
-            "provisioning refused: not an https domain entry (X-Forwarded-Proto={forwarded:?}, --site={:?}); \
-             a TLS-terminating proxy has to send X-Forwarded-Proto: https",
-            app.site
-        );
-        return false;
+/// The browser's own `Origin` answers it. Reconstructing the entry from `Host`
+/// and `X-Forwarded-Proto` instead holds only where every proxy in front
+/// forwards both, and the common ones do not: the aapanel and BT templates send
+/// no `X-Forwarded-Proto`, a bare `proxy_pass` sends its own upstream address as
+/// `Host` (as does Apache under `ProxyPreserveHost Off`), `$host` drops a port
+/// that is not 443, and a TLS edge ahead of a plaintext hop leaves
+/// `X-Forwarded-Proto: http`. Each of those refuses a panel that is in fact on
+/// https, and none can be told apart here from a genuine plaintext entry.
+/// `Origin` crosses all of them unchanged, and a page cannot forge its own.
+///
+/// `--site` is measured by the same rule, because it takes this origin's place
+/// in the command: an IP or a path there is refused however the panel is
+/// reached. It also answers for the one entry this origin cannot: a panel opened
+/// over a tunnel reads `http://127.0.0.1:PORT`, which names no address a node
+/// could reach, while `--site` names one and the tunnel carries the session
+/// under its own encryption.
+///
+/// The error is the message the panel shows.
+fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static str> {
+    if !app.site.is_empty() && https_domain(&app.site).is_none() {
+        debug!("provisioning refused: --site {:?} is not an https domain entry", app.site);
+        return Err(PROVISIONING_DENIED);
     }
-    let Some(url) = https_domain(&format!("https://{host}")) else {
-        debug!(
-            "provisioning refused: Host {host:?} is not an https domain entry; a reverse proxy that does \
-             not preserve Host sends its own upstream address here -- nginx needs \
-             `proxy_set_header Host $host`, Apache `ProxyPreserveHost On`"
-        );
-        return false;
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        debug!("provisioning refused: the request carries no readable Origin");
+        return Err(ORIGIN_MISSING);
     };
-    let expected = url.origin().ascii_serialization();
-    let allowed =
-        headers.get(header::ORIGIN).is_none_or(|origin| origin.to_str().ok() == Some(expected.as_str()));
-    if !allowed {
-        debug!("provisioning refused: Origin {:?} is not {expected}", headers.get(header::ORIGIN));
+    if https_domain(origin).is_none() && !(loopback_origin(origin) && !app.site.is_empty()) {
+        debug!("provisioning refused: Origin {origin:?} is not an https domain entry");
+        return Err(PROVISIONING_DENIED);
     }
-    allowed
+    // States that the request belongs to the page it addresses, which `Origin`
+    // alone does not: the panel is the only caller, and a page elsewhere holds no
+    // session here anyway, `SameSite=Lax` keeping the cookie from it. Browsers
+    // predating the header send none, and the origin above remains the test.
+    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    if fetch_site.is_some_and(|site| site != "same-origin") {
+        debug!("provisioning refused: Sec-Fetch-Site {fetch_site:?} is not same-origin");
+        return Err(PROVISIONING_DENIED);
+    }
+    Ok(())
 }
 
 /// Range and sign limits every stored node must satisfy, or the reason it does
@@ -512,6 +612,38 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
         return Some("price and traffic limit must be non-negative");
     }
     None
+}
+
+/// A theme shows the group as a tab label or a section title, so it is held to a
+/// length that fits one line on a 390 px phone.
+const MAX_GROUP: usize = 13;
+
+/// Trims a group name, or refuses it. Refused rather than truncated: the panel
+/// would otherwise report saved a name that is not the one stored.
+fn group_error(group: &mut String) -> Option<&'static str> {
+    *group = group.trim().to_owned();
+    if group.chars().count() > MAX_GROUP || group.chars().any(char::is_control) {
+        return Some("group must be at most 13 characters, without control characters");
+    }
+    None
+}
+
+/// Normalizes a patch, or names the first value that cannot be stored. The one
+/// check both the single and the batch write pass through, so the two accept
+/// exactly the same values.
+fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
+    if let Some(name) = &mut node.name {
+        *name = name.trim().to_owned();
+        if name.is_empty() {
+            return Some("name is required");
+        }
+    }
+    if let Some(group) = &mut node.group {
+        if let Some(message) = group_error(group) {
+            return Some(message);
+        }
+    }
+    node_limits(node.traffic_reset_day, node.price, node.traffic_limit).or_else(|| pins(node))
 }
 
 /// Normalizes the values set by hand, or names the one that cannot stand. Each
@@ -550,7 +682,9 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
-        "can_provision": provisioning_allowed(&app, &headers),
+        // Whether this browser may provision is not answered here: a GET carries
+        // no `Origin`, so the panel applies `provisioning_allowed`'s rule itself.
+        //
         // The hub's own public URL when one was given, which is what belongs in an
         // install command and in the OAuth callback -- not whichever address this
         // browser used, which behind a proxy may be a loopback port. Empty by
@@ -566,8 +700,8 @@ pub async fn create_node(
     headers: HeaderMap,
     body: Result<Json<Node>, JsonRejection>,
 ) -> Response {
-    if !provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
+    if let Err(refusal) = provisioning_allowed(&app, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
     if node.name.trim().is_empty() {
@@ -575,6 +709,7 @@ pub async fn create_node(
     }
     if let Some(message) =
         node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
+            .or_else(|| group_error(&mut node.group))
     {
         return bad(message);
     }
@@ -615,6 +750,14 @@ const HELD_TOKEN: &str = "x-node-token";
 /// that has never contacted the hub. A key issued by the panel, valid only within
 /// [`REGISTER_WINDOW`], serves in place of a session.
 ///
+/// `provisioning_allowed` does not guard it, because a shell script sends no
+/// `Origin` and the proxy headers that remain cannot state what address the
+/// caller used. Which addresses may be registered against is enforced in
+/// `install.sh`, where that address is known: it refuses plaintext to anything
+/// but loopback unless `--insecure` is given, the same switch under which the
+/// binary it is about to run as root was already fetched in the clear. The
+/// window this key belongs to is still opened from an https domain entry alone.
+///
 /// One request costs at most a lookup on the token's unique index, two setting
 /// reads, a `COUNT`, and one transaction inserting the `node` and `traffic` rows
 /// plus a `ping_node` row per `auto_join` probe, at most 64. It makes no outbound
@@ -634,9 +777,6 @@ pub async fn agent_register(
     // a POSIX `sh`.
     name: String,
 ) -> Response {
-    if !provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
-    }
     let ip = client_ip(&headers, peer.ip());
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
@@ -715,8 +855,8 @@ pub async fn agent_register(
 /// Opens a registration window with a fresh key. Any previous key stops working
 /// the moment this returns.
 pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderMap) -> Response {
-    if !provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
+    if let Err(refusal) = provisioning_allowed(&app, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let key = random_token();
     let until = (Utc::now().timestamp() + REGISTER_WINDOW).to_string();
@@ -741,16 +881,7 @@ pub async fn update_node(
     body: Result<Json<NodePatch>, JsonRejection>,
 ) -> Response {
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
-    if let Some(name) = &mut node.name {
-        *name = name.trim().to_owned();
-        if name.is_empty() {
-            return bad("name is required");
-        }
-    }
-    if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
-        return bad(message);
-    }
-    if let Some(message) = pins(&mut node) {
+    if let Some(message) = patch_error(&mut node) {
         return bad(message);
     }
     match app.db.update_node(id, &node) {
@@ -759,6 +890,53 @@ pub async fn update_node(
             Json(json!({"ok": true})).into_response()
         }
         Ok(false) => no_such_node(),
+        Err(e) => fail(e),
+    }
+}
+
+/// What a batch may set: the settings the panel applies across a selection.
+/// An allowlist, so a field added to [`NodePatch`] later, possibly one that
+/// describes a single machine, is refused here until it is listed.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BatchPatch {
+    group: Option<String>,
+    notify: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct NodeBatch {
+    ids: Vec<i64>,
+    #[serde(default)]
+    patch: BatchPatch,
+}
+
+/// Applies one patch to every selected node, all or none.
+pub async fn update_nodes(
+    _: Admin,
+    State(app): State<Shared>,
+    body: Result<Json<NodeBatch>, JsonRejection>,
+) -> Response {
+    let Ok(Json(NodeBatch { mut ids, patch })) = body else {
+        return bad("invalid batch: only group and notify apply to several nodes at once");
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return bad("no nodes selected");
+    }
+    let mut patch = NodePatch { group: patch.group, notify: patch.notify, ..Default::default() };
+    if let Some(message) = patch_error(&mut patch) {
+        return bad(message);
+    }
+    match app.db.update_nodes(&ids, &patch) {
+        Ok(true) => {
+            invalidate_snapshot(&app);
+            Json(json!({"updated": ids.len()})).into_response()
+        }
+        Ok(false) => {
+            (StatusCode::NOT_FOUND, "有节点已被删除，没有做任何修改；刷新后重新选择").into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -795,6 +973,9 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // metrics. Dropped after the delete, so the reconnect that follows finds no
     // token to accept. The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // Its held reading as well, which would otherwise be booked into the node
+    // that inherits the id.
+    app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
 }
@@ -926,8 +1107,8 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     // number is 5 seconds, the fastest probe available, run by every node the
     // task is assigned to; the panel reaches 0 simply by having its interval
     // field cleared.
-    if !(5..=3_600).contains(&task.interval) {
-        return bad("interval must be from 5 to 3600 seconds");
+    if !(Db::MIN_PROBE_INTERVAL..=3_600).contains(&task.interval) {
+        return bad(&format!("interval must be from {} to 3600 seconds", Db::MIN_PROBE_INTERVAL));
     }
     match app.db.save_ping_task(&task) {
         Ok(id) => {
@@ -961,6 +1142,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
+    "update_notice",
 ];
 
 // ---- the database itself ----
@@ -1202,6 +1384,8 @@ pub async fn db_restore(
             // now belong to different nodes, or to none. Dropping the senders ends
             // those loops; each reconnects against the restored database.
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+            // Held readings belong to the database just replaced.
+            app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
             invalidate_snapshot(&app);
             let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
                 Ok(cookie) => cookie,
@@ -1296,6 +1480,82 @@ pub async fn upload_theme(
 /// same `theme.tar.gz` the upload button accepts.
 const ARCHIVE: &str = "theme.tar.gz";
 
+/// How long a release lookup stands before the panel asks GitHub again, and how
+/// long a failed one does. The short retry keeps one unreachable moment from
+/// hiding an update for the rest of the day; the long one keeps a panel left
+/// open on a screen to four lookups a day, well inside the 60 per hour an
+/// unauthenticated caller is allowed.
+const RELEASES_FRESH: i64 = 6 * 3600;
+const RELEASES_RETRY: i64 = 600;
+
+/// What is running here, and what is published. The agent's own version travels
+/// in its hello and is already in the node list, so the panel compares the two
+/// itself and names the nodes to upgrade.
+///
+/// Admin-only, and deliberately not part of `/api/me`: that route answers
+/// anonymous callers, to whom the running hub version is not disclosed. Nothing
+/// is fetched until an administrator opens the panel, so a hub whose panel is
+/// never opened makes no outbound request.
+pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
+    let cached = app.releases.lock().unwrap().clone();
+    let latest = if fresh_enough(&cached, Utc::now().timestamp()) {
+        cached
+    } else {
+        // Both at once: one round trip of latency rather than two, and neither
+        // lookup depends on the other.
+        let (hub, agent) =
+            tokio::join!(latest_tag(&app, crate::HUB_REPO), latest_tag(&app, crate::AGENT_REPO));
+        let read = crate::Releases {
+            read_at: Utc::now().timestamp(),
+            hub: hub.unwrap_or_default(),
+            agent: agent.unwrap_or_default(),
+        };
+        *app.releases.lock().unwrap() = read.clone();
+        read
+    };
+    Json(json!({
+        "hub": env!("CARGO_PKG_VERSION"),
+        // Empty where GitHub could not be reached, which the panel renders as no
+        // update rather than as an error: a hub on a network that cannot reach
+        // github.com is a supported deployment, not a fault to report.
+        "hub_latest": latest.hub,
+        "agent_latest": latest.agent,
+        // Whether the navigation marks an update. It governs the mark alone: the
+        // lookup runs either way, so the update page still answers when opened.
+        "notice": app.db.get("update_notice").as_deref() != Some("off"),
+    }))
+}
+
+/// Whether the cached lookup still answers. One that returned nothing is held
+/// for [`RELEASES_RETRY`] instead, so a single unreachable moment does not hide
+/// an update for the rest of the day.
+fn fresh_enough(cached: &crate::Releases, now: i64) -> bool {
+    let holds =
+        if cached.hub.is_empty() || cached.agent.is_empty() { RELEASES_RETRY } else { RELEASES_FRESH };
+    cached.read_at != 0 && now - cached.read_at < holds
+}
+
+/// The tag of a repository's latest release, without its leading `v`, or None
+/// where GitHub could not be read, which costs only the update notice.
+async fn latest_tag(app: &App, repo: &str) -> Option<String> {
+    let tag = latest_release(app, repo).await.ok()?.tag_name;
+    Some(tag.strip_prefix('v').unwrap_or(&tag).to_owned())
+}
+
+/// The latest release of `owner/repo`. Unauthenticated: 60 requests per hour from
+/// this address. GitHub returns 403 without a User-Agent. Never through the
+/// panel's GitHub proxy, which most mirrors provide for release downloads alone.
+async fn latest_release(app: &App, repo: &str) -> reqwest::Result<Release> {
+    app.http
+        .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
+        .header(header::USER_AGENT, "monitor-hub")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+}
+
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
@@ -1359,18 +1619,9 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     let (owner, repo) = github_repo(&installed.url)
         .context("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包")?;
 
-    // Unauthenticated: 60 requests per hour from this address, ample for a manual
-    // action. GitHub returns 403 without a User-Agent.
-    let release: Release = app
-        .http
-        .get(format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"))
-        .header(header::USER_AGENT, "monitor-hub")
-        .send()
-        .await?
-        .error_for_status()
-        .with_context(|| format!("读不到 {owner}/{repo} 的最新 release"))?
-        .json()
-        .await?;
+    let release = latest_release(app, &format!("{owner}/{repo}"))
+        .await
+        .with_context(|| format!("读不到 {owner}/{repo} 的最新 release"))?;
 
     // Tags read `v1.2.3` while manifests carry `1.2.3`. Equal means up to date;
     // anything else is installed, including a deliberate downgrade, since the
@@ -1440,6 +1691,65 @@ pub async fn delete_theme(_: Admin, State(app): State<Shared>, Path(short): Path
     match crate::frontend::remove(&app.themes, &short) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => bad(&format!("{e:#}")),
+    }
+}
+
+/// Where a theme's saved settings live. Keyed by `short` in the database rather
+/// than stored beside the theme, so updating, reinstalling or deleting the
+/// theme leaves them in place, and a backup carries them.
+fn theme_config_key(short: &str) -> String {
+    format!("theme_config:{short}")
+}
+
+/// The settings saved for one theme in the panel: only the fields changed from
+/// the defaults its `theme.json` declares, which the theme fills in itself.
+/// Any theme may be named, installed or not, so a theme under development
+/// reads its own settings from whichever hub it proxies to.
+///
+/// Anonymous, under the same condition as `/api/nodes`. One request is one
+/// primary-key read answering at most 64 KiB, the router's body limit having
+/// bounded the write. That is the cost class of `/api/me`, so there is no gate:
+/// on a three-core hub (debug build), 120 concurrent requests for a 60 KiB
+/// value held the panel's `/api/nodes` at a 230 ms median, against 160 ms
+/// under the same load on `/api/me`.
+///
+/// A failed read answers 500 rather than `{}`: the panel saves on top of what
+/// it reads, so an empty answer would erase every saved override.
+pub async fn theme_config(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(short): Path<String>,
+) -> Response {
+    if !authed(&app, &headers) && !app.public_page() {
+        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+    }
+    if !crate::frontend::valid_short(&short) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match app.db.lookup(&theme_config_key(&short)) {
+        Ok(saved) => {
+            let saved = saved.unwrap_or_else(|| "{}".into());
+            ([(header::CONTENT_TYPE, "application/json")], saved).into_response()
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Replaces a theme's saved settings. Values are not checked against the
+/// theme's declared fields: the theme must validate what it reads regardless,
+/// since a value saved under one version of the theme meets the next.
+pub async fn save_theme_config(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(short): Path<String>,
+    Json(values): Json<serde_json::Map<String, Value>>,
+) -> Response {
+    if !crate::frontend::valid_short(&short) || !crate::frontend::selectable(&app, &short) {
+        return bad("theme is not installed");
+    }
+    match app.db.set(&theme_config_key(&short), &Value::Object(values).to_string()) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => fail(e),
     }
 }
 
@@ -1591,10 +1901,11 @@ mod tests {
     use crate::auth::sha256;
     use crate::db::Db;
 
-    fn domain_headers() -> HeaderMap {
+    /// What a browser on `https://monitor.example.com` sends with a panel write.
+    fn panel_headers() -> HeaderMap {
         HeaderMap::from_iter([
-            (header::HOST, "monitor.example.com".parse().unwrap()),
-            (header::HeaderName::from_static("x-forwarded-proto"), "https".parse().unwrap()),
+            (header::ORIGIN, "https://monitor.example.com".parse().unwrap()),
+            (header::HeaderName::from_static("sec-fetch-site"), "same-origin".parse().unwrap()),
         ])
     }
 
@@ -1616,52 +1927,90 @@ mod tests {
     /// across an await without `clippy::await_holding_lock` refusing the build.
     static HISTORY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    #[tokio::test]
-    async fn provisioning_requires_the_current_https_domain_entry() {
-        let no_site = app();
+    /// A lookup nobody can refresh must not hide an update all day, and a panel
+    /// left open on a screen must not ask GitHub on every load.
+    #[test]
+    fn a_release_lookup_is_held_for_six_hours_and_a_failed_one_for_ten_minutes() {
+        let now = Utc::now().timestamp();
+        let read = |read_at, hub: &str, agent: &str| crate::Releases {
+            read_at,
+            hub: hub.into(),
+            agent: agent.into(),
+        };
+        assert!(!fresh_enough(&crate::Releases::default(), now), "nothing has been read yet");
+        assert!(fresh_enough(&read(now - 5 * 3600, "1.2.0", "1.1.0"), now));
+        assert!(!fresh_enough(&read(now - 7 * 3600, "1.2.0", "1.1.0"), now));
+        assert!(fresh_enough(&read(now - 300, "", ""), now), "a failure is held briefly");
+        assert!(!fresh_enough(&read(now - 1200, "1.2.0", ""), now), "half an answer is a failure");
+    }
+
+    fn app_with_site(site: &str) -> App {
         let mut state = app();
-        state.site = "https://monitor.example.com".into();
-        let app = std::sync::Arc::new(state);
-        let good = domain_headers();
-        assert!(provisioning_allowed(&app, &good));
-        let mut plain = good.clone();
-        plain.insert("x-forwarded-proto", "http".parse().unwrap());
-        assert!(
-            !provisioning_allowed(&app, &plain),
-            "--site cannot override an explicitly plaintext request"
-        );
-        for host in ["127.0.0.1:9911", "[::1]:9911", "198.51.100.1", "2130706433", "localhost"] {
+        state.site = site.into();
+        state
+    }
+
+    #[tokio::test]
+    async fn provisioning_follows_the_browsers_own_origin() {
+        let app = std::sync::Arc::new(app_with_site("https://monitor.example.com"));
+        let good = panel_headers();
+        assert!(provisioning_allowed(&app, &good).is_ok());
+
+        // The four shapes a reverse proxy puts in Host and X-Forwarded-Proto
+        // while the browser is on https: no X-Forwarded-Proto at all, the proxy's
+        // own upstream address as Host, a plaintext hop behind a TLS edge, and a
+        // port dropped by `$host`. Reading them instead of the origin refuses
+        // each one.
+        let mut proxied = good.clone();
+        proxied.insert(header::HOST, "127.0.0.1:28080".parse().unwrap());
+        proxied.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(provisioning_allowed(&app, &proxied).is_ok());
+
+        for origin in [
+            "http://monitor.example.com",
+            "https://198.51.100.1",
+            "null",
+            // A registered name resolving wherever its owner points it, which is
+            // not the loopback entry below however it is spelled.
+            "http://127.0.0.1.example.com",
+        ] {
             let mut headers = good.clone();
-            headers.insert(header::HOST, host.parse().unwrap());
-            let node = serde_json::from_value(json!({"name":"blocked"})).unwrap();
-            assert_eq!(
-                create_node(Admin, State(app.clone()), headers.clone(), Ok(Json(node))).await.status(),
-                StatusCode::FORBIDDEN
-            );
-            assert_eq!(
-                open_register(Admin, State(app.clone()), headers.clone()).await.status(),
-                StatusCode::FORBIDDEN
-            );
-            assert_eq!(
-                agent_register(
-                    State(app.clone()),
-                    ConnectInfo("127.0.0.1:1".parse().unwrap()),
-                    headers,
-                    "blocked".into()
-                )
-                .await
-                .status(),
-                StatusCode::FORBIDDEN
-            );
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+            assert_eq!(provisioning_allowed(&app, &headers), Err(PROVISIONING_DENIED), "{origin}");
         }
+
+        // A panel opened over a tunnel reads as loopback. It names no address a
+        // node could reach, so it provisions alongside --site and not without it.
+        for origin in ["http://127.0.0.1:9911", "http://localhost:9911", "http://[::1]:9911"] {
+            let mut headers = good.clone();
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+            assert!(provisioning_allowed(&app, &headers).is_ok(), "{origin}");
+            assert!(provisioning_allowed(&app_with_site(""), &headers).is_err(), "{origin} without --site");
+        }
+        // No origin at all: every caller that is not a browser, and a browser
+        // behind a proxy that clears the header, which the message names.
         let mut headers = good.clone();
-        headers.insert(header::ORIGIN, "http://127.0.0.1:9911".parse().unwrap());
-        assert!(!provisioning_allowed(&app, &headers));
+        headers.remove(header::ORIGIN);
+        assert_eq!(provisioning_allowed(&app, &headers), Err(ORIGIN_MISSING));
+        // A request sent from a page elsewhere.
+        headers = good.clone();
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(provisioning_allowed(&app, &headers).is_err());
+
+        // Both panel paths refuse, and neither leaves anything behind.
+        headers = good.clone();
+        headers.insert(header::ORIGIN, "http://monitor.example.com".parse().unwrap());
+        let node = serde_json::from_value(json!({"name":"blocked"})).unwrap();
+        assert_eq!(
+            create_node(Admin, State(app.clone()), headers.clone(), Ok(Json(node))).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(open_register(Admin, State(app.clone()), headers).await.status(), StatusCode::FORBIDDEN);
         assert!(app.db.nodes().unwrap().is_empty());
         assert!(app.db.get("register_key").is_none());
-        headers = good;
-        headers.remove("x-forwarded-proto");
-        assert!(!provisioning_allowed(&no_site, &headers));
+
+        // --site takes the origin's place in the command, so one that is not an
+        // https domain refuses every entry.
         for site in [
             "http://monitor.example.com",
             "https://198.51.100.1",
@@ -1669,6 +2018,7 @@ mod tests {
             "https://monitor.example.com/path",
         ] {
             assert!(https_domain(site).is_none());
+            assert_eq!(provisioning_allowed(&app_with_site(site), &good), Err(PROVISIONING_DENIED), "{site}");
         }
     }
 
@@ -1920,7 +2270,7 @@ mod tests {
         for i in 0..30 * 1440 {
             app.db.insert_metric(id, now - i * 60, &json!({"cpu": 1.0})).unwrap();
             for task in 1..=PROBES {
-                app.db.insert_ping(id, task, now - i * 20, 42).unwrap();
+                app.db.insert_pings(id, &[(task, now - i * 20, 42)]).unwrap();
             }
         }
 
@@ -1990,11 +2340,11 @@ mod tests {
             task(&app, vec![id]);
         }
         for (i, latency) in [30, -1, -1, -1].into_iter().enumerate() {
-            app.db.insert_ping(id, 1, base + 10 + i as i64 * 20, latency).unwrap();
+            app.db.insert_pings(id, &[(1, base + 10 + i as i64 * 20, latency)]).unwrap();
         }
         // A second probe that never answered, and a third that answered cleanly.
-        app.db.insert_ping(id, 2, base + 10, -1).unwrap();
-        app.db.insert_ping(id, 3, base + 10, 12).unwrap();
+        app.db.insert_pings(id, &[(2, base + 10, -1)]).unwrap();
+        app.db.insert_pings(id, &[(3, base + 10, 12)]).unwrap();
 
         let m = &app.db.metrics(id, base, 120).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
@@ -2030,7 +2380,7 @@ mod tests {
         let wide_probe = task(&app, vec![wide]);
         let wide_base = base / 180 * 180;
         for i in 0..180 {
-            app.db.insert_ping(wide, wide_probe, wide_base + i, if i == 0 { -1 } else { 20 }).unwrap();
+            app.db.insert_pings(wide, &[(wide_probe, wide_base + i, if i == 0 { -1 } else { 20 })]).unwrap();
         }
         let (rows, _) = app.db.ping_records(wide, wide_base, 180).unwrap();
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
@@ -2043,7 +2393,7 @@ mod tests {
         let jitter = node(&app, "jitter", true);
         let jitter_probe = task(&app, vec![jitter]);
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
-            app.db.insert_ping(jitter, jitter_probe, wide_base + i as i64, latency).unwrap();
+            app.db.insert_pings(jitter, &[(jitter_probe, wide_base + i as i64, latency)]).unwrap();
         }
         let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().0[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
@@ -2055,7 +2405,7 @@ mod tests {
         let even = node(&app, "even", true);
         let even_probe = task(&app, vec![even]);
         for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
-            app.db.insert_ping(even, even_probe, wide_base + i as i64, latency).unwrap();
+            app.db.insert_pings(even, &[(even_probe, wide_base + i as i64, latency)]).unwrap();
         }
         assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().0[0]["latency"], 25);
     }
@@ -2077,9 +2427,9 @@ mod tests {
         // A full minute at five seconds per round with no loss, then a minute
         // holding one sample, which was lost, before the probe stopped.
         for i in 0..12 {
-            app.db.insert_ping(id, probe, base + i * 5, 20).unwrap();
+            app.db.insert_pings(id, &[(probe, base + i * 5, 20)]).unwrap();
         }
-        app.db.insert_ping(id, probe, base + 60, -1).unwrap();
+        app.db.insert_pings(id, &[(probe, base + 60, -1)]).unwrap();
 
         let (rows, loss) = app.db.ping_records(id, base, 60).unwrap();
         let per_bucket: Vec<i64> = rows.iter().map(|r| r["loss"].as_i64().unwrap_or(0)).collect();
@@ -2104,15 +2454,16 @@ mod tests {
         let _held = connect(
             &app,
             open,
-            json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0,
-                   "hostname": "db-prod-01", "ip": "203.0.113.7"}),
+            json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0, "iface": "eth1",
+                   "hostname": "db-prod-01", "ip": "203.0.113.7", "total_rx": 1}),
         );
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
         // Disclosing the token would let any visitor impersonate the node.
-        for hidden in ["ip", "remark", "hostname", "token"] {
+        for hidden in ["ip", "addresses", "ipv4_auto", "ipv6_auto", "remark", "hostname", "token", "interval"]
+        {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert!(
@@ -2126,11 +2477,118 @@ mod tests {
             assert!(public[0]["metrics"].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert_eq!(public[0]["metrics"]["cpu"], 1.0, "the rest of the report still goes out");
+        assert!(public[0]["metrics"].get("iface").is_none(), "the interface list is the panel's");
 
         let admin = visible_nodes(&app, true).unwrap();
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
+        // The panel reads `iface` and nothing else the contract leaves out.
+        assert_eq!(admin[0]["metrics"]["iface"], "eth1");
+        for hidden in ["boot_id", "net_rx_total", "hostname", "ip"] {
+            assert!(admin[0]["metrics"].get(hidden).is_none(), "{hidden} is not part of the panel's frame");
+        }
+        // The traffic inside `metrics` is the hub's, whatever the report claimed.
+        for view in [&public[0], &admin[0]] {
+            assert_eq!(view["metrics"]["total_rx"], view["total_rx"]);
+            assert_eq!(view["metrics"]["month_tx"], view["month_tx"]);
+        }
+    }
+
+    /// One address per family, marked with where it came from.
+    #[test]
+    fn a_node_shows_the_address_it_is_reached_by() {
+        let rows = |ip, held, pins| -> Vec<String> {
+            addresses(ip, held, pins).into_iter().map(|(a, source)| format!("{a} {source}")).collect()
+        };
+        let none = ("", "");
+        // A public interface is the machine; a different exit in front of it is a
+        // proxy and stays out.
+        assert_eq!(
+            rows("2001:db8::2", ("203.0.113.7", "2001:db8::2"), none),
+            ["203.0.113.7 interface", "2001:db8::2 interface"]
+        );
+        assert_eq!(rows("198.51.100.1", ("203.0.113.7", ""), none), ["203.0.113.7 interface"]);
+        // NAT: the exit replaces the private interface address, which nobody
+        // outside can use.
+        assert_eq!(rows("203.0.113.7", ("10.10.2.250", ""), none), ["203.0.113.7 exit"]);
+        assert_eq!(rows("203.0.113.7", ("100.64.0.9", ""), none), ["203.0.113.7 exit"]);
+        // An LXC guest behind NAT with a public /128, reached over v4 by a current
+        // agent...
+        assert_eq!(
+            rows("203.0.113.7", ("10.10.1.5", "2401:b60:1c::5"), none),
+            ["203.0.113.7 exit", "2401:b60:1c::5 interface"]
+        );
+        // ...and over v6 by an older one reporting the ULA ahead of it.
+        assert_eq!(rows("2401:b60:1c::5", ("10.10.1.5", "fd42:43af::1"), none), ["2401:b60:1c::5 exit"]);
+        // Behind a transparent proxy the exit is the proxy's; the home line can
+        // only be set by hand.
+        let home = ("192.168.1.5", "2409:8a1e::5");
+        assert_eq!(rows("198.51.100.77", home, none), ["198.51.100.77 exit", "2409:8a1e::5 interface"]);
+        assert_eq!(
+            rows("198.51.100.77", home, ("203.0.113.50", "")),
+            ["203.0.113.50 manual", "2409:8a1e::5 interface"]
+        );
+        // A pin wins over a public interface too, and may name a private address
+        // for use on the LAN.
+        assert_eq!(
+            rows("", ("203.0.113.7", "2001:db8::5"), ("", "2001:db8::9")),
+            ["203.0.113.7 interface", "2001:db8::9 manual"]
+        );
+        assert_eq!(rows("203.0.113.7", ("10.0.0.2", ""), ("10.0.0.2", "")), ["10.0.0.2 manual"]);
+        // No interface in the exit's family: a translator (NAT64, WARP) that does
+        // not lead to the machine.
+        assert_eq!(rows("104.28.1.1", ("", "2001:db8::5"), none), ["2001:db8::5 interface"]);
+        // An address reported under the other family's name is not that family's.
+        assert_eq!(rows("203.0.113.7", ("2001:db8::5", ""), none), ["203.0.113.7 exit"]);
+        // Nothing public anywhere: hub and node share a network, and the private
+        // addresses are all there is.
+        assert_eq!(rows("192.168.1.2", ("192.168.1.5", ""), none), ["192.168.1.5 interface"]);
+        assert_eq!(
+            rows("fd00::2", ("10.0.0.2", "fd00::5"), none),
+            ["10.0.0.2 interface", "fd00::5 interface"]
+        );
+        assert_eq!(
+            rows("198.18.0.1", ("192.168.1.5", ""), none),
+            ["192.168.1.5 interface"],
+            "a TUN proxy's fake-IP range is not public"
+        );
+        // With no interface reported the connection is all there is, and nothing
+        // says it is not the machine's own.
+        assert_eq!(rows("203.0.113.7", none, none), ["203.0.113.7 connection"]);
+        assert_eq!(rows("", ("10.0.0.2", ""), none), ["10.0.0.2 interface"]);
+        assert!(rows("", none, none).is_empty());
+
+        // The panel gets the list, and per family what shows with the pin
+        // cleared.
+        let app = app();
+        let id = node(&app, "n", true);
+        app.db
+            .save_facts(id, &json!({"ipv4": "10.10.1.5", "ipv6": "2401:b60:1c::5"}), "203.0.113.7", "")
+            .unwrap();
+        let patch: NodePatch = serde_json::from_value(json!({"ipv4_pin": "198.51.100.50"})).unwrap();
+        app.db.update_node(id, &patch).unwrap();
+        let view = &visible_nodes(&app, true).unwrap()[0];
+        assert_eq!(
+            view["addresses"],
+            json!([{"address": "198.51.100.50", "source": "manual"}, {"address": "2401:b60:1c::5", "source": "interface"}])
+        );
+        assert_eq!(
+            (&view["ipv4_auto"], &view["ipv6_auto"]),
+            (&json!("203.0.113.7"), &json!("2401:b60:1c::5"))
+        );
+
+        // Private addresses show only when nothing public is known, so the pin
+        // the other family keeps decides: v4 falls back to nothing while the v6
+        // pin stands.
+        let lan = node(&app, "lan", true);
+        app.db
+            .save_facts(lan, &json!({"ipv4": "192.168.1.5", "ipv6": "fd00::5"}), "192.168.1.2", "")
+            .unwrap();
+        let patch: NodePatch = serde_json::from_value(json!({"ipv6_pin": "2001:db8::9"})).unwrap();
+        app.db.update_node(lan, &patch).unwrap();
+        let view = visible_nodes(&app, true).unwrap().into_iter().find(|v| v["id"] == lan).unwrap();
+        assert_eq!((&view["ipv4_auto"], &view["ipv6_auto"]), (&json!(""), &json!("fd00::5")));
     }
 
     #[tokio::test]
@@ -2149,6 +2607,91 @@ mod tests {
             "the old agent's channel must be closed"
         );
         assert!(app.agents.read().unwrap().is_empty(), "the node must read as offline at once");
+    }
+
+    /// A batch writes to every selected node or to none, accepts only what a
+    /// selection can share, and a group reaches the status page.
+    #[tokio::test]
+    async fn a_batch_edit_applies_to_all_selected_nodes_or_none() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let (a, b, c) = (node(&app, "a", true), node(&app, "b", true), node(&app, "c", true));
+        let batch = |ids: Vec<i64>, patch: Value| {
+            Ok(Json(NodeBatch { ids, patch: serde_json::from_value(patch).unwrap() }))
+        };
+        let group = |id| app.db.node(id).unwrap().unwrap().group;
+
+        let r =
+            update_nodes(Admin, state(), batch(vec![a, b, a], json!({"group": " 香港 ", "notify": true})))
+                .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!((group(a), group(b), group(c)), ("香港".into(), "香港".into(), String::new()));
+        assert!(app.db.node(b).unwrap().unwrap().notify);
+
+        // One id gone: nothing is written, not even to the nodes still there.
+        let r = update_nodes(Admin, state(), batch(vec![a, 999], json!({"group": "东京"}))).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(group(a), "香港", "a refused batch leaves every node as it was");
+
+        // Only the listed fields deserialize, so the extractor refuses the rest.
+        for refused in [json!({"name": "x"}), json!({"ipv4_pin": "1.2.3.4"}), json!({"public": false})] {
+            assert!(serde_json::from_value::<BatchPatch>(refused.clone()).is_err(), "{refused}");
+        }
+        // Counted in characters, not bytes: thirteen of them take 39 bytes.
+        let r = update_nodes(Admin, state(), batch(vec![a], json!({"group": "港".repeat(MAX_GROUP)}))).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r =
+            update_nodes(Admin, state(), batch(vec![a], json!({"group": "港".repeat(MAX_GROUP + 1)}))).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            update_nodes(Admin, state(), batch(vec![], json!({"notify": false}))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        assert!(live_snapshot(&app, false).as_str().contains(r#""group":"香港""#), "the group is public");
+    }
+
+    /// What the panel saves is what an anonymous visitor reads, under the same
+    /// condition as the node list, and only an installed theme takes a write.
+    #[tokio::test]
+    async fn saved_theme_settings_reach_visitors_while_the_status_page_is_open() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let read = |short: &str| theme_config(state(), HeaderMap::new(), Path(short.to_owned()));
+        let body = |r: Response| async { axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap() };
+
+        assert_eq!(&body(read("default").await).await[..], b"{}", "nothing saved reads as no overrides");
+        let values = json!({"notice": "维护中", "show_price": false}).as_object().unwrap().clone();
+        let saved = save_theme_config(Admin, state(), Path("default".into()), Json(values.clone())).await;
+        assert_eq!(saved.status(), StatusCode::NO_CONTENT);
+        let read_back: Value = serde_json::from_slice(&body(read("default").await).await).unwrap();
+        assert_eq!(read_back, Value::Object(values.clone()));
+
+        let missing = save_theme_config(Admin, state(), Path("aurora".into()), Json(values.clone())).await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "a theme that is not installed takes no write");
+        assert_eq!(read("../etc").await.status(), StatusCode::NOT_FOUND);
+
+        app.db.set("public_page", "off").unwrap();
+        assert_eq!(
+            read("default").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "a closed status page hides them too"
+        );
+    }
+
+    /// Days to expiry are counted on the hub's calendar and are public, like the
+    /// date itself; no date counts nothing.
+    #[test]
+    fn days_to_expiry_follow_the_hubs_calendar() {
+        let app = app();
+        let id = node(&app, "a", true);
+        let expires_in = || visible_nodes(&app, false).unwrap()[0]["expires_in"].clone();
+        assert_eq!(expires_in(), Value::Null);
+        let today = Local::now().date_naive();
+        for days in [3, 0, -1] {
+            app.db.set_expiry(id, &(today + chrono::Duration::days(days)).to_string()).unwrap();
+            assert_eq!(expires_in(), json!(days));
+        }
     }
 
     /// A write naming a node that no longer exists, such as one deleted from
@@ -2275,7 +2818,7 @@ mod tests {
             let created = create_node(
                 Admin,
                 axum::extract::State(app.clone()),
-                domain_headers(),
+                panel_headers(),
                 Ok(Json(serde_json::from_value(bad.clone()).unwrap())),
             )
             .await;
@@ -2368,7 +2911,7 @@ mod tests {
         assert_eq!(added.billing_cycle, "monthly");
         assert_eq!(added.traffic_reset_day, 1);
 
-        let created = create_node(Admin, State(app.clone()), domain_headers(), Ok(Json(added))).await;
+        let created = create_node(Admin, State(app.clone()), panel_headers(), Ok(Json(added))).await;
         assert_eq!(created.status(), StatusCode::OK);
         // Frames are cached for nearly two seconds, so without dropping the cache
         // the node just added would disappear from the list.
@@ -2376,7 +2919,7 @@ mod tests {
 
         // A name consisting only of spaces is refused and leaves no node behind.
         let blank = Json(serde_json::from_value::<Node>(json!({"name": "   "})).unwrap());
-        let refused = create_node(Admin, State(app.clone()), domain_headers(), Ok(blank)).await;
+        let refused = create_node(Admin, State(app.clone()), panel_headers(), Ok(blank)).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(app.db.nodes().unwrap().len(), 2);
     }
@@ -2387,7 +2930,7 @@ mod tests {
     async fn registration_only_works_inside_a_window_the_panel_opened() {
         let app = std::sync::Arc::new(app());
         let register = |key: Option<&str>, name: &str| {
-            let mut headers = domain_headers();
+            let mut headers = HeaderMap::new();
             if let Some(key) = key {
                 headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
             }
@@ -2403,7 +2946,7 @@ mod tests {
         assert_eq!(register(Some("guess"), "a").await.status(), StatusCode::FORBIDDEN);
         assert!(app.db.nodes().unwrap().is_empty());
 
-        assert_eq!(open_register(Admin, State(app.clone()), domain_headers()).await.status(), StatusCode::OK);
+        assert_eq!(open_register(Admin, State(app.clone()), panel_headers()).await.status(), StatusCode::OK);
         let key = app.db.get("register_key").unwrap();
         assert_eq!(register(Some("guess"), "a").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(register(None, "a").await.status(), StatusCode::FORBIDDEN);
@@ -2429,7 +2972,7 @@ mod tests {
 
         // Reopened, then closed manually: the key from the open window stops
         // working.
-        open_register(Admin, State(app.clone()), domain_headers()).await;
+        open_register(Admin, State(app.clone()), panel_headers()).await;
         let key = app.db.get("register_key").unwrap();
         assert_eq!(close_register(Admin, State(app.clone())).await.status(), StatusCode::NO_CONTENT);
         assert_eq!(register(Some(&key), "c").await.status(), StatusCode::FORBIDDEN);
@@ -2442,7 +2985,7 @@ mod tests {
     async fn a_rerun_keeps_its_node_until_the_node_is_deleted() {
         let app = std::sync::Arc::new(app());
         let register = |key: &str, held: &str| {
-            let mut headers = domain_headers();
+            let mut headers = HeaderMap::new();
             headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
             // curl omits a header whose value is empty, so a machine holding no
             // token sends none.
@@ -2461,7 +3004,7 @@ mod tests {
                 .unwrap()
         };
 
-        open_register(Admin, State(app.clone()), domain_headers()).await;
+        open_register(Admin, State(app.clone()), panel_headers()).await;
         let key = app.db.get("register_key").unwrap();
         let token = text(register(&key, "").await).await;
         let id = app.db.node_by_token(&token).unwrap().expect("token opens a node");
@@ -2475,7 +3018,7 @@ mod tests {
         // rather than handing back a token the agent would be refused with.
         app.db.delete_node(id).unwrap();
         assert_eq!(register(&key, &token).await.status(), StatusCode::FORBIDDEN);
-        open_register(Admin, State(app.clone()), domain_headers()).await;
+        open_register(Admin, State(app.clone()), panel_headers()).await;
         let key = app.db.get("register_key").unwrap();
         let fresh = text(register(&key, &token).await).await;
         assert_ne!(fresh, token);
@@ -2487,12 +3030,12 @@ mod tests {
     #[tokio::test]
     async fn one_window_stops_registering_at_the_limit() {
         let app = std::sync::Arc::new(app());
-        open_register(Admin, State(app.clone()), domain_headers()).await;
+        open_register(Admin, State(app.clone()), panel_headers()).await;
         let key = app.db.get("register_key").unwrap();
         for i in 0..REGISTER_LIMIT {
             node(&app, &format!("n{i}"), true);
         }
-        let mut headers = domain_headers();
+        let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
         let refused = agent_register(
             State(app.clone()),
@@ -2509,9 +3052,9 @@ mod tests {
     fn a_node_view_carries_traffic_even_while_offline() {
         let app = app();
         let id = node(&app, "n", true);
-        app.db.accumulate(id, "b", Some((100, 100))).unwrap();
-        app.db.accumulate(id, "b", Some((900, 500))).unwrap();
-        app.db.touch_seen(id, 1_700_000_000).unwrap();
+        app.db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
+        app.db.accumulate(id, "b", (900, 500), Local::now()).unwrap();
+        app.db.touch_seen(id, 1_700_000_000, &serde_json::Value::Null).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
         assert_eq!(view["online"], false);
@@ -2565,9 +3108,9 @@ mod tests {
 
     /// `PUBLIC_HOURS` bounds one window; this bounds how many are built
     /// concurrently. Each holds the connection the agents report through for its
-    /// entire scan, and the path takes no credentials -- the same arrangement
-    /// `RELAY_GATE` and `PASSWORD_GATE` enforce on the other two anonymous paths
-    /// that make this process work hard.
+    /// entire scan, and the path takes no credentials. `PASSWORD_GATE` refuses the
+    /// same way; `RELAY_GATE` queues briefly instead, as a batch install is one
+    /// burst of legitimate requests.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
         // This test holds every permit; see HISTORY_TESTS.
@@ -2632,7 +3175,7 @@ mod tests {
         let app = std::sync::Arc::new(app());
         app.db.set("register_key", "the-key").unwrap();
         app.db.set("register_until", &(Utc::now().timestamp() + 60).to_string()).unwrap();
-        let mut headers = domain_headers();
+        let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer wrong".parse().unwrap());
         let peer: std::net::SocketAddr = "198.51.100.7:9000".parse().unwrap();
 

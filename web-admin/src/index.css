@@ -106,6 +106,15 @@
   /* Reserve the scrollbar's width on every page: without it, leaving a route
      whose content exceeds the fold widens the page. */
   html { scrollbar-gutter: stable; }
+  /* A dialog or an open select locks the page, and the lock's stylesheet also
+     hides the scrollbar and pads the body by its width -- both of which the
+     gutter above already provides for. Undone together: the margin would count
+     the width twice and shift the page half a scrollbar left, and the hidden bar
+     would leave the gutter empty, flashing off and on at every open. Scrolling
+     stays locked, since the lock also swallows wheel and touch outside the
+     layer; only a drag on the bar itself still moves the page. The rule is
+     injected at run time with equal specificity, hence the extra `html`. */
+  html body[data-scroll-locked] { margin-right: 0 !important; overflow: visible !important; }
   body { @apply bg-background text-foreground; }
   /* Tailwind v4 leaves `button` and `input` on the browser's default cursor,
      where v3 made buttons a pointer. Radix renders Switch as a button, so without

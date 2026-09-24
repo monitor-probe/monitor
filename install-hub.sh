@@ -1,7 +1,7 @@
 #!/bin/sh
 # monitor hub installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/monitor-probe/monitor/main/install-hub.sh -o install-hub.sh
+#   curl -fsSL https://github.com/monitor-probe/monitor/releases/latest/download/install-hub.sh -o install-hub.sh
 #   chmod +x install-hub.sh
 #   sudo ./install-hub.sh
 #
@@ -81,6 +81,54 @@ press() {
 	if [ ! -t 0 ]; then return 0; fi
 	printf '\n  %s回车返回菜单%s ' "$D" "$N"
 	read -r _ || true
+}
+
+# A copy of this script saved on the machine may be several releases old, and
+# re-running it is the documented way to upgrade: it would rewrite the unit by
+# that version's rules. The release publishes this script and hashes it
+# alongside the binary, so a saved copy measures itself before the menu or the
+# install and, when stale, replaces itself and hands the same request to the
+# new copy. The replacement is unconditional: the stale rules are never the
+# wanted ones, and an unattended run cannot answer a prompt. The new copy is
+# held to the checksum file the binary is, so it is trusted exactly as far as
+# the binary the install fetches.
+#
+# A piped run has no file to measure and needs none: it was fetched a moment
+# ago. The marker keeps `curl | sh`, whose $0 is "sh", from measuring a file of
+# that name in the working directory.
+check_self() {
+	[ -f "$0" ] && grep -qxF '# monitor hub installer.' "$0" 2>/dev/null || return 0
+	base="https://github.com/$REPO/releases/latest/download"
+	self="$(mktemp -d)"
+	trap 'rm -rf "$self"' EXIT
+	# GitHub out of reach is reported by the install, which needs it as well;
+	# the menu's other entries do not. A release published before the script
+	# was an asset carries no line for it.
+	want=""
+	if curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$self/sums" 2>/dev/null; then
+		want="$(sed -n 's/^\([0-9a-f]\{64\}\)  *install-hub.sh$/\1/p' "$self/sums")"
+	fi
+	if [ -z "$want" ] || [ "$(sha256sum "$0" | cut -d' ' -f1)" = "$want" ]; then
+		rm -rf "$self"
+		trap - EXIT
+		return 0
+	fi
+
+	warn "这份脚本不是最新发布的那一版，先换成新的"
+	curl -fsSL --max-time 30 "$base/install-hub.sh" -o "$self/new" || die "新脚本下载失败：$base/install-hub.sh"
+	[ "$(sha256sum "$self/new" | cut -d' ' -f1)" = "$want" ] || die "新脚本校验不通过，已丢弃，$0 未改动"
+	# Written through the existing file, which keeps its mode and owner. The shell
+	# reads nothing further from it: exec follows.
+	cat "$self/new" >"$0" || die "写不进 $0。手动更新：curl -fsSL $base/install-hub.sh -o $0"
+	rm -rf "$self"
+	ok "脚本" "已更新"
+	# The parser consumed "$@", so the request is rebuilt from what it recorded;
+	# only the menu or an install reaches here.
+	set --
+	[ -z "$PORT_SET" ] || set -- "$@" --port "$PORT"
+	[ -z "$SITE_SET" ] || set -- "$@" --site "$SITE"
+	[ -z "$YES" ] || set -- "$@" --yes
+	exec sh "$0" "$@"
 }
 
 check_port() {
@@ -417,9 +465,10 @@ monitor hub 安装器
 
   --port <n>     本机监听端口，默认 $PORT
   --site <url>   一般不用填。面板拼安装命令用的是浏览器地址栏，配好反代
-                 用域名访问就自动对了。只有两种情况要填：你进面板的地址
-                 不是节点能用的地址（比如走 SSH 隧道），或反代不发
-                 X-Forwarded-Proto
+                 用域名访问就自动对了。三种情况要填：节点该连的域名和你
+                 进面板的域名不是同一个；走 SSH 隧道进面板（地址栏是
+                 127.0.0.1，节点连不上它）；反代不发 X-Forwarded-Proto
+                 （那时会话 cookie 拿不到 Secure 标志）
   --yes, -y      跳过确认
   --help, -h     显示这段
 
@@ -428,6 +477,7 @@ hub 只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / C
 
 重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版；
 没写的参数沿用上次的，所以升级不会把端口和 --site 冲掉。
+这份脚本不是最新发布的那一版时，会先把自己换成新版再接着装。
 二进制和数据都在 $ROOT 下（数据库和主题在 $DATA），卸载默认保留数据。
 TXT
 }
@@ -484,6 +534,7 @@ case "$ACTION" in
 uninstall) banner; uninstall_hub ;;
 reset) banner; reset_password ;;
 *)
+	check_self
 	if [ -t 0 ]; then
 		menu
 	else

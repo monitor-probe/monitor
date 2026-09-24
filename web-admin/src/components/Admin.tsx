@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -9,10 +9,11 @@ import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, moved, provisioningSite, trafficCorrection, upload, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, moved, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -146,7 +147,7 @@ function DragHandle({ id, index, name, disabled = false, drag }: {
       draggable={!disabled}
       disabled={disabled}
       className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
-      title={disabled ? "清空搜索后可拖动排序" : "拖动排序"}
+      title={disabled ? "清空搜索和分组筛选后可拖动排序" : "拖动排序"}
       aria-label={`拖动 ${name} 排序`}
       onDragStart={(e) => {
         drag.begin(id)
@@ -185,7 +186,7 @@ const SOURCES: Record<Source, string> = {
 // one into an ssh command is why they are shown. Where each came from is in the
 // tooltip, keeping the column to addresses alone.
 function Addresses({ node }: { node: Node }) {
-  const list = addresses(node)
+  const list = node.addresses ?? []
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
     <div className="flex flex-col items-start gap-y-0.5">
@@ -205,26 +206,61 @@ function Addresses({ node }: { node: Node }) {
   )
 }
 
-// Name, address and country: what a node is looked up by, in every node list.
+// Name, address, country and group: what a node is looked up by, in every node list.
 function searchNodes(nodes: Node[], query: string) {
   const needle = query.trim().toLowerCase()
   if (!needle) return nodes
   return nodes.filter((n) =>
-    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country].some((v) => v?.toLowerCase().includes(needle)))
+    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country, n.group].some((v) => v?.toLowerCase().includes(needle)))
+}
+
+// A filter naming a group no node carries any more -- renamed, or its last node
+// deleted -- falls back to all rather than showing an empty list; so does 未分组
+// once no group is left, since the dropdown that would clear it is hidden then.
+// Reset rather than masked, so the old filter does not return with a later group
+// of the same name.
+function useGroupFilter(nodes: Node[]) {
+  const [filter, setFilter] = useState("all")
+  const valid = filter === "all"
+    || (filter === "none" ? nodes.some((n) => n.group) : nodes.some((n) => n.group === filter.slice(1)))
+  if (!valid) setFilter("all")
+  return [valid ? filter : "all", setFilter] as const
+}
+
+// Offered once some node has a group. 未分组 is where a batch of freshly
+// registered machines waits to be assigned one.
+function GroupFilter({ nodes, value, onChange, className = "" }: {
+  nodes: Node[]
+  value: string
+  onChange: (value: string) => void
+  className?: string
+}) {
+  const groups = groupsOf(nodes)
+  if (!groups.length) return null
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger className={className} aria-label="按分组筛选"><SelectValue /></SelectTrigger>
+      <SelectContent position="popper">
+        <SelectItem value="all">全部分组</SelectItem>
+        {groups.map((g) => <SelectItem key={g} value={`=${g}`}>{g}</SelectItem>)}
+        <SelectItem value="none">未分组</SelectItem>
+      </SelectContent>
+    </Select>
+  )
 }
 
 function NodeSearch({ value, onChange, className = "" }: { value: string; onChange: (value: string) => void; className?: string }) {
   return (
     <div className={`relative ${className}`}>
       <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input className="pl-8" placeholder="名称/地址/地区" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
+      <Input className="pl-8" placeholder="名称/地址/地区/分组" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
     </div>
   )
 }
 
 // Ticks nodes in a searchable grid. 全选 and 全不选 act on the rows in view, so a
-// search narrows what they touch: search JP, then 全选. Offline nodes are dimmed
-// but remain selectable.
+// search or a group narrows what they touch: pick a group, then 全选. Offline
+// nodes are dimmed but remain selectable.
 function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   nodes: Node[]
   chosen: Set<number>
@@ -232,15 +268,17 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   disabled?: boolean
 }) {
   const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
   // The unfiltered list's height, held as its floor: in a centred dialog a
   // shrinking list would move the search box out from under the cursor.
   const [listHeight, setListHeight] = useState(0)
-  const visible = searchNodes(nodes, query)
+  const visible = inGroup(searchNodes(nodes, query), group)
   const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
   return (
     <div className="rounded-lg border">
-      <div className="flex items-center gap-1 border-b p-2">
-        <NodeSearch className="min-w-0 flex-1" value={query} onChange={setQuery} />
+      <div className="flex flex-wrap items-center gap-1 border-b p-2">
+        <NodeSearch className="min-w-0 flex-1 basis-40" value={query} onChange={setQuery} />
+        <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
         <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
         <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
       </div>
@@ -253,7 +291,7 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
         className="grid max-h-[min(16rem,40dvh)] grid-cols-2 content-start gap-0.5 overflow-y-auto p-1.5 sm:grid-cols-3"
       >
         {visible.map((n) => (
-          <label key={n.id} title={n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+          <label key={n.id} title={n.group ? `${n.name} · ${n.group}` : n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
             <input type="checkbox" checked={chosen.has(n.id)} disabled={disabled} onChange={(e) => onPick([n], e.target.checked)} className="shrink-0 accent-primary" />
             <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
             {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
@@ -313,6 +351,200 @@ function OptionRow({ title, hint, toggle = false, below, children }: {
   )
 }
 
+
+// Free text, with the groups already in use offered, so a group is picked
+// rather than retyped, where a typo would start a second one. A list of its own
+// rather than a <datalist>: Chrome draws that as a tooltip and filters it by the
+// text already in the box, so a grouped node was offered only its own group.
+// The whole list shows on opening; typing narrows it without highlighting, so
+// Enter keeps a new name that merely prefixes an existing one.
+function GroupInput({ nodes, value, onChange }: {
+  nodes: Pick<Node, "group">[]
+  value: string
+  onChange: (value: string) => void
+}) {
+  const id = useId()
+  const [open, setOpen] = useState(false)
+  const [typed, setTyped] = useState(false)
+  const [active, setActive] = useState(0)
+  const input = useRef<HTMLInputElement>(null)
+  const counts = new Map<string, number>()
+  for (const n of nodes) if (n.group) counts.set(n.group, (counts.get(n.group) ?? 0) + 1)
+  const name = value.trim()
+  const query = typed ? name.toLowerCase() : ""
+  const matches = [...counts.keys()].filter((g) => g.toLowerCase().includes(query))
+  // "" is 未分组, offered last while the list is not being narrowed.
+  const items = query ? matches : [...matches, ""]
+  const fresh = typed && name !== "" && !counts.has(name)
+  const shown = open && (matches.length > 0 || fresh)
+
+  useEffect(() => {
+    if (shown) document.getElementById(`${id}-${active}`)?.scrollIntoView({ block: "nearest" })
+  }, [id, active, shown])
+
+  const show = () => {
+    setTyped(false)
+    setActive(Math.max(0, [...counts.keys(), ""].indexOf(name)))
+    setOpen(true)
+  }
+  const pick = (group: string) => {
+    onChange(group)
+    setTyped(false)
+    setOpen(false)
+  }
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault()
+      if (!shown) return show()
+      if (!items.length) return
+      const down = e.key === "ArrowDown"
+      setActive((i) => (i < 0 ? (down ? 0 : items.length - 1) : (i + (down ? 1 : -1) + items.length) % items.length))
+    } else if (e.key === "Enter" && shown) {
+      e.preventDefault()
+      if (items[active] !== undefined) pick(items[active])
+      else setOpen(false)
+    }
+  }
+
+  if (!counts.size) {
+    return <Input maxLength={13} value={value} onChange={(e) => onChange(e.target.value)} placeholder="未分组" />
+  }
+  return (
+    <Popover open={shown} onOpenChange={setOpen}>
+      <PopoverAnchor asChild>
+        <div className="relative">
+          <Input
+            ref={input}
+            role="combobox"
+            aria-expanded={shown}
+            aria-controls={id}
+            aria-autocomplete="list"
+            aria-activedescendant={shown && items[active] !== undefined ? `${id}-${active}` : undefined}
+            maxLength={13}
+            value={value}
+            placeholder="未分组"
+            className="pr-9"
+            onChange={(e) => {
+              onChange(e.target.value)
+              setTyped(true)
+              setActive(-1)
+              setOpen(true)
+            }}
+            onClick={show}
+            onKeyDown={onKeyDown}
+          />
+          {/* Not a tab stop, and keeps the focus in the box it opens a list for. */}
+          <button
+            type="button"
+            tabIndex={-1}
+            aria-label="选择分组"
+            className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted-foreground"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              if (shown) return setOpen(false)
+              input.current?.focus()
+              show()
+            }}
+          >
+            <ChevronDown className={`size-4 opacity-50 transition-transform ${shown ? "rotate-180" : ""}`} />
+          </button>
+        </div>
+      </PopoverAnchor>
+      <PopoverContent
+        align="start"
+        className="w-(--radix-popover-trigger-width) p-1"
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        onCloseAutoFocus={(e) => e.preventDefault()}
+        // The box and its button sit outside the list; pressing them is not a dismissal.
+        onInteractOutside={(e) => input.current?.parentElement?.contains(e.target as Element) && e.preventDefault()}
+        onMouseDown={(e) => e.preventDefault()}
+      >
+        <div role="listbox" id={id} aria-label="已有分组" className="max-h-60 overflow-y-auto">
+          {items.map((group, i) => (
+            <div key={group || "\0"}>
+              {group === "" && <div className="my-1 h-px bg-border" />}
+              <div
+                id={`${id}-${i}`}
+                role="option"
+                aria-selected={group === name}
+                onMouseEnter={() => setActive(i)}
+                onClick={() => pick(group)}
+                className={`relative flex cursor-default items-center gap-2 rounded-sm py-1.5 pr-8 pl-2 text-sm select-none ${i === active ? "bg-accent text-accent-foreground" : ""}`}
+              >
+                <span className={`truncate ${group ? "" : "text-muted-foreground"}`}>{group || "未分组"}</span>
+                {group && <span className="tnum ml-auto shrink-0 text-xs text-muted-foreground">{counts.get(group)} 台</span>}
+                {group === name && <Check className="absolute right-2 size-4" />}
+              </div>
+            </div>
+          ))}
+          {fresh && <p className="px-2 py-1.5 text-xs text-muted-foreground">新分组「{name}」，保存后生效</p>}
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+// Puts the nodes ticked here into one group, or, with the name left empty, out
+// of any. Renaming or dissolving a group is the same act: filter the picker to
+// it, tick all, then type the new name or clear it. One request, applied to all
+// of them or none.
+function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: () => void }) {
+  const [name, setName] = useState("")
+  const [chosen, setChosen] = useState<Set<number>>(new Set())
+  const [saving, setSaving] = useState(false)
+  const group = name.trim()
+  // Counted against the live list, so a node deleted meanwhile is not sent.
+  const ids = nodes.filter((n) => chosen.has(n.id)).map((n) => n.id)
+  const pick = (list: Node[], on: boolean) =>
+    setChosen((old) => {
+      const next = new Set(old)
+      for (const n of list) {
+        if (on) next.add(n.id)
+        else next.delete(n.id)
+      }
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
+    try {
+      await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { group } }) })
+      toast.success(group ? `已把 ${ids.length} 台设为「${group}」` : `已把 ${ids.length} 台移出分组`)
+      onClose()
+      onSaved()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>设置分组</DialogTitle>
+          <DialogDescription className="leading-relaxed">
+            勾选节点，设为同一个分组。改名或解散：先筛选出这个分组、全选，再填新名字或清空。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <Field label="分组名" hint="公开页可见，最多 13 字；留空为移出分组">
+            <GroupInput nodes={nodes} value={name} onChange={setName} />
+          </Field>
+          <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button onClick={save} disabled={saving || !ids.length} className="max-w-full gap-0">
+            <span className="truncate">{group ? `设为「${group}」` : "移出分组"}</span>
+            {ids.length > 0 && <span className="tnum shrink-0">（{ids.length} 台）</span>}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
 
 function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
   title: string
@@ -386,8 +618,9 @@ function CreateNode({ onClose, onSaved }: {
   )
 }
 
-function NodeForm({ node, onClose, onSaved }: {
+function NodeForm({ node, nodes, onClose, onSaved }: {
   node: Node
+  nodes: Node[]
   onClose: () => void
   onSaved: () => void
 }) {
@@ -403,8 +636,7 @@ function NodeForm({ node, onClose, onSaved }: {
   const pristine = useRef(traffic)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
   // What each address box falls back to when left empty.
-  const automatic = (v6: boolean) =>
-    addresses({ ...node, ipv4_pin: "", ipv6_pin: "" }).find((a) => a.address.includes(":") === v6)?.address ?? "无"
+  const automatic = (v6: boolean) => (v6 ? node.ipv6_auto : node.ipv4_auto) || "无"
 
   async function save() {
     if (!form.name.trim()) return toast.error("请填写节点名称")
@@ -412,6 +644,7 @@ function NodeForm({ node, onClose, onSaved }: {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      group: (form.group ?? "").trim(),
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
@@ -459,8 +692,11 @@ function NodeForm({ node, onClose, onSaved }: {
               <Field label="名称">
                 <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
               </Field>
-              <Field label="备注">
-                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途，仅管理员可见" />
+              <Field label="分组" hint="公开页可见，留空为未分组">
+                <GroupInput nodes={nodes} value={form.group ?? ""} onChange={(v) => set("group", v)} />
+              </Field>
+              <Field label="备注" className="sm:col-span-2">
+                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="仅管理员可见" />
               </Field>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -481,7 +717,7 @@ function NodeForm({ node, onClose, onSaved }: {
               <Field label="计算方式">
                 <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
                   <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent>
+                  <SelectContent position="popper">
                     {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
                       <SelectItem key={k} value={k}>{v}</SelectItem>
                     ))}
@@ -598,7 +834,7 @@ function BillingForm({ node, onClose, onSaved }: {
             <Field label="货币">
               <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
+                <SelectContent position="popper">
                   {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => (
                     <SelectItem key={c} value={c}>{c}</SelectItem>
                   ))}
@@ -610,7 +846,7 @@ function BillingForm({ node, onClose, onSaved }: {
             <Field label="付款周期">
               <Select value={form.billing_cycle} onValueChange={(v) => set("billing_cycle", v)}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
+                <SelectContent position="popper">
                   {Object.entries(CYCLES).map(([k, v]) => (
                     <SelectItem key={k} value={k}>{v}</SelectItem>
                   ))}
@@ -642,8 +878,14 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, `--interval ${seconds}`, ...ifaceArg(iface)])
+function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
+}
+
+// Left out untouched, as an untouched --iface is: a rerun then keeps what the
+// machine already has.
+function intervalArg(seconds: number | undefined) {
+  return seconds === undefined ? [] : [`--interval ${seconds}`]
 }
 
 // '' is how install.sh is told to clear a value it would otherwise keep; a
@@ -655,15 +897,38 @@ function ifaceArg(iface: string | undefined) {
 // One command for a batch of machines. The key belongs to the hub, is valid only
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
-// used directly in a loop.
-function registerCommand(site: string, key: string, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...ifaceArg(iface)])
+// sent to every machine as it is.
+function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface)])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
 // node is deleted.
 function uninstallCommand(site: string) {
   return scriptCommand(site, () => ["--uninstall"])
+}
+
+// Also the same for every node: install.sh reads the token and the hub address
+// from the machine's own env file.
+function upgradeCommand(site: string) {
+  return scriptCommand(site, () => ["--upgrade"])
+}
+
+export type Versions = { hub: string; hub_latest: string; agent_latest: string; notice: boolean }
+
+/**
+ * What is running and what is published. Read once per panel load: the hub holds
+ * the answer for six hours, so this costs a GitHub lookup a few times a day at
+ * most, and nothing at all while nobody opens the panel.
+ *
+ * A hub that cannot reach github.com answers with empty latest fields, which
+ * render as no update rather than as an error.
+ */
+function useVersions() {
+  const [versions, setVersions] = useState<Versions | null>(null)
+  const load = useCallback(() => api<Versions>("/version").then(setVersions).catch(() => {}), [])
+  useEffect(() => { load() }, [load])
+  return { versions, reload: load }
 }
 
 // The window lives on the hub; this reads it back and counts down, which is also
@@ -712,7 +977,8 @@ function RegisterDialog({ site, reg, onClose }: {
   onClose: () => void
 }) {
   const iface = useIfaceOption(undefined)
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, iface.flag) : ""
+  const interval = useIntervalOption()
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -725,10 +991,11 @@ function RegisterDialog({ site, reg, onClose }: {
           {/* One string: JSX turns a line break inside CJK text into a visible space. */}
           <p className="text-sm text-muted-foreground">
             {"开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在列表里，" +
-              "名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。"}
+              "名字默认取它的 hostname。命令里没有任何一台机器的凭证，可以同时发给多台机器。"}
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
+            <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
           </section>
           {reg.left > 0 ? (
@@ -737,6 +1004,18 @@ function RegisterDialog({ site, reg, onClose }: {
               <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
                 {command || "网卡名有误，改正后显示命令"}
               </Command>
+              {/* Per machine, so it cannot be part of the one command. */}
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
+                <a
+                  className="ml-1 underline underline-offset-2 hover:text-foreground"
+                  href="https://monitor-document.pages.dev/install/batch"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  批量执行的做法
+                </a>
+              </p>
               <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
                 <Button variant="outline" size="sm" onClick={reg.close}>立即关闭</Button>
               </OptionRow>
@@ -753,6 +1032,43 @@ function RegisterDialog({ site, reg, onClose }: {
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// The reporting interval both install dialogs offer, opening on the node's
+// current one where the hub has read it from the reports. `flag` stays
+// undefined until the field is changed, including back to what it opened on.
+function useIntervalOption(current?: number | null) {
+  const [typed, setTyped] = useState<string>()
+  const text = typed ?? String(current ?? 1)
+  const seconds = Math.min(3600, Math.max(1, Math.round(Number(text) || 1)))
+  return { typed: text, setTyped, current, flag: typed === undefined ? undefined : seconds }
+}
+
+function IntervalOption({ option, batch = false }: { option: ReturnType<typeof useIntervalOption>; batch?: boolean }) {
+  return (
+    <OptionRow
+      title="上报间隔"
+      hint={batch ? "1–3600 秒，默认 1 秒。这一批机器都按这个间隔上报，机器多时可以调大" : (
+        <>
+          1–3600 秒，默认 1 秒。不改动时沿用机器上原有的间隔
+          {option.current && <span className="mt-0.5 block">当前：{option.current} 秒</span>}
+        </>
+      )}
+    >
+      <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
+        {/* Text rather than number: no spinner arrows, and no wheel changing
+            the value under a passing scroll. */}
+        <Input
+          inputMode="numeric"
+          value={option.typed}
+          onChange={(e) => option.setTyped(e.target.value.replace(/\D/g, ""))}
+          aria-label="上报间隔（秒）"
+          className="tnum h-8 w-20 bg-background text-right"
+        />
+        秒
+      </span>
+    </OptionRow>
   )
 }
 
@@ -823,13 +1139,12 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   onRotated: () => void
 }) {
   const [token, setToken] = useState(node.token ?? "")
-  const [interval, setInterval] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
+  const interval = useIntervalOption(node.interval)
 
-  const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const command = token && iface.valid ? installCommand(site, token, seconds, iface.flag) : ""
+  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
 
   async function rotate() {
     setRotating(true)
@@ -851,24 +1166,14 @@ function InstallDialog({ node, site, onClose, onRotated }: {
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
+          {/* The one place a single node's agent version is shown, and what an
+              issue report asks for. Empty until the node has reported once. */}
+          {node.agent_version && <DialogDescription>当前 agent v{node.agent_version}</DialogDescription>}
         </DialogHeader>
         <div className="space-y-5">
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
-            <OptionRow title="上报间隔" hint="1–3600 秒，默认 1 秒">
-              <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
-                {/* Text rather than number: no spinner arrows, and no wheel
-                    changing the value under a passing scroll. */}
-                <Input
-                  inputMode="numeric"
-                  value={interval}
-                  onChange={(e) => setInterval(e.target.value.replace(/\D/g, ""))}
-                  aria-label="上报间隔（秒）"
-                  className="tnum h-8 w-20 bg-background text-right"
-                />
-                秒
-              </span>
-            </OptionRow>
+            <IntervalOption option={interval} />
             <IfaceOption option={iface} />
           </section>
           <section className="space-y-2 border-t pt-5">
@@ -906,7 +1211,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
-function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
+function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -916,13 +1221,15 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
   const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
+  const [grouping, setGrouping] = useState(false)
   const drag = useDragOrder(nodes, "/nodes/order", refresh)
   const order = drag.order
   // `order` itself stays whole, because the order sent on drop is the order of
   // every node.
-  const visible = searchNodes(order, query)
-  const searching = query.trim() !== ""
-  const uninstall = canProvision ? uninstallCommand(site) : ""
+  const visible = inGroup(searchNodes(order, query), group)
+  const searching = query.trim() !== "" || group !== "all"
+  const uninstall = refusal ? "" : uninstallCommand(site)
 
   async function remove() {
     if (!deleting) return
@@ -941,15 +1248,21 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
 
   return (
     <div className="space-y-4">
-      {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
+      {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
+        <div className="mr-auto flex w-full gap-2 sm:w-auto">
+          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
+          <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+        </div>
+        <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
+          <Layers /> 分组
+        </Button>
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
-        <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
+        <Button variant="outline" disabled={!!refusal} onClick={() => setRegistering(true)}>
           <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
         </Button>
-        <Button disabled={!canProvision} onClick={() => setCreating(true)}>
+        <Button disabled={!!refusal} onClick={() => setCreating(true)}>
           <Plus /> 添加节点
         </Button>
       </div>
@@ -986,7 +1299,10 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                         offers only its own rows to drop onto, so the index below
                         is the full one exactly while nothing is filtered out. */}
                     <DragHandle id={n.id} index={index} name={n.name} disabled={searching} drag={drag} />
-                    <div className="min-w-0 font-medium">{n.name}</div>
+                    <div className="min-w-0">
+                      <div className="font-medium">{n.name}</div>
+                      {n.group && <div className="truncate text-xs text-muted-foreground">{n.group}</div>}
+                    </div>
                     {n.country && (
                       <Badge
                         variant="outline"
@@ -1028,7 +1344,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
+                  <Button variant="ghost" size="icon" disabled={!!refusal} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
@@ -1070,10 +1386,12 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
       {editing && (
         <NodeForm
           node={editing}
+          nodes={nodes}
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />
       )}
+      {grouping && <GroupDialog nodes={order} onClose={() => setGrouping(false)} onSaved={refresh} />}
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
@@ -1330,6 +1648,179 @@ type Theme = {
   // 内置主题在二进制里，没有目录可删。装上一份同名的会顶替它，那一份就是普通
   // 主题，删掉之后内置的重新顶上。
   builtin: boolean
+  // theme.json 里声明的设置表单，原样转过来，由 configFields 挑出能画的字段。
+  config?: unknown
+}
+
+// 主题在 theme.json 里声明的设置。hub 只存与默认值不同的项，其余由主题用自己的默认值补上，
+// 所以主题作者日后改了某个默认值，没动过这一项的站点会跟着变。
+//
+// 字段不多时是一列；多了改成宽对话框：按分组标题分节，左侧切换，右侧两列，
+// 否则几十项排成一条细长的列表。有改动的节在导航上带一个点。
+function ThemeSettings({ theme, saved, onClose }: {
+  theme: Theme
+  saved: Record<string, unknown>
+  onClose: () => void
+}) {
+  const form = configForm(theme.config)
+  const fields = form.filter((entry): entry is ConfigField => entry.type !== "title")
+  const sections = configSections(form)
+  const large = fields.length > 6
+  const paged = large && sections.length > 1
+  const [current, setCurrent] = useState(0)
+  const [values, setValues] = useState(() => configValues(fields, saved))
+  // What the save builds on. Keys the form does not declare are kept, except
+  // after 恢复默认: that also clears them, the only way from the panel to drop
+  // a value, publicly readable, left by a field the theme has since removed.
+  const [base, setBase] = useState(saved)
+  const [saving, setSaving] = useState(false)
+  const set = (key: string, value: unknown) => setValues((old) => ({ ...old, [key]: value }))
+  const label = (field: ConfigField) => field.label || field.key
+  // A number box holds its text while being edited; an empty one holds no
+  // number, where Number("") would read as 0.
+  const typed = (f: ConfigField) =>
+    f.type !== "number" ? values[f.key] : values[f.key] === "" ? NaN : Number(values[f.key])
+  const differs = (f: ConfigField) => typed(f) !== f.default
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault()
+    // The browser checks required/min/max only on the boxes on screen; a
+    // section switched away from is no longer rendered, so its numbers are
+    // checked here and the offending one brought back into view.
+    const invalid = fields.find((f) => f.type === "number" && !fits(f, typed(f)))
+    if (invalid) {
+      setCurrent(Math.max(0, sections.findIndex((section) => section.fields.includes(invalid))))
+      const range =
+        invalid.min !== undefined && invalid.max !== undefined ? `${invalid.min}–${invalid.max} 之间的`
+        : invalid.min !== undefined ? `不小于 ${invalid.min} 的`
+        : invalid.max !== undefined ? `不大于 ${invalid.max} 的` : ""
+      return toast.error(`「${label(invalid)}」要填${range}数字`)
+    }
+    setSaving(true)
+    try {
+      await api(`/themes/${theme.short}/config`, {
+        method: "PUT",
+        body: JSON.stringify(configOverrides(fields, base, Object.fromEntries(fields.map((f) => [f.key, typed(f)])))),
+      })
+      toast.success("主题设置已保存，公开页刷新后生效")
+      onClose()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const input = (field: ConfigField) =>
+    field.type === "boolean" ? (
+      <OptionRow key={field.key} title={label(field)} hint={field.help} toggle>
+        <Switch checked={values[field.key] as boolean} onCheckedChange={(v) => set(field.key, v)} />
+      </OptionRow>
+    ) : (
+      <Field key={field.key} label={label(field)} hint={field.help} className={large && field.type === "text" ? "sm:col-span-2" : ""}>
+        {field.type === "text" ? (
+          <textarea
+            rows={4}
+            className={`${TEXT_BOX} text-sm`}
+            value={values[field.key] as string}
+            onChange={(e) => set(field.key, e.target.value)}
+          />
+        ) : field.type === "select" ? (
+          <Select value={values[field.key] as string} onValueChange={(v) => set(field.key, v)}>
+            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent position="popper">
+              {field.options!.map((o) => (
+                <SelectItem key={o.value} value={o.value}>{o.label || o.value}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : field.type === "number" ? (
+          <Input
+            type="number"
+            required
+            step="any"
+            min={field.min}
+            max={field.max}
+            value={String(values[field.key])}
+            onChange={(e) => set(field.key, e.target.value)}
+          />
+        ) : (
+          <Input value={values[field.key] as string} onChange={(e) => set(field.key, e.target.value)} />
+        )}
+      </Field>
+    )
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        className={large ? "flex h-[min(46rem,calc(100dvh-2rem))] flex-col overflow-hidden sm:max-w-4xl" : "sm:max-w-lg"}
+      >
+        <DialogHeader>
+          <DialogTitle>{theme.name} 设置</DialogTitle>
+          <DialogDescription className="leading-relaxed">
+            保存后公开页刷新即生效，更新、重装主题都不会丢失。这里填的内容所有访客都能看到，不要填密码或密钥。
+          </DialogDescription>
+        </DialogHeader>
+        <form className="flex min-h-0 flex-1 flex-col gap-4" onSubmit={save}>
+          <div className="flex min-h-0 flex-1 flex-col gap-4 sm:flex-row">
+            {paged && (
+              <nav className="-mx-1 flex shrink-0 gap-1 overflow-x-auto px-1 pb-1 sm:mx-0 sm:w-48 sm:flex-col sm:overflow-y-auto sm:px-0">
+                {sections.map((section, index) => (
+                  <button
+                    key={index}
+                    type="button"
+                    aria-current={index === current}
+                    onClick={() => setCurrent(index)}
+                    className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm transition-colors ${
+                      index === current ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                    }`}
+                  >
+                    <span className="whitespace-nowrap sm:whitespace-normal">{section.label}</span>
+                    {section.fields.some(differs) && (
+                      <span className="ml-auto size-1.5 shrink-0 rounded-full bg-primary" title="有改动" />
+                    )}
+                  </button>
+                ))}
+              </nav>
+            )}
+            <div className={`min-h-0 flex-1 ${large ? "overflow-y-auto pr-1" : ""}`}>
+              <div className={`grid items-start gap-4 ${large ? "sm:grid-cols-2" : ""}`}>
+                {paged
+                  ? sections[current].fields.map(input)
+                  : form.map((entry, index) =>
+                      entry.type === "title" ? (
+                        <h3 key={`title-${index}`} className={`pt-2 text-sm font-semibold first:pt-0 ${large ? "sm:col-span-2" : ""}`}>
+                          {entry.label}
+                        </h3>
+                      ) : (
+                        input(entry)
+                      ),
+                    )}
+              </div>
+            </div>
+          </div>
+          {/* One row on a phone as well: stacked, the three buttons would take a
+              third of the height the fields have. */}
+          <DialogFooter className="flex-row items-center border-t pt-4">
+            <Button
+              type="button"
+              variant="ghost"
+              className="mr-auto"
+              onClick={() => {
+                setValues(Object.fromEntries(fields.map((f) => [f.key, f.default])))
+                setBase({})
+              }}
+            >
+              {paged ? "全部恢复默认" : "恢复默认"}
+            </Button>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>保存</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function Themes() {
@@ -1337,6 +1828,7 @@ function Themes() {
   const [busy, setBusy] = useState("")
   const [doomed, setDoomed] = useState<Theme | null>(null)
   const [zoomed, setZoomed] = useState<Theme | null>(null)
+  const [configuring, setConfiguring] = useState<{ theme: Theme; saved: Record<string, unknown> } | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
   const load = () =>
@@ -1385,6 +1877,16 @@ function Themes() {
       toast.error((e as Error).message)
     } finally {
       setBusy("")
+    }
+  }
+
+  // Read on opening rather than inside the dialog, so the form starts from what
+  // is saved instead of flashing the defaults first.
+  async function configure(theme: Theme) {
+    try {
+      setConfiguring({ theme, saved: await api(`/themes/${theme.short}/config`) })
+    } catch (e) {
+      toast.error((e as Error).message)
     }
   }
 
@@ -1473,6 +1975,11 @@ function Themes() {
                 <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
                   {theme.selected ? "使用中" : "使用"}
                 </Button>
+                {configFields(theme.config).length > 0 && (
+                  <Button size="icon" variant="ghost" title="主题设置" onClick={() => configure(theme)}>
+                    <SlidersHorizontal />
+                  </Button>
+                )}
                 {updatable(theme) && (
                   <Button
                     size="icon"
@@ -1519,6 +2026,8 @@ function Themes() {
           </DialogContent>
         </Dialog>
       )}
+
+      {configuring && <ThemeSettings {...configuring} onClose={() => setConfiguring(null)} />}
 
       {doomed && (
         <ConfirmDialog
@@ -1633,8 +2142,9 @@ function SettingsTab() {
   )
 }
 
-const TEXTAREA =
-  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+const TEXT_BOX =
+  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+const TEXTAREA = `${TEXT_BOX} font-mono text-xs`
 
 // One offline alert, filled in the way the hub fills a template: in a single pass,
 // JSON-escaped for the webhook body. Previews only; nothing here is sent.
@@ -1693,36 +2203,63 @@ function ChannelCard({ title, configured, children }: { title: string; configure
 }
 
 // Offline alerts are opt-in per node, so turning them on for a fleet needs one
-// place rather than one dialog per node.
+// place rather than one dialog per node. Ticks are a draft until 保存, like every
+// other form in the panel: a request per click would make each tick wait on a
+// round trip and a refresh before showing.
 function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const [busy, setBusy] = useState(false)
+  // Only the ticks changed here, by node id. A snapshot of every node's state
+  // would send back a node another session switched meanwhile.
+  const [draft, setDraft] = useState<Map<number, boolean>>(new Map())
+  const [saving, setSaving] = useState(false)
+  const on = (n: Node) => draft.get(n.id) ?? !!n.notify
+  const chosen = new Set(nodes.filter(on).map((n) => n.id))
+  // Against the live list, so a node deleted meanwhile is neither counted nor sent.
+  const turnOn = nodes.filter((n) => on(n) && !n.notify).map((n) => n.id)
+  const turnOff = nodes.filter((n) => !on(n) && n.notify).map((n) => n.id)
+  const dirty = turnOn.length + turnOff.length > 0
 
-  async function apply(targets: Node[], on: boolean) {
-    setBusy(true)
+  // Kept after a save until the list reports it, so the ticks do not flash back
+  // to the old state for a round trip. Adjusted during render rather than in an
+  // effect, as it follows from props alone.
+  if (draft.size && !dirty && !saving) setDraft(new Map())
+
+  const pick = (list: Node[], value: boolean) =>
+    setDraft((old) => {
+      const next = new Map(old)
+      for (const n of list) next.set(n.id, value)
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
     try {
-      // Awaited in turn, the requests would cost one round trip per node, and
-      // the two-second stream would render each one as it lands.
-      await Promise.all(
-        targets
-          .filter((n) => !!n.notify !== on)
-          .map((n) => api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })),
-      )
+      for (const [ids, on] of [[turnOn, true], [turnOff, false]] as const) {
+        if (ids.length) await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { notify: on } }) })
+      }
+      toast.success("离线通知已保存")
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       refresh()
-      setBusy(false)
+      setSaving(false)
     }
   }
 
-  const enabled = new Set(nodes.filter((n) => n.notify).map((n) => n.id))
+  const pending = [turnOn.length && `打开 ${turnOn.length} 台`, turnOff.length && `关闭 ${turnOff.length} 台`].filter(Boolean)
   return (
     <Card className="gap-4 p-5">
       <div>
         <h3 className="text-sm font-medium">离线通知</h3>
-        <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled.size} / {nodes.length} 台</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          按节点打开，默认关。已打开 {nodes.filter((n) => n.notify).length} / {nodes.length} 台
+          {pending.length > 0 && <span className="text-foreground">，待保存：{pending.join("、")}</span>}
+        </p>
       </div>
-      <NodePicker nodes={nodes} chosen={enabled} onPick={apply} disabled={busy} />
+      <NodePicker nodes={nodes} chosen={chosen} onPick={pick} disabled={saving} />
+      <div className="flex justify-end gap-2">
+        <Button size="sm" variant="ghost" disabled={!dirty || saving} onClick={() => setDraft(new Map())}>撤销</Button>
+        <Button size="sm" disabled={!dirty || saving} onClick={save}>保存</Button>
+      </div>
     </Card>
   )
 }
@@ -2186,6 +2723,178 @@ function Data() {
   )
 }
 
+const releaseUrl = (repo: string, version: string) => `https://github.com/monitor-probe/${repo}/releases/tag/v${version}`
+
+/** `v1.2.0 → v1.3.0` when something is published, the running version alone otherwise. */
+function VersionPair({ current, latest }: { current: string; latest: string }) {
+  if (!behind(current, latest)) {
+    return <span className="text-xs text-muted-foreground">{latest ? `已是最新 v${current}` : `当前 v${current}`}</span>
+  }
+  return (
+    <span className="text-xs text-muted-foreground">
+      v{current} <span className="px-0.5">→</span>
+      <span className="ml-0.5 font-medium text-foreground">v{latest}</span>
+    </span>
+  )
+}
+
+/** Outdated nodes grouped by the version they run, oldest first. */
+function byVersion(nodes: Node[]): [string, Node[]][] {
+  const groups = new Map<string, Node[]>()
+  for (const n of nodes) groups.set(n.agent_version, [...(groups.get(n.agent_version) ?? []), n])
+  return [...groups].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+}
+
+/**
+ * What is published for the hub and the agents. Its own route rather than a
+ * banner on the node list; the dot in the navigation is what says there is
+ * something here.
+ *
+ * The hub card names the release alone: how to take it depends on how the hub
+ * was installed, script or container, which the hub cannot tell.
+ */
+function Update({ versions, reload, nodes, site, refusal }: {
+  versions: Versions | null
+  reload: () => void
+  nodes: Node[]
+  site: string
+  refusal: string
+}) {
+  const [saving, setSaving] = useState(false)
+  if (!versions) return null
+  const outdated = outdatedAgents(nodes, versions.agent_latest)
+  const offline = outdated.filter((n) => !n.online).length
+  const upgrade = refusal ? "" : upgradeCommand(site)
+  const unreachable = !versions.hub_latest && !versions.agent_latest
+
+  // Applied on the spot: one switch, and the navigation changes with it.
+  async function setNotice(on: boolean) {
+    setSaving(true)
+    try {
+      await api("/settings", { method: "PUT", body: JSON.stringify({ update_notice: on ? "on" : "off" }) })
+      reload()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      {unreachable && (
+        <Card className="p-5">
+          <p className="text-sm text-muted-foreground">
+            查不到最新版本：这台 hub 连不上 api.github.com。GitHub 代理不作用于这一项。
+          </p>
+        </Card>
+      )}
+
+      <Card className="gap-4 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-medium">hub</h3>
+          <div className="flex items-center gap-3">
+            <VersionPair current={versions.hub} latest={versions.hub_latest} />
+            {behind(versions.hub, versions.hub_latest) && (
+              <Button size="sm" variant="ghost" asChild>
+                <a href={releaseUrl("monitor", versions.hub_latest)} target="_blank" rel="noreferrer">
+                  发布说明
+                </a>
+              </Button>
+            )}
+          </div>
+        </div>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-medium">agent</h3>
+          <span className="text-xs text-muted-foreground">
+            {versions.agent_latest
+              ? outdated.length
+                ? <>最新 v{versions.agent_latest} · <span className="font-medium text-foreground">{outdated.length} 台待升级</span></>
+                : `全部已是最新 v${versions.agent_latest}`
+              : "查不到版本"}
+          </span>
+        </div>
+        {/* Also where the lookup failed: the command does not depend on it, and a
+            hub that fetches agents through the GitHub proxy cannot read tags. */}
+        {(outdated.length > 0 || !versions.agent_latest) && (
+          <>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              以 root 在每台机器上执行一次。不含凭证，沿用机器上已有的设置，不会新建节点。
+            </p>
+            {upgrade ? (
+              <>
+                <Command>{upgrade}</Command>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" variant="secondary" onClick={() => copy(upgrade)}>
+                    <Copy className="size-4" /> 复制命令
+                  </Button>
+                  {versions.agent_latest && (
+                    <Button size="sm" variant="ghost" asChild>
+                      <a href={releaseUrl("agent", versions.agent_latest)} target="_blank" rel="noreferrer">
+                        发布说明
+                      </a>
+                    </Button>
+                  )}
+                  <Button size="sm" variant="ghost" asChild>
+                    <a href="https://monitor-document.pages.dev/install/batch" target="_blank" rel="noreferrer">
+                      批量升级的做法
+                    </a>
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <p className="text-xs text-muted-foreground">{refusal}</p>
+            )}
+            {/* Collapsed until asked for, grouped by version, and bounded in height
+                once open, so any number of nodes stays one line on the page. */}
+            {outdated.length > 0 && (
+              <details className="group border-t pt-3">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-md text-xs text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+                  <span className="flex items-center gap-1.5">
+                    <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
+                    待升级的节点
+                  </span>
+                  {offline > 0 && <span>其中 {offline} 台离线</span>}
+                </summary>
+                <div className="mt-3 max-h-60 space-y-3 overflow-auto">
+                  {byVersion(outdated).map(([version, group]) => (
+                    <div key={version} className="space-y-1.5">
+                      <div className="text-xs text-muted-foreground">v{version} · {group.length} 台</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {group.map((n) => (
+                          <Badge
+                            key={n.id}
+                            variant="secondary"
+                            className={`font-normal ${n.online ? "" : "opacity-50"}`}
+                            title={n.online ? undefined : "离线"}
+                          >
+                            {n.name}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+          </>
+        )}
+      </Card>
+
+      <OptionRow
+        title="更新提醒"
+        hint="有新版本时在导航的「更新」旁显示小圆点。关闭只是不再显示圆点，这一页照常检查"
+        toggle
+      >
+        <Switch checked={versions.notice} disabled={saving} onCheckedChange={setNotice} />
+      </OptionRow>
+    </div>
+  )
+}
+
 // Each area is its own route rather than a tab, so a page can be linked to and a
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
@@ -2196,6 +2905,7 @@ const ADMIN_SECTIONS = [
   { path: "/admin/themes", label: "主题", icon: Palette },
   { path: "/admin/security", label: "安全", icon: Shield },
   { path: "/admin/settings", label: "设置", icon: Settings },
+  { path: "/admin/update", label: "更新", icon: ArrowUpCircle },
 ] as const
 
 export function Admin({
@@ -2204,15 +2914,21 @@ export function Admin({
   nodes,
   refresh,
   site,
-  canProvision,
+  refusal,
 }: {
   path: string
   go: (to: string) => void
   nodes: Node[]
   refresh: () => void
   site: string
-  canProvision: boolean
+  refusal: string
 }) {
+  const { versions, reload } = useVersions()
+  // One dot for both; the page separates them. Absent when switched off on that
+  // page, or when the lookup failed and the page has nothing to say.
+  const updates =
+    !!versions?.notice
+    && (behind(versions.hub, versions.hub_latest) || outdatedAgents(nodes, versions.agent_latest).length > 0)
   return (
     <div className="flex flex-col gap-6 md:flex-row">
       <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
@@ -2229,6 +2945,9 @@ export function Admin({
             >
               <Icon className="size-4" />
               {label}
+              {to === "/admin/update" && updates && (
+                <span className="ml-1 size-1.5 shrink-0 rounded-full bg-foreground md:ml-auto" title="有新版本" />
+              )}
             </button>
           )
         })}
@@ -2247,8 +2966,10 @@ export function Admin({
           <Security site={site} />
         ) : path === "/admin/settings" ? (
           <SettingsTab />
+        ) : path === "/admin/update" ? (
+          <Update versions={versions} reload={reload} nodes={nodes} site={site} refusal={refusal} />
         ) : (
-          <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} />
+          <Nodes nodes={nodes} refresh={refresh} site={site} refusal={refusal} />
         )}
       </div>
     </div>
