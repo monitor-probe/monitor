@@ -109,7 +109,7 @@ function GroupFilter({ nodes, value, onChange, className = "" }: {
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger className={className} aria-label="按分组筛选"><SelectValue /></SelectTrigger>
-      <SelectContent>
+      <SelectContent position="popper">
         <SelectItem value="all">全部分组</SelectItem>
         {groups.map((g) => <SelectItem key={g} value={`=${g}`}>{g}</SelectItem>)}
         <SelectItem value="none">未分组</SelectItem>
@@ -328,7 +328,7 @@ function GroupInput({ nodes, value, onChange }: {
         <div role="listbox" id={id} aria-label="已有分组" className="max-h-60 overflow-y-auto">
           {items.map((group, i) => (
             <div key={group || "\0"}>
-              {group === "" && <div className="-mx-1 my-1 h-px bg-border" />}
+              {group === "" && <div className="my-1 h-px bg-border" />}
               <div
                 id={`${id}-${i}`}
                 role="option"
@@ -584,7 +584,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
               <Field label="计算方式">
                 <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
                   <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent>
+                  <SelectContent position="popper">
                     {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
                       <SelectItem key={k} value={k}>{v}</SelectItem>
                     ))}
@@ -701,7 +701,7 @@ function BillingForm({ node, onClose, onSaved }: {
             <Field label="货币">
               <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
+                <SelectContent position="popper">
                   {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => (
                     <SelectItem key={c} value={c}>{c}</SelectItem>
                   ))}
@@ -713,7 +713,7 @@ function BillingForm({ node, onClose, onSaved }: {
             <Field label="付款周期">
               <Select value={form.billing_cycle} onValueChange={(v) => set("billing_cycle", v)}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
+                <SelectContent position="popper">
                   {Object.entries(CYCLES).map(([k, v]) => (
                     <SelectItem key={k} value={k}>{v}</SelectItem>
                   ))}
@@ -1629,7 +1629,7 @@ function ThemeSettings({ theme, saved, onClose }: {
         ) : field.type === "select" ? (
           <Select value={values[field.key] as string} onValueChange={(v) => set(field.key, v)}>
             <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-            <SelectContent>
+            <SelectContent position="popper">
               {field.options!.map((o) => (
                 <SelectItem key={o.value} value={o.value}>{o.label || o.value}</SelectItem>
               ))}
