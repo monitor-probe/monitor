@@ -4,7 +4,9 @@
 # are checked. Needs curl and jq.
 #   scripts/e2e.sh <monitor-hub> <monitor-agent>
 # CI pairs each repository's build with the other's latest release, the
-# combination every upgrade of either side meets first.
+# combination every upgrade of either side meets first. Agent CI runs this file
+# from the hub's main against the latest hub release, so a change here must keep
+# working with that release.
 set -eu
 
 HUB=$1
@@ -13,13 +15,27 @@ URL=http://127.0.0.1:${E2E_PORT:-9951}
 DIR=$(mktemp -d)
 HUB_PID=
 AGENT_PID=
-trap 'kill $HUB_PID $AGENT_PID 2>/dev/null || true; rm -rf "$DIR"' EXIT
+
+logs() {
+	for log in hub agent; do
+		if [ -f "$DIR/$log.log" ]; then
+			echo "--- $log.log" >&2
+			cat "$DIR/$log.log" >&2
+		fi
+	done
+}
+
+# Both logs follow any failure, including a curl or jq that `set -e` stops on.
+cleanup() {
+	status=$?
+	kill $HUB_PID $AGENT_PID 2>/dev/null || true
+	[ "$status" -eq 0 ] || logs
+	rm -rf "$DIR"
+}
+trap cleanup EXIT
 
 fail() {
 	echo "e2e: $*" >&2
-	for log in hub agent; do
-		[ -f "$DIR/$log.log" ] && { echo "--- $log.log" >&2; cat "$DIR/$log.log" >&2; }
-	done
 	exit 1
 }
 
@@ -54,12 +70,14 @@ COOKIE=$(curl -fsS -D - -o /dev/null -H 'content-type: application/json' -d "{\"
 curl -fsS -o /dev/null -H "Cookie: $COOKIE" -H 'Origin: https://hub.example.com' -H 'Sec-Fetch-Site: same-origin' \
 	-H 'content-type: application/json' -d '{"name":"e2e","remark":"e2e-remark"}' "$URL/api/nodes" ||
 	fail "creating a node was refused"
-TOKEN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes" | jq -r '.nodes[0].token')
+TOKEN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes" | jq -r '.nodes[0].token // empty')
+[ -n "$TOKEN" ] || fail "the panel shows no token for the new node"
 
 "$AGENT" --server "$URL" --token "$TOKEN" --interval 1 >"$DIR/agent.log" 2>&1 &
 AGENT_PID=$!
 wait_for "the node to report" reported
-# The first report of a connection is where the hub checks the field contract.
+# The panel's frame is cached for up to 1.9 s, and nothing an agent does renews
+# it, so the one taken above for the token may still predate the connection.
 sleep 2
 
 PUBLIC=$(curl -fsS "$URL/api/nodes")
@@ -67,13 +85,14 @@ ADMIN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes")
 
 # The public check below would pass on a node that has no private fields at
 # all, so the panel's view must carry them first.
-echo "$ADMIN" | jq -e '.nodes[0] | .remark == "e2e-remark" and .hostname != "" and .ip != "" and .token != ""' \
+echo "$ADMIN" | jq -e '.nodes[0] | .remark == "e2e-remark" and (.hostname // "") != "" and (.ip // "") != "" and (.token // "") != ""' \
 	>/dev/null || fail "the panel's view lacks the private fields: $ADMIN"
 
 # No address, hostname, note or token reaches a visitor, neither under its own
 # key nor as a value anywhere else in the response.
 LEAKED=$(jq -nc --argjson a "$ADMIN" --argjson p "$PUBLIC" '
-	[$p.nodes[0] | keys[] | select(IN("ip", "ipv4", "ipv6", "addresses", "hostname", "remark", "token"))]
+	[$p.nodes[0] | keys[] | select(IN("ip", "ipv4", "ipv6", "ipv4_pin", "ipv6_pin", "ipv4_auto", "ipv6_auto", "addresses", "hostname",
+		"remark", "token"))]
 	+ ([$p | .. | strings] as $shown
 		| [$a.nodes[0] | .ip, .ipv4, .ipv6, .hostname, .remark, .token | select(. != "" and IN($shown[]))])')
 [ "$LEAKED" = "[]" ] || fail "the public view discloses $LEAKED: $PUBLIC"

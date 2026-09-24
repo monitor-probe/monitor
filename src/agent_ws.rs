@@ -606,6 +606,7 @@ fn check_contract(node_id: i64, metrics: &serde_json::Value) {
     let missing: Vec<&str> =
         report_fields().filter(|k| metrics.get(k).is_none_or(|v| v.is_null() || *v == "")).collect();
     if !missing.is_empty() {
+        // scripts/e2e.sh fails on "reports without"; the two change together.
         warn!("node {node_id} reports without {missing:?}: this agent and this hub are out of step, and what depends on those fields -- traffic, charts, the default theme's live view -- will not show them");
     }
 }
