@@ -1,22 +1,10 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, moved, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
+import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
 assert.deepEqual(changes({ expires_at: "2030-01-01" as string | null }, { expires_at: null }), { expires_at: null })
-// A drag moves one row: both tables' reorder go through this.
-assert.deepEqual(moved([1, 2, 3], 0, 2), [2, 3, 1])
-assert.deepEqual(moved([1, 2, 3], 2, 0), [3, 1, 2])
-assert.deepEqual(moved(["a"], 0, 0), ["a"])
-// An index outside the list is not a move, and the caller tells the two apart by
-// identity rather than by comparing contents.
-const untouched = [1, 2, 3]
-assert.equal(moved(untouched, 1, 1), untouched)
-assert.equal(moved(untouched, 0, 3), untouched)
-assert.equal(moved(untouched, 3, 0), untouched)
-assert.equal(moved(untouched, 0, -1), untouched)
-assert.deepEqual(untouched, [1, 2, 3], "a refused move must not disturb the list it was given")
 assert.equal(provisioningSite("https://monitor.example.com:8443/"), "https://monitor.example.com:8443")
 for (const site of ["http://monitor.example.com", "https://127.0.0.1", "https://[::1]", "https://2130706433", "https://0x7f000001", "https://localhost", "https://user@monitor.example.com", "https://monitor.example.com/path"]) {
   assert.equal(provisioningSite(site), "", site)

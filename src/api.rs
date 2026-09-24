@@ -942,14 +942,14 @@ pub async fn update_nodes(
 }
 
 #[derive(Deserialize)]
-pub struct NodeOrder {
+pub struct Order {
     ids: Vec<i64>,
 }
 
 /// The list must name every node exactly once, checked inside the transaction
 /// that renumbers rather than here: re-reading the node list first would only
 /// race the write it guards.
-pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<NodeOrder>) -> Response {
+pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<Order>) -> Response {
     match app.db.reorder_nodes(&order.ids) {
         Ok(()) => {
             invalidate_snapshot(&app);
@@ -1030,32 +1030,11 @@ pub async fn ping_tasks(_: Admin, State(app): State<Shared>) -> Response {
     }
 }
 
-#[derive(Deserialize)]
-pub struct PingTaskOrder {
-    ids: Vec<i64>,
-}
-
-/// The list must name every probe exactly once, checked inside the transaction
-/// that renumbers rather than here, as in `reorder_nodes`.
-///
-/// Pushed to every connected agent as well: the order the panel lists the probes
-/// in is the order an agent runs them in, so a reorder that stopped at the
-/// database would leave the two disagreeing until the next reconnect.
-///
-/// Unlike `reorder_nodes` there is no snapshot to invalidate: `live_snapshot`
-/// renders nodes alone, and a probe reaches a browser only through its node's
-/// chart, which is queried per request.
-pub async fn reorder_ping_tasks(
-    _: Admin,
-    State(app): State<Shared>,
-    Json(order): Json<PingTaskOrder>,
-) -> Response {
+/// As `reorder_nodes`. Nothing is pushed to the agents: the list they run is in
+/// id order, see `ping_tasks_for`.
+pub async fn reorder_ping_tasks(_: Admin, State(app): State<Shared>, Json(order): Json<Order>) -> Response {
     match app.db.reorder_ping_tasks(&order.ids) {
-        Ok(()) => {
-            agent_ws::push_ping_tasks(&app);
-            Json(json!({"ok": true})).into_response()
-        }
-        // Every failure here indicates a malformed list from the caller.
+        Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => bad(&e.to_string()),
     }
 }
@@ -1913,18 +1892,9 @@ mod tests {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
-    /// Held by every test that reaches the `metrics` handler, which is the only
-    /// way to the history gate.
-    ///
-    /// The gate is a process-wide static, and one of those tests deliberately
-    /// holds every permit to watch a request be refused. libtest runs tests in
-    /// parallel by default, so without this the other test is refused too and
-    /// fails somewhere unrelated: it parses the 503's plain-text body as JSON and
-    /// reports "expected ident", naming neither the gate nor the test that took
-    /// it. Taking this lock is what a new test reaching `metrics` has to do.
-    ///
-    /// Tokio's mutex rather than the standard one, whose guard cannot be held
-    /// across an await without `clippy::await_holding_lock` refusing the build.
+    /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,
+    /// and a test holding all of its permits would refuse a parallel one with a
+    /// 503. Tokio's mutex, since the guard is held across awaits.
     static HISTORY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A lookup nobody can refresh must not hide an update all day, and a panel
@@ -2351,9 +2321,8 @@ mod tests {
         assert_eq!(m["net_rx"], 500);
         assert_eq!(m["ts"], base, "stamped with the bucket, so every series shares a grid");
 
-        // Keyed by task rather than by index: the rows of one bucket share a
-        // timestamp and are emitted in the panel's probe order, which this
-        // fixture does not arrange.
+        // Keyed by task rather than index: the order is the panel's, which
+        // `a_probe_chart_follows_the_panel_order` covers.
         let (rows, window_loss) = app.db.ping_records(id, base, 120).unwrap();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
@@ -3113,7 +3082,6 @@ mod tests {
     /// burst of legitimate requests.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
-        // This test holds every permit; see HISTORY_TESTS.
         let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
@@ -3211,7 +3179,6 @@ mod tests {
     /// every row behind it holding the write connection.
     #[tokio::test]
     async fn an_anonymous_history_window_stops_at_a_week() {
-        // Reaches the gate through `metrics`; see HISTORY_TESTS.
         let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
@@ -3385,36 +3352,5 @@ mod tests {
         for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
             assert!(!body.to_string().contains(secret), "{secret}");
         }
-    }
-
-    /// A reorder reaches two readers at once: the list the panel reads back, and
-    /// the list an already-connected agent is holding. Stopping at the database
-    /// would leave the agent running the probes in the old order until its next
-    /// reconnect, which on a steady link is days away.
-    #[tokio::test]
-    async fn reordering_probes_reaches_the_panel_and_the_connected_agents() {
-        let app = std::sync::Arc::new(app());
-        let id = node(&app, "n", true);
-        let (a, b) = (task(&app, vec![id]), task(&app, vec![id]));
-        let mut frames = connect(&app, id, json!({"cpu": 1.0}));
-        let order = || app.db.ping_tasks().unwrap().iter().map(|t| t.id).collect::<Vec<_>>();
-        let reorder = |ids: Vec<i64>| {
-            reorder_ping_tasks(Admin, axum::extract::State(app.clone()), Json(PingTaskOrder { ids }))
-        };
-        assert_eq!(order(), vec![a, b]);
-
-        assert_eq!(reorder(vec![b, a]).await.status(), StatusCode::OK);
-        assert_eq!(order(), vec![b, a], "the panel's next read is the new order");
-
-        let frame: Value = serde_json::from_str(&frames.try_recv().expect("a push")).unwrap();
-        assert_eq!(frame["method"], "ping.tasks");
-        let pushed: Vec<i64> =
-            frame["params"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
-        assert_eq!(pushed, vec![b, a], "the agent is handed the order it must run them in");
-
-        // A list that is not every probe is the caller's error rather than a
-        // failure of the hub, as in `reorder_nodes`.
-        assert_eq!(reorder(vec![b]).await.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(order(), vec![b, a], "a refused list changes nothing");
     }
 }

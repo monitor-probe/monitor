@@ -85,16 +85,7 @@ export type Node = {
   notify?: boolean
 }
 
-export type PingTask = {
-  id: number
-  name: string
-  target: string
-  interval: number
-  /** The panel's order. Written by the reorder endpoint, never by an edit. */
-  sort: number
-  nodes: number[]
-  auto_join: boolean
-}
+export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[]; auto_join: boolean }
 
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
 export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
@@ -111,19 +102,6 @@ export function inGroup<T extends Pick<Node, "group">>(nodes: T[], filter: strin
 /** Form snapshots must never overwrite fields the user did not edit. */
 export function changes<T extends object>(initial: T, values: Partial<T>): Partial<T> {
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== initial[key as keyof T])) as Partial<T>
-}
-
-/**
- * The list with the item at `from` moved to `to`. Both tables' drag reorder
- * through it, so the two move identically. A move onto itself, or an index
- * outside the list, returns the same array rather than splicing at a position
- * that would scramble the order: callers test for that by identity.
- */
-export function moved<T>(items: T[], from: number, to: number): T[] {
-  if (from === to || from < 0 || to < 0 || from >= items.length || to >= items.length) return items
-  const next = [...items]
-  next.splice(to, 0, ...next.splice(from, 1))
-  return next
 }
 
 /** One field of the settings form a theme declares under `config` in its `theme.json`. */
