@@ -71,6 +71,13 @@ export type Node = {
   /** Panel only. Set by hand, each replacing the address shown for its family. */
   ipv4_pin?: string
   ipv6_pin?: string
+  /** Panel only. What the hub shows: at most one per family, v4 first. */
+  addresses?: { address: string; source: Source }[]
+  /** Panel only. What each family shows with its pin cleared; empty for none. */
+  ipv4_auto?: string
+  ipv6_auto?: string
+  /** Panel only. The agent's reporting interval in seconds, read from its reports; null until two have arrived. */
+  interval?: number | null
   remark?: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
   token?: string
@@ -230,53 +237,8 @@ export function trafficCorrection(
   )
 }
 
-/**
- * Globally routable. v4 excludes RFC 1918, CGNAT, loopback, link-local, 0/8,
- * 192.0.0/24, 198.18/15 (the fake-IP range of TUN-mode proxies), multicast and
- * reserved; v6 counts 2000::/3 only, leaving out ULA and link-local. The agent
- * ranks its interfaces and the hub picks the country's address by the same
- * ranges; the three lists are to be changed together.
- */
-export function isPublic(ip: string): boolean {
-  if (ip.includes(":")) return (parseInt(ip.split(":")[0] || "0", 16) & 0xe000) === 0x2000
-  const [a, b, c] = ip.split(".").map(Number)
-  return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b < 128) ||
-    (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 0 && c === 0) ||
-    (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)))
-}
-
 /** Where a shown address comes from, which the panel gives as its tooltip. */
 export type Source = "manual" | "interface" | "exit" | "connection"
-
-/**
- * The addresses shown for a node: at most one per family, v4 first, the one the
- * machine is reached by. The agent reports its interfaces; `ip` is where its
- * connection arrived from, which the hub canonicalizes to dotted form for IPv4.
- *
- * Per family an address set by hand comes first, then a public one on the
- * interface. Failing both, where the interface holds only a private address of
- * the family the connection used -- NAT, or a proxy in front -- the connection's
- * public address, its exit, stands in. An exit in a family the interface does
- * not hold is a translator such as NAT64 or WARP and is left out.
- *
- * Private addresses appear only when nothing public is known, as where hub and
- * node share a network and they are all there is. `ip` alone is the fallback
- * for an agent reporting no interface.
- */
-export function addresses(
-  node: Pick<Node, "ip" | "ipv4" | "ipv6" | "ipv4_pin" | "ipv6_pin">,
-): { address: string; source: Source }[] {
-  const { ip = "", ipv4 = "", ipv6 = "", ipv4_pin = "", ipv6_pin = "" } = node
-  const family = (pin: string, held: string, v6: boolean): { address: string; source: Source } | null =>
-    pin ? { address: pin, source: "manual" }
-      : held && isPublic(held) ? { address: held, source: "interface" }
-      : held && isPublic(ip) && ip.includes(":") === v6 ? { address: ip, source: "exit" }
-      : null
-  const shown = [family(ipv4_pin, ipv4, false), family(ipv6_pin, ipv6, true)].filter((a) => a !== null)
-  if (shown.length) return shown
-  if (ipv4 || ipv6) return [ipv4, ipv6].filter(Boolean).map((address) => ({ address, source: "interface" }))
-  return ip ? [{ address: ip, source: "connection" }] : []
-}
 
 /** Installation commands require a TLS origin with a domain, never an IP. */
 export function provisioningSite(site: string): string {

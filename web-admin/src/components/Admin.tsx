@@ -13,7 +13,7 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -55,7 +55,7 @@ const SOURCES: Record<Source, string> = {
 // one into an ssh command is why they are shown. Where each came from is in the
 // tooltip, keeping the column to addresses alone.
 function Addresses({ node }: { node: Node }) {
-  const list = addresses(node)
+  const list = node.addresses ?? []
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
     <div className="flex flex-col items-start gap-y-0.5">
@@ -505,8 +505,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
   const pristine = useRef(traffic)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
   // What each address box falls back to when left empty.
-  const automatic = (v6: boolean) =>
-    addresses({ ...node, ipv4_pin: "", ipv6_pin: "" }).find((a) => a.address.includes(":") === v6)?.address ?? "无"
+  const automatic = (v6: boolean) => (v6 ? node.ipv6_auto : node.ipv4_auto) || "无"
 
   async function save() {
     if (!form.name.trim()) return toast.error("请填写节点名称")
@@ -748,8 +747,14 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, `--interval ${seconds}`, ...ifaceArg(iface)])
+function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
+}
+
+// Left out untouched, as an untouched --iface is: a rerun then keeps what the
+// machine already has.
+function intervalArg(seconds: number | undefined) {
+  return seconds === undefined ? [] : [`--interval ${seconds}`]
 }
 
 // '' is how install.sh is told to clear a value it would otherwise keep; a
@@ -761,11 +766,9 @@ function ifaceArg(iface: string | undefined) {
 // One command for a batch of machines. The key belongs to the hub, is valid only
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
-// sent to every machine as it is. An interval left untouched is left out, as an
-// untouched --iface is: a rerun then keeps what the machine already has.
+// sent to every machine as it is.
 function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined) {
-  const interval = seconds === undefined ? [] : [`--interval ${seconds}`]
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...interval, ...ifaceArg(iface)])
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface)])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -844,7 +847,7 @@ function RegisterDialog({ site, reg, onClose }: {
 }) {
   const iface = useIfaceOption(undefined)
   const interval = useIntervalOption()
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.edited ? interval.seconds : undefined, iface.flag) : ""
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -901,20 +904,26 @@ function RegisterDialog({ site, reg, onClose }: {
   )
 }
 
-// The reporting interval both install dialogs offer. `edited` stays false until
-// the field is changed, including back to 1.
-function useIntervalOption() {
+// The reporting interval both install dialogs offer, opening on the node's
+// current one where the hub has read it from the reports. `flag` stays
+// undefined until the field is changed, including back to what it opened on.
+function useIntervalOption(current?: number | null) {
   const [typed, setTyped] = useState<string>()
-  const text = typed ?? "1"
+  const text = typed ?? String(current ?? 1)
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(text) || 1)))
-  return { typed: text, setTyped, edited: typed !== undefined, seconds }
+  return { typed: text, setTyped, current, flag: typed === undefined ? undefined : seconds }
 }
 
 function IntervalOption({ option, batch = false }: { option: ReturnType<typeof useIntervalOption>; batch?: boolean }) {
   return (
     <OptionRow
       title="上报间隔"
-      hint={batch ? "1–3600 秒，默认 1 秒。这一批机器都按这个间隔上报，机器多时可以调大" : "1–3600 秒，默认 1 秒"}
+      hint={batch ? "1–3600 秒，默认 1 秒。这一批机器都按这个间隔上报，机器多时可以调大" : (
+        <>
+          1–3600 秒，默认 1 秒。不改动时沿用机器上原有的间隔
+          {option.current && <span className="mt-0.5 block">当前：{option.current} 秒</span>}
+        </>
+      )}
     >
       <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
         {/* Text rather than number: no spinner arrows, and no wheel changing
@@ -1002,9 +1011,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
-  const interval = useIntervalOption()
+  const interval = useIntervalOption(node.interval)
 
-  const command = token && iface.valid ? installCommand(site, token, interval.seconds, iface.flag) : ""
+  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
 
   async function rotate() {
     setRotating(true)

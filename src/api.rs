@@ -76,6 +76,50 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
     "month_tx",
 ];
 
+/// The addresses the panel shows for a node, each with where it comes from: at
+/// most one per family, v4 first, the one the machine is reached by. The agent
+/// reports its interfaces; `ip` is where its connection arrived from, in dotted
+/// form for IPv4.
+///
+/// Per family an address set by hand comes first, then a public one on the
+/// interface. Failing both, where the interface holds only a private address of
+/// the family the connection used -- NAT, or a proxy in front -- the
+/// connection's public address, its exit, stands in. An exit in a family the
+/// interface does not hold is a translator such as NAT64 or WARP and is left
+/// out.
+///
+/// Private addresses appear only when nothing public is known, as where hub and
+/// node share a network and they are all there is. `ip` alone is the fallback
+/// for an agent reporting no interface.
+fn addresses<'a>(
+    ip: &'a str,
+    (ipv4, ipv6): (&'a str, &'a str),
+    (pin4, pin6): (&'a str, &'a str),
+) -> Vec<(&'a str, &'static str)> {
+    let public =
+        |a: &str, v6: bool| a.parse::<IpAddr>().is_ok_and(|a| a.is_ipv6() == v6 && agent_ws::public(a));
+    let family = |pin: &'a str, held: &'a str, v6: bool| {
+        if !pin.is_empty() {
+            Some((pin, "manual"))
+        } else if public(held, v6) {
+            Some((held, "interface"))
+        } else if !held.is_empty() && public(ip, v6) {
+            Some((ip, "exit"))
+        } else {
+            None
+        }
+    };
+    let shown: Vec<_> = [family(pin4, ipv4, false), family(pin6, ipv6, true)].into_iter().flatten().collect();
+    if !shown.is_empty() {
+        return shown;
+    }
+    let held: Vec<_> = [ipv4, ipv6].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "interface")).collect();
+    if !held.is_empty() {
+        return held;
+    }
+    [ip].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "connection")).collect()
+}
+
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
 fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool, today: NaiveDate) -> Value {
@@ -165,12 +209,23 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     // Address, private notes and the token never leave the panel. The token is
     // included so the install command can be displayed without reissuing it.
     if full {
+        let held = (node.ipv4.as_str(), node.ipv6.as_str());
+        let shown = addresses(&node.ip, held, (&node.ipv4_pin, &node.ipv6_pin));
+        // What each family shows with its pin cleared, for the edit form to
+        // offer as the fallback.
+        let auto = addresses(&node.ip, held, ("", ""));
+        let auto = |v6: bool| auto.iter().find(|(a, _)| a.contains(':') == v6).map_or("", |(a, _)| a);
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
         view["ipv6"] = json!(node.ipv6);
         view["ipv4_pin"] = json!(node.ipv4_pin);
         view["ipv6_pin"] = json!(node.ipv6_pin);
+        view["addresses"] =
+            shown.iter().map(|(address, source)| json!({"address": address, "source": source})).collect();
+        view["ipv4_auto"] = json!(auto(false));
+        view["ipv6_auto"] = json!(auto(true));
+        view["interval"] = json!(current.and_then(Agent::interval));
         view["country_pin"] = json!(node.country_pin);
         view["country_auto"] = json!(node.country);
         view["remark"] = json!(node.remark);
@@ -2357,7 +2412,7 @@ mod tests {
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
         // Disclosing the token would let any visitor impersonate the node.
-        for hidden in ["ip", "remark", "hostname", "token"] {
+        for hidden in ["ip", "addresses", "ipv4_auto", "remark", "hostname", "token", "interval"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert!(
@@ -2387,6 +2442,90 @@ mod tests {
             assert_eq!(view["metrics"]["total_rx"], view["total_rx"]);
             assert_eq!(view["metrics"]["month_tx"], view["month_tx"]);
         }
+    }
+
+    /// One address per family, marked with where it came from.
+    #[test]
+    fn a_node_shows_the_address_it_is_reached_by() {
+        let rows = |ip, held, pins| -> Vec<String> {
+            addresses(ip, held, pins).into_iter().map(|(a, source)| format!("{a} {source}")).collect()
+        };
+        let none = ("", "");
+        // A public interface is the machine; a different exit in front of it is a
+        // proxy and stays out.
+        assert_eq!(
+            rows("2001:db8::2", ("203.0.113.7", "2001:db8::2"), none),
+            ["203.0.113.7 interface", "2001:db8::2 interface"]
+        );
+        assert_eq!(rows("198.51.100.1", ("203.0.113.7", ""), none), ["203.0.113.7 interface"]);
+        // NAT: the exit replaces the private interface address, which nobody
+        // outside can use.
+        assert_eq!(rows("203.0.113.7", ("10.10.2.250", ""), none), ["203.0.113.7 exit"]);
+        assert_eq!(rows("203.0.113.7", ("100.64.0.9", ""), none), ["203.0.113.7 exit"]);
+        // An LXC guest behind NAT with a public /128, reached over v4 by a current
+        // agent...
+        assert_eq!(
+            rows("203.0.113.7", ("10.10.1.5", "2401:b60:1c::5"), none),
+            ["203.0.113.7 exit", "2401:b60:1c::5 interface"]
+        );
+        // ...and over v6 by an older one reporting the ULA ahead of it.
+        assert_eq!(rows("2401:b60:1c::5", ("10.10.1.5", "fd42:43af::1"), none), ["2401:b60:1c::5 exit"]);
+        // Behind a transparent proxy the exit is the proxy's; the home line can
+        // only be set by hand.
+        let home = ("192.168.1.5", "2409:8a1e::5");
+        assert_eq!(rows("198.51.100.77", home, none), ["198.51.100.77 exit", "2409:8a1e::5 interface"]);
+        assert_eq!(
+            rows("198.51.100.77", home, ("203.0.113.50", "")),
+            ["203.0.113.50 manual", "2409:8a1e::5 interface"]
+        );
+        // A pin wins over a public interface too, and may name a private address
+        // for use on the LAN.
+        assert_eq!(
+            rows("", ("203.0.113.7", "2001:db8::5"), ("", "2001:db8::9")),
+            ["203.0.113.7 interface", "2001:db8::9 manual"]
+        );
+        assert_eq!(rows("203.0.113.7", ("10.0.0.2", ""), ("10.0.0.2", "")), ["10.0.0.2 manual"]);
+        // No interface in the exit's family: a translator (NAT64, WARP) that does
+        // not lead to the machine.
+        assert_eq!(rows("104.28.1.1", ("", "2001:db8::5"), none), ["2001:db8::5 interface"]);
+        // An address reported under the other family's name is not that family's.
+        assert_eq!(rows("203.0.113.7", ("2001:db8::5", ""), none), ["203.0.113.7 exit"]);
+        // Nothing public anywhere: hub and node share a network, and the private
+        // addresses are all there is.
+        assert_eq!(rows("192.168.1.2", ("192.168.1.5", ""), none), ["192.168.1.5 interface"]);
+        assert_eq!(
+            rows("fd00::2", ("10.0.0.2", "fd00::5"), none),
+            ["10.0.0.2 interface", "fd00::5 interface"]
+        );
+        assert_eq!(
+            rows("198.18.0.1", ("192.168.1.5", ""), none),
+            ["192.168.1.5 interface"],
+            "a TUN proxy's fake-IP range is not public"
+        );
+        // With no interface reported the connection is all there is, and nothing
+        // says it is not the machine's own.
+        assert_eq!(rows("203.0.113.7", none, none), ["203.0.113.7 connection"]);
+        assert_eq!(rows("", ("10.0.0.2", ""), none), ["10.0.0.2 interface"]);
+        assert!(rows("", none, none).is_empty());
+
+        // The panel gets the list, and per family what shows with the pin
+        // cleared.
+        let app = app();
+        let id = node(&app, "n", true);
+        app.db
+            .save_facts(id, &json!({"ipv4": "10.10.1.5", "ipv6": "2401:b60:1c::5"}), "203.0.113.7", "")
+            .unwrap();
+        let patch: NodePatch = serde_json::from_value(json!({"ipv4_pin": "198.51.100.50"})).unwrap();
+        app.db.update_node(id, &patch).unwrap();
+        let view = &visible_nodes(&app, true).unwrap()[0];
+        assert_eq!(
+            view["addresses"],
+            json!([{"address": "198.51.100.50", "source": "manual"}, {"address": "2401:b60:1c::5", "source": "interface"}])
+        );
+        assert_eq!(
+            (&view["ipv4_auto"], &view["ipv6_auto"]),
+            (&json!("203.0.113.7"), &json!("2401:b60:1c::5"))
+        );
     }
 
     #[tokio::test]

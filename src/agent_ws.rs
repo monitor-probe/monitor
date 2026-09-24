@@ -92,6 +92,9 @@ pub struct Agent {
     mark: Option<Mark>,
     /// Running mean of the minute in progress.
     minute: Minute,
+    /// When this session's first and latest reports arrived, and how many came
+    /// after the first. See [`Agent::interval`].
+    reports: Option<(Instant, Instant, u32)>,
 }
 
 impl Agent {
@@ -104,7 +107,18 @@ impl Agent {
             last_minute: None,
             mark: None,
             minute: Minute::default(),
+            reports: None,
         }
+    }
+
+    /// The interval the agent reports at, in whole seconds: the mean spacing of
+    /// this session's reports, `None` before the second. The agent does not
+    /// state its own, and a reinstall keeps it unless told otherwise, so the
+    /// install dialog shows this as what it would keep.
+    pub fn interval(&self) -> Option<u64> {
+        let (first, last, spacings) = self.reports?;
+        (spacings > 0)
+            .then(|| (last.duration_since(first).as_secs_f64() / f64::from(spacings)).round() as u64)
     }
 }
 
@@ -462,10 +476,10 @@ fn dispatch(
 /// TUN-mode proxies), multicast and reserved. On the v6 side only 2000::/3
 /// counts, which leaves out ULA, link-local and loopback.
 ///
-/// The agent ranks its interface addresses by the same ranges and the panel
-/// decides by them which addresses to show; the three lists are to be changed
-/// together.
-fn public(ip: IpAddr) -> bool {
+/// The agent ranks its interface addresses by the same ranges, and
+/// `api::addresses` decides by them which to show; the two lists are to be
+/// changed together.
+pub(crate) fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, c, _] = v4.octets();
@@ -724,6 +738,10 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
     let store = *entry.last_minute.get_or_insert(minute) != minute;
     entry.metrics = metrics.clone();
     entry.last_seen = arrival.at.timestamp();
+    entry.reports = Some(match entry.reports {
+        Some((first, _, n)) => (first, arrival.tick, n + 1),
+        None => (arrival.tick, arrival.tick, 0),
+    });
     entry.minute.add(&metrics);
 
     // The stored row summarises the interval since the previous row rather than
@@ -1026,6 +1044,23 @@ mod tests {
         );
     }
 
+    /// The interval a reinstall would keep, read from the reports: known from the
+    /// second, and not thrown by one delayed on the way.
+    #[test]
+    fn the_reporting_interval_is_the_mean_spacing_of_the_session() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let mut session = Session::default();
+        let interval = |app: &App| app.agents.read().unwrap()[&id].interval();
+        let report = report_json("boot-a", 0, 0);
+        dispatch(&app, id, "ip", &report, &mut session, at_ms(0)).unwrap();
+        assert_eq!(interval(&app), None, "one report has no spacing");
+        for ms in [5_000, 10_000, 17_900, 20_000, 25_000] {
+            dispatch(&app, id, "ip", &report, &mut session, at_ms(ms)).unwrap();
+        }
+        assert_eq!(interval(&app), Some(5), "a report held up for 2.9 s does not make it 8");
+    }
+
     /// A history row describes the minute preceding it rather than the instant it
     /// is stamped with: the network rate from the counters the kernel reported
     /// over it, everything else from the mean of the reports in between.
@@ -1260,6 +1295,33 @@ mod tests {
         // The agent's fields reach a URL, so each must be an address of its family.
         assert_eq!(source("192.168.1.2", "2409:8a1e::5", "198.51.100.4"), None, "families swapped");
         assert_eq!(source("192.168.1.2", "1.1.1.1/../x", "2409:8a1e::5/x"), None);
+    }
+
+    #[test]
+    fn public_means_globally_routable() {
+        let public = |ip: &str| public(ip.parse().unwrap());
+        for ip in [
+            "10.0.0.1",
+            "172.31.0.1",
+            "192.168.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.0.1",
+            "0.0.0.1",
+            "192.0.0.4",
+            "198.19.0.1",
+            "224.0.0.1",
+            "fd42::1",
+            "fe80::1",
+            "::1",
+        ] {
+            assert!(!public(ip), "{ip}");
+        }
+        for ip in
+            ["1.1.1.1", "100.128.0.1", "172.32.0.1", "192.0.1.1", "198.20.0.1", "2401:b60:1c::5", "3fff::1"]
+        {
+            assert!(public(ip), "{ip}");
+        }
     }
 
     #[test]
