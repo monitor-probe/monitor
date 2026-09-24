@@ -1083,12 +1083,19 @@ impl Db {
         //
         // Never dated before a period the row already carries. The panel stamps
         // the current period with a correction, which a reading held back from
-        // before the boundary would otherwise read as a new period and discard;
-        // a wall clock stepped back would likewise restart the day. A date later
-        // than the stamp is used as it is, so a changed reset day still takes
-        // effect.
-        let date = at.date_naive();
-        let dated = |stored: &str| stored.parse::<NaiveDate>().map_or(date, |stamp| stamp.max(date));
+        // before the boundary would otherwise read as a new period and discard.
+        // A date later than the stamp is used as it is, so a changed reset day
+        // still takes effect. A stamp later than today came from a clock since
+        // stepped back and is not honoured: it would hold both counters in that
+        // period, which the read side answers as zero, until the date caught up.
+        let (date, today) = (at.date_naive(), Local::now().date_naive());
+        let dated = |stored: &str| {
+            stored
+                .parse::<NaiveDate>()
+                .ok()
+                .filter(|stamp| *stamp <= today)
+                .map_or(date, |stamp| stamp.max(date))
+        };
         let period = period_start(dated(&month_start), reset_day).to_string();
         if month_start != period {
             // A new billing period restarts the month counter but not the total.
@@ -2293,9 +2300,9 @@ mod tests {
 
     /// A reading is dated by its arrival, which for one held back over a boundary
     /// is earlier than its booking. It must never take the row back into a period
-    /// already stamped on it: the panel stamps the current one with a correction,
-    /// and a wall clock stepped back would otherwise restart the day. A later
-    /// date still moves the period, as a changed reset day requires.
+    /// already stamped on it, as the panel stamps the current one with a
+    /// correction. A later date still moves the period, as a changed reset day
+    /// requires, and a stamp later than today is not held to.
     #[test]
     fn a_reading_is_never_booked_into_a_period_already_left() {
         use chrono::TimeZone;
@@ -2319,6 +2326,13 @@ mod tests {
         db.set_traffic(id, &TrafficPatch { month_rx: Some(10_000), ..Default::default() }).unwrap();
         let t = db.accumulate(id, "boot-a", (4_500, 0), Local::now() - chrono::Duration::days(40)).unwrap();
         assert_eq!(t.month_rx, 10_500, "the correction survives a reading dated before it");
+
+        // A clock a year ahead stamps its own day and period. Once it is stepped
+        // back, the next reading returns the row to today.
+        db.accumulate(id, "boot-a", (5_000, 0), Local::now() + chrono::Duration::days(365)).unwrap();
+        db.accumulate(id, "boot-a", (5_200, 0), Local::now()).unwrap();
+        let t = db.all_traffic().remove(&id).unwrap();
+        assert_eq!((t.day_rx, t.month_rx), (200, 200), "today reads what moved today, not zero");
     }
 
     /// The other half of the rollover: the counters restart on the node's next

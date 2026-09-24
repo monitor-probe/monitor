@@ -342,10 +342,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
         }
     };
 
-    if let Some(agent) = release(&app, node_id, tag) {
+    let ended = release(&app, node_id, tag);
+    if ended.is_some() {
         info!("node {node_id} went offline");
-        tokio::task::block_in_place(|| close(&app, node_id, &agent, &mut session));
     }
+    tokio::task::block_in_place(|| close(&app, node_id, ended.as_ref(), &mut session));
     outcome
 }
 
@@ -367,15 +368,21 @@ fn release(app: &App, node_id: i64, tag: u64) -> Option<Agent> {
 /// results not yet filed, and when the node was last seen, with the capacities
 /// it last reported.
 ///
-/// Only for a session that ended on its own, which [`release`] reports. One the
-/// panel ended, by deleting the node or reissuing its token, files nothing, and
-/// neither does one a reconnect replaced: its successor already files newer
-/// figures, and an older `last_seen` would move that back.
-fn close(app: &App, node_id: i64, agent: &Agent, session: &mut Session) {
-    book_held(app, Some(node_id));
+/// All of it for a session that ended on its own, which [`release`] reports as
+/// `ended`. One a reconnect replaced files its probe results alone: they
+/// arrived on this connection and no other, while its successor files newer
+/// figures of the rest, and an older `last_seen` would move that back. One the
+/// panel ended, by deleting the node, reissuing its token or restoring the
+/// database, files nothing.
+fn close(app: &App, node_id: i64, ended: Option<&Agent>, session: &mut Session) {
+    if ended.is_none() && !app.agents.read().unwrap_or_else(|e| e.into_inner()).contains_key(&node_id) {
+        return;
+    }
     if let Err(e) = session.file_results(app, node_id) {
         warn!("node {node_id}: filing its last probe results failed: {e:#}");
     }
+    let Some(agent) = ended else { return };
+    book_held(app, Some(node_id));
     if agent.last_seen > 0 {
         if let Err(e) = app.db.touch_seen(node_id, agent.last_seen, &agent.metrics) {
             warn!("node {node_id}: recording when it was last seen failed: {e:#}");
@@ -397,9 +404,12 @@ fn dispatch(
     let rpc: Rpc = serde_json::from_str(text)?;
     // Results gathered in an earlier minute are filed on the next frame of any
     // kind: reports arrive every few seconds even where every probe runs once an
-    // hour.
+    // hour. A failure is logged rather than returned, which would discard the
+    // frame that happened to trigger it.
     if session.results.first().is_some_and(|&(_, ts, _)| ts.div_euclid(60) != arrival.minute()) {
-        session.file_results(app, node_id)?;
+        if let Err(e) = session.file_results(app, node_id) {
+            session.complain(node_id, format_args!("filing probe results failed: {e:#}"));
+        }
     }
     match rpc.method.as_str() {
         "hello" => {
@@ -1127,10 +1137,38 @@ mod tests {
         assert!(results(&app, id).is_empty(), "results wait for the minute to turn");
 
         let agent = release(&app, id, 1).expect("the session is still the node's");
-        close(&app, id, &agent, &mut session);
+        close(&app, id, Some(&agent), &mut session);
         assert_eq!(total_rx(&app, id), 3_000, "the held reading is booked");
         assert_eq!(results(&app, id), vec![(task, 42)], "the gathered results are filed");
         assert_eq!(app.db.node(id).unwrap().unwrap().last_seen, at(10).at.timestamp());
+    }
+
+    /// A reconnect replacing a half-open session leaves that session's probe
+    /// results to it alone: the minute before the link failed. A session the
+    /// panel ended files nothing.
+    #[test]
+    fn a_replaced_session_still_files_its_probe_results() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let task = probe(&app, id, "p");
+        let mut session = Session::default();
+        send(&app, id, &mut session, 0, &report_json("boot-a", 1_000, 0)).unwrap();
+        send(&app, id, &mut session, 10, &report_json("boot-a", 4_000, 0)).unwrap();
+        send(&app, id, &mut session, 11, &result_json(task, 42)).unwrap();
+
+        let (tx, _rx) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(id, Agent::new(2, tx));
+        let ended = release(&app, id, 1);
+        assert!(ended.is_none(), "the reconnect holds the node");
+        close(&app, id, ended.as_ref(), &mut session);
+        assert_eq!(results(&app, id), vec![(task, 42)], "no other connection received them");
+        assert_eq!(total_rx(&app, id), 0, "the held reading is the successor's to book");
+
+        let mut ended_by_panel = Session::default();
+        send(&app, id, &mut ended_by_panel, 12, &result_json(task, 7)).unwrap();
+        app.agents.write().unwrap().remove(&id);
+        close(&app, id, None, &mut ended_by_panel);
+        assert_eq!(results(&app, id), vec![(task, 42)]);
     }
 
     #[test]
