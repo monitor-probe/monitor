@@ -875,11 +875,11 @@ function RegisterDialog({ site, reg, onClose }: {
                 要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
                 <a
                   className="ml-1 underline underline-offset-2 hover:text-foreground"
-                  href="https://monitor-document.pages.dev/install/batch"
+                  href="https://monitor-document.pages.dev/install/agent#批量安装"
                   target="_blank"
                   rel="noreferrer"
                 >
-                  批量执行的做法
+                  批量安装的做法
                 </a>
               </p>
               <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
