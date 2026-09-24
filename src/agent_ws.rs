@@ -179,6 +179,12 @@ impl Minute {
 /// known, so what exceeds it is dropped: reports faster than its one-second
 /// floor, a second hello, and results beyond [`Db::MAX_PROBES_PER_NODE`]
 /// probes each run every [`Db::MIN_PROBE_INTERVAL`] seconds.
+///
+/// ponytail: the caps start afresh with each connection, so a token reconnecting
+/// in a loop costs two commits per handshake -- the hello, and the first
+/// report's `last_seen` -- rather than a few per minute. An honest agent cannot
+/// do this, as it doubles its wait after a short session. A per-node limit on
+/// handshakes if it is ever observed; reissuing the token ends it meanwhile.
 #[derive(Debug, Default)]
 struct Session {
     greeted: bool,
