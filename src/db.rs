@@ -798,18 +798,18 @@ impl Db {
     fn reorder(&self, table: &str, ids: &[i64]) -> Result<()> {
         let unique: HashSet<_> = ids.iter().collect();
         if unique.len() != ids.len() {
-            anyhow::bail!("排序里有重复的条目");
+            refuse!("排序里有重复的条目");
         }
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let count: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
         if count as usize != ids.len() {
-            anyhow::bail!("列表已在别处改动，刷新后再排序");
+            refuse!("列表已在别处改动，刷新后再排序");
         }
         let sql = format!("UPDATE {table} SET sort=?2 WHERE id=?1");
         for (sort, id) in ids.iter().enumerate() {
             if tx.execute(&sql, params![id, sort as i64])? != 1 {
-                anyhow::bail!("列表已在别处改动，刷新后再排序");
+                refuse!("列表已在别处改动，刷新后再排序");
             }
         }
         tx.commit()?;
@@ -1304,7 +1304,7 @@ impl Db {
             // would fail on the task's foreign key and be reported against a
             // node, or, with none, the save would report success.
             if updated == 0 {
-                anyhow::bail!("监控不存在，可能已被删除");
+                refuse!("监控不存在，可能已被删除");
             }
             t.id
         } else {
@@ -1337,7 +1337,7 @@ impl Db {
                 "INSERT OR IGNORE INTO ping_node (task_id, node_id) VALUES (?1,?2)",
                 params![id, node],
             )
-            .with_context(|| format!("节点 {node} 不存在"))?;
+            .with_context(|| crate::Shown(format!("节点 {node} 不存在，可能已被删除")))?;
         }
         // Queried from the table after the rows are in rather than counted from
         // the request: an update changes this task's own assignments, so
@@ -1354,7 +1354,7 @@ impl Db {
             )
             .optional()?;
         if let Some(node) = crowded {
-            anyhow::bail!(
+            refuse!(
                 "节点「{node}」会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
                 Self::MAX_PROBES_PER_NODE
             );
@@ -1363,10 +1363,7 @@ impl Db {
         let joining: i64 =
             tx.query_row("SELECT COUNT(*) FROM ping_task WHERE auto_join", [], |r| r.get(0))?;
         if joining > Self::MAX_PROBES_PER_NODE {
-            anyhow::bail!(
-                "新节点会自动加入 {joining} 个探测任务，agent 最多只跑 {} 个",
-                Self::MAX_PROBES_PER_NODE
-            );
+            refuse!("新节点会自动加入 {joining} 个探测任务，agent 最多只跑 {} 个", Self::MAX_PROBES_PER_NODE);
         }
         tx.commit()?;
         Ok(id)
@@ -1678,15 +1675,17 @@ impl Db {
     /// while the live database is still untouched. The caller owns that file and
     /// deletes it in either case.
     pub fn check_backup(&self, src: &str) -> Result<()> {
+        const NOT_A_BACKUP: &str = "这不是 hub 导出的备份文件";
         // Read-write rather than read-only: a plain copy of a running hub's
         // database is in WAL mode, and SQLite cannot open such a file read-only
         // without its -shm companion.
         let candidate = Connection::open(src)?;
         let health: String = candidate
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-            .map_err(|e| anyhow::anyhow!("not a readable SQLite database: {e}"))?;
+            .context(crate::Shown(NOT_A_BACKUP.into()))?;
         if health != "ok" {
-            anyhow::bail!("the file is a damaged database: {health}");
+            info!("uploaded backup fails integrity_check: {health}");
+            refuse!("备份文件已损坏，数据库完整性检查没有通过");
         }
         // Pages are copied verbatim, so whatever schema the file carries becomes
         // the schema this hub runs its statements against. A view or trigger
@@ -1698,7 +1697,7 @@ impl Db {
             |r| r.get(0),
         )?;
         if plotted > 0 {
-            anyhow::bail!("the file carries views or triggers, which a hub backup never does");
+            refuse!("文件里有视图或触发器，不是 hub 导出的备份");
         }
         for table in TABLES {
             let found: i64 = candidate.query_row(
@@ -1707,21 +1706,19 @@ impl Db {
                 |r| r.get(0),
             )?;
             if found == 0 {
-                anyhow::bail!("the file is not a hub backup: no {table} table");
+                refuse!("{NOT_A_BACKUP}：缺少 {table} 表");
             }
         }
         let version: i64 = candidate.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > SCHEMA_VERSION {
-            anyhow::bail!(
-                "the backup is from a newer hub (schema {version}, this one reads {SCHEMA_VERSION}); upgrade first"
-            );
+            refuse!("备份来自更新版本的 hub（数据库版本 {version}，这台只认到 {SCHEMA_VERSION}），先升级 hub 再恢复");
         }
         // The online backup API refuses a page size change while the destination
         // is in WAL mode; an explicit message is clearer than SQLITE_READONLY.
         let theirs: i64 = candidate.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let ours: i64 = self.conn().query_row("PRAGMA page_size", [], |r| r.get(0))?;
         if theirs != ours {
-            anyhow::bail!("the backup uses a {theirs}-byte page, this database uses {ours}");
+            refuse!("备份的页大小是 {theirs} 字节，这台 hub 是 {ours} 字节，无法恢复");
         }
         // Brought up to this build's schema here, on the upload. Run after the
         // copy instead, a failed migration would leave the hub on a database it
@@ -1752,7 +1749,7 @@ impl Db {
             let mut missing: Vec<&str> = want.difference(&got).map(String::as_str).collect();
             if !missing.is_empty() {
                 missing.sort_unstable();
-                anyhow::bail!("the file's {table} table is missing {}", missing.join(", "));
+                refuse!("{NOT_A_BACKUP}：{table} 表缺少字段 {}", missing.join("、"));
             }
         }
         Ok(())
@@ -2034,14 +2031,20 @@ mod tests {
         let scratch = Scratch::new();
         let db = Db::open(&scratch.0).unwrap();
         let bad = format!("{}.copy", scratch.0);
+        // Each refusal carries a message the panel shows, never a bare 500.
+        let refused = |why: &str| {
+            let e = db.check_backup(&bad).unwrap_err();
+            assert!(e.downcast_ref::<crate::Shown>().is_some(), "{why}: {e:#}");
+            e.to_string()
+        };
 
         std::fs::write(&bad, b"this is not a database at all").unwrap();
-        assert!(db.check_backup(&bad).is_err(), "not SQLite");
+        refused("not SQLite");
 
         let _ = std::fs::remove_file(&bad);
         let empty = Connection::open(&bad).unwrap();
         empty.execute_batch("CREATE TABLE unrelated (a)").unwrap();
-        assert!(db.check_backup(&bad).is_err(), "SQLite, but not this schema");
+        refused("SQLite, but not this schema");
 
         // A file carrying its own code where a table belongs: the restore copies
         // pages, so that schema would become the one the hub runs every statement
@@ -2052,7 +2055,7 @@ mod tests {
                 "DROP TABLE session; CREATE VIEW session AS SELECT 1 AS token_hash, 2 AS expires_at",
             )
             .unwrap();
-        assert!(db.check_backup(&bad).is_err(), "a view where a table belongs");
+        refused("a view where a table belongs");
 
         // Eight tables with the right names and none of the right columns. Every
         // gate above passes: it is a healthy SQLite file, it carries no view or
@@ -2069,15 +2072,15 @@ mod tests {
         shaped.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
         // Which table fails first follows the order of TABLES and is incidental;
         // naming the table and the columns is what matters.
-        let refused = db.check_backup(&bad).unwrap_err().to_string();
-        assert!(refused.contains("table is missing"), "{refused}");
+        let missing = refused("tables without their columns");
+        assert!(missing.contains("表缺少字段"), "{missing}");
 
         // From a hub carrying a schema this build has never seen.
         let _ = std::fs::remove_file(&bad);
         let newer = Connection::open(&bad).unwrap();
         newer.execute_batch(SCHEMA).unwrap();
         newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
-        assert!(db.check_backup(&bad).is_err(), "from a newer hub");
+        refused("from a newer hub");
 
         newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
         db.check_backup(&bad).unwrap();

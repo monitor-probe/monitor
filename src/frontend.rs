@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
@@ -13,6 +13,7 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::api::answer;
 use crate::auth::random_token;
 use crate::{App, Shared};
 
@@ -60,16 +61,12 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     let path = uri.path().trim_start_matches('/');
     let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
     if is_api_path(path) {
-        return (StatusCode::NOT_FOUND, format!("no such endpoint: /{path}")).into_response();
+        return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
 
     if path == "admin" || path.starts_with("admin/") {
         let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
-        return embedded::<AdminAssets>(
-            path,
-            "the panel is not built; run `npm run build` in web-admin/",
-            known,
-        );
+        return embedded::<AdminAssets>(path, "面板没有构建，在 web-admin/ 下运行 npm run build", known);
     }
 
     let theme = app.db.get("theme").unwrap_or_default();
@@ -78,7 +75,7 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
             return response;
         }
     }
-    embedded::<DefaultThemeAssets>(path, "the default theme is missing; run scripts/theme.sh", known)
+    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known)
 }
 
 fn is_api_path(path: &str) -> bool {
@@ -100,11 +97,11 @@ fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) ->
         return asset(path, file.data.into_owned(), known);
     }
     if is_asset(path) {
-        return (StatusCode::NOT_FOUND, format!("no such asset: /{path}")).into_response();
+        return answer(StatusCode::NOT_FOUND, format!("没有这个文件：/{path}"));
     }
     match T::get("index.html") {
         Some(index) => asset("index.html", index.data.into_owned(), known),
-        None => (StatusCode::NOT_FOUND, remedy.to_owned()).into_response(),
+        None => answer(StatusCode::NOT_FOUND, remedy),
     }
 }
 
@@ -281,36 +278,57 @@ pub fn install<R: Read>(themes: &Path, archive: R, expect: Option<&str>) -> Resu
     installed
 }
 
+/// The answer to any archive that cannot be read to the end: a download cut
+/// short, which is how a partial `theme.tar.gz` fails, or a file that is not a
+/// gzip'd tar at all.
+const DAMAGED: &str = "主题包损坏或不完整（可能没下载完），重新下载 theme.tar.gz 再试";
+
+/// Tells a failure to read the archive from a failure to write it out. Reading
+/// fails with these kinds -- `UnexpectedEof` where the stream stops short,
+/// `InvalidInput` for a corrupt or non-gzip stream -- and writing with others,
+/// such as a full disk or a permission, which are this machine's to fix.
+fn unreadable(e: std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind::{InvalidData, InvalidInput, UnexpectedEof};
+    let damaged = matches!(e.kind(), UnexpectedEof | InvalidInput | InvalidData);
+    let e = anyhow::Error::from(e);
+    if damaged {
+        e.context(crate::Shown(DAMAGED.into()))
+    } else {
+        e
+    }
+}
+
 fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
     fs::create_dir(into)?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let mut expanded = 0u64;
     for (seen, entry) in archive.entries()?.enumerate() {
-        let mut entry = entry.context("主题包不是有效的 tar.gz")?;
+        // Only reading happens here, so every failure is the archive's.
+        let mut entry = entry.context(crate::Shown(DAMAGED.into()))?;
         if seen >= MAX_ENTRIES {
-            bail!("主题包里的条目超过 {MAX_ENTRIES} 个");
+            refuse!("主题包里的条目超过 {MAX_ENTRIES} 个");
         }
         // Only the entry types a theme consists of. A symlink, hard link or
         // device node belongs in none, and each is a route to writing where the
         // path check below cannot see.
         let kind = entry.header().entry_type();
         if !kind.is_file() && !kind.is_dir() {
-            bail!("主题包里有不支持的条目：{}", entry.path()?.display());
+            refuse!("主题包里有不支持的条目：{}", entry.path()?.display());
         }
         let size = entry.size();
         if size > MAX_FILE {
-            bail!("{} 超过单个文件 {} MiB 的上限", entry.path()?.display(), MAX_FILE >> 20);
+            refuse!("{} 超过单个文件 {} MiB 的上限", entry.path()?.display(), MAX_FILE >> 20);
         }
         // Subtraction, because summing two entry sizes can overflow; `size` is
         // already known to be the smaller of the two.
         if expanded > MAX_EXPANDED - size {
-            bail!("主题包解压后超过 {} MiB", MAX_EXPANDED >> 20);
+            refuse!("主题包解压后超过 {} MiB", MAX_EXPANDED >> 20);
         }
         expanded += size;
         // Rejects an entry whose path escapes `into` -- absolute, `..`, or via
         // a symlinked parent -- reporting `false` rather than an error.
-        if !entry.unpack_in(into)? {
-            bail!("主题包里的路径越出了主题目录");
+        if !entry.unpack_in(into).map_err(unreadable)? {
+            refuse!("主题包里的路径越出了主题目录");
         }
     }
     Ok(())
@@ -319,24 +337,25 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
 /// Checks the unpacked directory is a theme this hub can actually serve, then
 /// moves it into place under the name its manifest asks for.
 fn publish(themes: &Path, staging: &Path, expect: Option<&str>) -> Result<Theme> {
-    let manifest = read_inside(staging, "theme.json").context("主题包里没有 theme.json")?;
+    let Some(manifest) = read_inside(staging, "theme.json") else { refuse!("主题包里没有 theme.json") };
     if manifest.len() > 64 * 1024 {
-        bail!("theme.json 过大");
+        refuse!("theme.json 过大");
     }
-    let theme: Theme = serde_json::from_slice(&manifest).context("theme.json 格式不对")?;
+    let theme: Theme =
+        serde_json::from_slice(&manifest).context(crate::Shown("theme.json 格式不对".into()))?;
     if !valid_short(&theme.short) {
-        bail!("theme.json 里的 short 不能作为目录名：{:?}", theme.short);
+        refuse!("theme.json 里的 short 不能作为目录名：{:?}", theme.short);
     }
     // An update replaces the theme it was invoked for. A package whose manifest
     // carries a different `short` would instead install a second theme, or
     // overwrite an unrelated one, while reporting success for the update.
     if let Some(expected) = expect.filter(|&expected| expected != theme.short) {
-        bail!("这个包里是主题 {:?}，不是 {expected:?}", theme.short);
+        refuse!("这个包里是主题 {:?}，不是 {expected:?}", theme.short);
     }
     // The one file `serve` requires. Without it every request falls through to
     // the built-in theme, indistinguishable from the upload having no effect.
     if !staging.join("dist").join("index.html").is_file() {
-        bail!("主题包里没有 dist/index.html");
+        refuse!("主题包里没有 dist/index.html");
     }
 
     let destination = themes.join(&theme.short);
@@ -392,14 +411,15 @@ const PREVIEW: &str = "preview.png";
 /// request, the same path a broken theme already takes.
 pub fn remove(themes: &Path, short: &str) -> Result<()> {
     if !valid_short(short) {
-        bail!("没有这个主题");
+        refuse!("没有这个主题");
     }
     let base = themes.canonicalize()?;
-    let root = base.join(short).canonicalize()?;
+    // Already gone, as when two panels delete the same theme.
+    let Ok(root) = base.join(short).canonicalize() else { refuse!("没有这个主题") };
     // Canonical on both sides: a symlink leading out of the themes directory
     // must not be deleted through.
     if !root.starts_with(&base) || !root.is_dir() {
-        bail!("没有这个主题");
+        refuse!("没有这个主题");
     }
     fs::remove_dir_all(root)?;
     Ok(())
@@ -500,6 +520,13 @@ mod tests {
         ] {
             assert!(install(&base, bad, None).is_err());
         }
+        // A download cut short says so, rather than quoting the decoder.
+        pack(&[("theme.json", manifest), ("dist/index.html", b"v9")], None);
+        let whole = fs::read(&archive).unwrap();
+        let Err(e) = install(&base, &whole[..whole.len() / 2], None) else {
+            panic!("half an archive installed")
+        };
+        assert_eq!(e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()), Some(DAMAGED), "{e:#}");
 
         // None of that affected the theme being served or left a staging
         // directory behind.

@@ -83,13 +83,9 @@ export default function App() {
   const { nodes, admin, error, refresh } = useNodes()
 
   const loadMe = useCallback(() => {
-    // `|| "..."` because an empty message reads as no error: api() falls back to
-    // res.statusText, which HTTP/2 and HTTP/3 removed, so a bodiless 502 from a
-    // proxy arrives as "". The check below would then take the loading branch and
-    // the retry button would never render.
     return api<Me>("/me")
       .then((next) => { setMe(next); setMeError("") })
-      .catch((e: Error) => setMeError(e.message || "网络错误"))
+      .catch((e: Error) => setMeError(e.message))
   }, [])
   useEffect(() => {
     loadMe()

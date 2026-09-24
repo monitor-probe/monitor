@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use axum::extract::{ConnectInfo, Query, State};
@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::App;
+use crate::api::{answer, fail};
+use crate::{App, Shown};
 
 pub const COOKIE: &str = "monitor_session";
 const STATE_COOKIE: &str = "monitor_oauth_state";
@@ -168,18 +169,18 @@ pub async fn login(
 ) -> Response {
     let ip = client_ip(&headers, peer.ip());
     if app.throttle.locked(ip) {
-        return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
     }
     // Held across the check below, which is its purpose.
     let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
-        return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
     };
     let Some(stored) = app.db.get("admin_password_hash") else {
-        return (StatusCode::FORBIDDEN, "password login is disabled").into_response();
+        return answer(StatusCode::FORBIDDEN, "没有设置应急密码，无法用密码登录");
     };
     if !verify_password(&body.password, &stored) {
         app.throttle.record_failure(ip);
-        return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
+        return answer(StatusCode::UNAUTHORIZED, "密码错误");
     }
     app.throttle.clear(ip);
     match issue_session(&app, &headers) {
@@ -187,7 +188,7 @@ pub async fn login(
             crate::notify::signed_in(&app, "应急密码", ip);
             with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => fail(e),
     }
 }
 
@@ -205,7 +206,7 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
 /// to GitHub. The nonce returns in step two and must match.
 pub async fn github_start(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
     let Some(client_id) = app.db.get("github_client_id").filter(|v| !v.is_empty()) else {
-        return (StatusCode::PRECONDITION_FAILED, "GitHub sign-in is not configured").into_response();
+        return answer(StatusCode::PRECONDITION_FAILED, "没有配置 GitHub 登录");
     };
     let state = random_token();
     let url = format!(
@@ -238,38 +239,45 @@ pub async fn github_callback(
     // GitHub reports a refusal in the query string rather than the body.
     if let Some(error) = &query.error {
         let reason = query.error_description.as_deref().unwrap_or(error);
-        return sign_in_failed(&app, &headers, &format!("GitHub returned {error}: {reason}"));
+        let shown = if error == "access_denied" {
+            "在 GitHub 上取消了授权"
+        } else {
+            "GitHub 拒绝了这次登录"
+        };
+        return sign_in_failed(
+            &app,
+            &headers,
+            anyhow!("GitHub returned {error}: {reason}").context(Shown(shown.into())),
+        );
     }
     // Reject a callback the browser did not initiate.
     let state = query.state.as_deref().unwrap_or_default();
     if state.is_empty() || cookie_value(&headers, STATE_COOKIE).as_deref() != Some(state) {
-        return sign_in_failed(
-            &app,
-            &headers,
-            "state mismatch or missing; start again from the sign-in page",
-        );
+        return sign_in_failed(&app, &headers, anyhow!(Shown("登录已过期，请从登录页重新开始".into())));
     }
     let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
-        return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
+        return sign_in_failed(&app, &headers, anyhow!(Shown("GitHub 没有返回授权码，请重新登录".into())));
     };
     let user = match github_login(&app, code).await {
         Ok(user) => user,
-        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
+        Err(e) => return sign_in_failed(&app, &headers, e),
     };
     let session = match issue_session(&app, &headers) {
         Ok(cookie) => cookie,
-        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
+        Err(e) => return sign_in_failed(&app, &headers, e),
     };
     crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&headers, peer.ip()));
     with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
 }
 
 /// Redirects the browser back to the sign-in page with the reason, rather than
-/// leaving a bare 401 at a callback URL offering no way forward.
-fn sign_in_failed(app: &App, headers: &HeaderMap, reason: &str) -> Response {
+/// leaving a bare 401 at a callback URL offering no way forward. The reason is
+/// the error's [`Shown`] message, the same rule `api::fail` applies.
+fn sign_in_failed(app: &App, headers: &HeaderMap, e: anyhow::Error) -> Response {
     // A rejected sign-in must leave a server-side record; the browser sees only
     // the redirect.
-    warn!("GitHub sign-in rejected: {reason}");
+    warn!("GitHub sign-in rejected: {e:#}");
+    let reason = e.downcast_ref::<Shown>().map_or(crate::api::INTERNAL, |shown| shown.0.as_str());
     let target = format!("/admin?login_error={}", urlencode(reason));
     with_cookies(Redirect::to(&target), [clear_state(app, headers), String::new()])
 }
@@ -291,7 +299,7 @@ pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [Strin
             Ok(value) => {
                 response.headers_mut().append(header::SET_COOKIE, value);
             }
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "bad cookie").into_response(),
+            Err(e) => return fail(e),
         }
     }
     response
@@ -309,19 +317,22 @@ fn urlencode(value: &str) -> String {
         .collect()
 }
 
+/// What a sign-in says when GitHub could not be asked.
+const UNREACHABLE: &str = "hub 连不上 GitHub，检查它的网络后重新登录";
+
 /// Exchanges the code for a token and checks the login against the allow list,
 /// returning the accepted login.
 async fn github_login(app: &App, code: &str) -> Result<String> {
     let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
     else {
-        bail!("not configured");
+        refuse!("没有配置 GitHub 登录");
     };
     let allowed = app.db.get("github_allowed_users").unwrap_or_default();
     let allowed: Vec<String> =
         allowed.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
     if allowed.is_empty() {
         // Without an allow list, any GitHub account could sign in.
-        bail!("no allowed GitHub users configured");
+        refuse!("没有设置允许登录的 GitHub 用户");
     }
 
     #[derive(Deserialize)]
@@ -336,12 +347,17 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
         .json(&serde_json::json!({"client_id": id, "client_secret": secret, "code": code}))
         .send()
         .await
-        .context("token request")?
+        .context("token request")
+        .context(Shown(UNREACHABLE.into()))?
         .json()
         .await
-        .context("token response")?;
+        .context("token response")
+        .context(Shown(UNREACHABLE.into()))?;
     let Some(access) = token.access_token else {
-        bail!("{}", token.error_description.unwrap_or_else(|| "no access token".into()));
+        // Typically an expired code, or a client secret that no longer matches.
+        let reason = token.error_description.unwrap_or_else(|| "no access token".into());
+        return Err(anyhow!(reason)
+            .context(Shown("GitHub 没有发放令牌，检查 Client Secret 是否正确后重新登录".into())));
     };
 
     #[derive(Deserialize)]
@@ -355,21 +371,22 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
         .header(header::USER_AGENT, "monitor-hub")
         .send()
         .await
-        .context("user request")?;
+        .context("user request")
+        .context(Shown(UNREACHABLE.into()))?;
     let status = response.status();
-    let body = response.text().await.context("user response")?;
+    let body = response.text().await.context("user response").context(Shown(UNREACHABLE.into()))?;
     // Decoding an error page into GithubUser would report "missing field login"
     // instead of GitHub's actual message.
-    let user: GithubUser = serde_json::from_str(&body).with_context(|| {
-        format!("user response ({status}): {}", body.chars().take(200).collect::<String>())
-    })?;
+    let user: GithubUser = serde_json::from_str(&body)
+        .with_context(|| format!("user response ({status}): {}", body.chars().take(200).collect::<String>()))
+        .context(Shown(UNREACHABLE.into()))?;
 
     if !allowed.contains(&user.login.to_lowercase()) {
         // The list stays in the log and out of the reason, which travels back in
         // a query string: any GitHub account can reach that page, and a reason
         // carrying the allow list would disclose the accounts worth phishing.
         warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
-        bail!("GitHub user {} is not on the allowed list", user.login);
+        refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
     }
     info!("GitHub sign-in accepted for {}", user.login);
     Ok(user.login)

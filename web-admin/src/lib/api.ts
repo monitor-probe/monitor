@@ -358,13 +358,49 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Every error the hub answers is one line of plain text written for the reader.
+ * Anything else came from something in front of it -- a proxy's error page, a
+ * CDN's challenge, an empty 502 -- and is described by its status instead.
+ */
+async function failure(res: Response): Promise<ApiError> {
+  const text = res.headers.get("content-type")?.startsWith("text/plain") ? (await res.text()).trim() : ""
+  if (text) return new ApiError(res.status, text)
+  return new ApiError(
+    res.status,
+    res.status >= 500
+      ? `hub 没有正常响应（HTTP ${res.status}），检查 hub 是否在运行、反向代理是否指向它`
+      : `请求被拦截（HTTP ${res.status}），不是 hub 的回复，检查反向代理或 CDN 的设置`,
+  )
+}
+
+/** `fetch`, failing with a message for the reader when nothing answers at all. */
+async function send(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init)
+  } catch (e) {
+    // An abort was asked for, and the caller tells it apart by name.
+    if ((e as Error).name === "AbortError") throw e
+    throw new ApiError(0, "连不上 hub，检查网络后重试")
+  }
+}
+
+/** A success from the hub is JSON; a 200 carrying HTML is a proxy's page. */
+async function json<T>(res: Response): Promise<T> {
+  try {
+    return await res.json()
+  } catch {
+    throw new ApiError(res.status, "收到的不是 hub 的回复，检查反向代理是否把 /api 转给了 hub")
+  }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await send(`/api${path}`, {
     ...init,
     headers: init?.body ? { "content-type": "application/json", ...init?.headers } : init?.headers,
   })
-  if (!res.ok) throw new ApiError(res.status, (await res.text()) || res.statusText)
-  return res.status === 204 ? (undefined as T) : res.json()
+  if (!res.ok) throw await failure(res)
+  return res.status === 204 ? (undefined as T) : json<T>(res)
 }
 
 /**
@@ -392,26 +428,22 @@ export async function upload<T>(
     // the last piece lands, and `offset = 0` truncates whatever an abandoned
     // attempt left behind, so aborting here leaves the state unchanged.
     if (signal?.aborted) throw new DOMException("aborted", "AbortError")
-    const res = await fetch(`/api${path}?offset=${offset}&total=${file.size}`, {
+    const res = await send(`/api${path}?offset=${offset}&total=${file.size}`, {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: file.slice(offset, offset + CHUNK),
       signal,
     })
-    if (!res.ok) {
-      // A 413 never reached the hub: the proxy in front answered, and only its
-      // own logs record it. The message names the setting responsible.
-      throw new ApiError(
-        res.status,
-        res.status === 413
-          ? "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m"
-          : (await res.text()) || res.statusText,
-      )
+    // A 413 never reached the hub: the proxy in front answered, and only its
+    // own logs record it. The message names the setting responsible.
+    if (res.status === 413) {
+      throw new ApiError(413, "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m")
     }
+    if (!res.ok) throw await failure(res)
     last = res
     onProgress?.(Math.min(offset + CHUNK, file.size))
   }
-  return last!.json()
+  return json<T>(last!)
 }
 
 /**

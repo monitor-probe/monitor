@@ -12,7 +12,7 @@ use axum::Json;
 use chrono::{Local, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::agent_ws::Agent;
 use crate::auth::{
@@ -26,27 +26,76 @@ use crate::{agent_ws, App, Shared};
 pub struct Admin;
 
 impl FromRequestParts<Shared> for Admin {
-    type Rejection = StatusCode;
+    type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Self::Rejection> {
         if authed(app, &parts.headers) {
             Ok(Admin)
         } else {
-            Err(StatusCode::UNAUTHORIZED)
+            Err(answer(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录"))
         }
     }
 }
 
-fn fail(e: impl std::fmt::Display) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+/// Marks a response whose text was written for the reader; see [`plain_errors`].
+#[derive(Clone)]
+struct Written;
+
+/// An error response carrying `text` as written. Every error the hub composes
+/// is built here.
+pub(crate) fn answer(status: StatusCode, text: impl Into<String>) -> Response {
+    let mut response = (status, text.into()).into_response();
+    response.extensions_mut().insert(Written);
+    response
+}
+
+/// What a failure this hub cannot explain to the reader says instead.
+pub(crate) const INTERNAL: &str = "hub 内部出错，详细原因见 hub 日志";
+
+/// Answers an error: 400 with the outermost [`crate::Shown`] message in its
+/// chain, or, without one, 500 with [`INTERNAL`]. The chain is logged in full
+/// either way, the underlying cause of a shown message included.
+pub(crate) fn fail(e: impl Into<anyhow::Error>) -> Response {
+    let e = e.into();
+    match e.downcast_ref::<crate::Shown>() {
+        Some(shown) => {
+            info!("request refused: {e:#}");
+            answer(StatusCode::BAD_REQUEST, shown.0.clone())
+        }
+        None => {
+            warn!("request failed: {e:#}");
+            answer(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL)
+        }
+    }
 }
 
 fn bad(message: &str) -> Response {
-    (StatusCode::BAD_REQUEST, message.to_owned()).into_response()
+    answer(StatusCode::BAD_REQUEST, message)
 }
 
 fn no_such_node() -> Response {
-    (StatusCode::NOT_FOUND, "no such node").into_response()
+    answer(StatusCode::NOT_FOUND, "节点不存在，可能已被删除")
+}
+
+/// The last step of every response. An error the hub composed passes as it is;
+/// any other -- an extractor's rejection, the body limit's 413, a bare status --
+/// would carry axum's English wording or nothing, and is given a fixed text for
+/// its status instead.
+pub async fn plain_errors(response: Response) -> Response {
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error())
+        || response.extensions().get::<Written>().is_some()
+    {
+        return response;
+    }
+    let text = match status {
+        StatusCode::UNAUTHORIZED => "登录已失效，请重新登录",
+        StatusCode::NOT_FOUND => "请求的内容不存在",
+        StatusCode::PAYLOAD_TOO_LARGE => "提交的内容过大",
+        s if s.is_server_error() => INTERNAL,
+        _ => "请求格式不对",
+    };
+    answer(status, text)
 }
 
 // ---- read paths, shared between the panel and the public page ----
@@ -258,7 +307,7 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
 pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     let full = authed(&app, &headers);
     if !full && !app.public_page() {
-        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+        return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
@@ -323,13 +372,12 @@ pub async fn metrics(
 ) -> Response {
     let full = authed(&app, &headers);
     if !readable(&app, full, id) {
-        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+        return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
     // After the two point lookups above, so an unauthorised caller is told so
     // rather than asked to retry later.
     let Ok(_permit) = HISTORY_GATE.try_acquire() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many history queries in flight, try again")
-            .into_response();
+        return answer(StatusCode::SERVICE_UNAVAILABLE, "查询历史的请求太多，稍后再试");
     };
     let hours = w.hours.clamp(1, if full { ADMIN_HOURS } else { PUBLIC_HOURS });
     let since = Utc::now().timestamp() - hours * 3_600;
@@ -487,7 +535,7 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     // running, and only the row it names can report whether it has.
     let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
     if session.is_none() && !app.public_page() {
-        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+        return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
     upgrade
         .read_buffer_size(SOCKET_BUFFER)
@@ -606,10 +654,10 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
 /// only because `period_start` clamps what it reads.
 fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -> Option<&'static str> {
     if reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
-        return Some("reset day must be from 1 to 31");
+        return Some("流量重置日要在 1 到 31 之间");
     }
     if price.is_some_and(|v| !v.is_finite() || v < 0.0) || limit.is_some_and(|v| v < 0) {
-        return Some("price and traffic limit must be non-negative");
+        return Some("价格和流量上限不能是负数");
     }
     None
 }
@@ -623,7 +671,7 @@ const MAX_GROUP: usize = 13;
 fn group_error(group: &mut String) -> Option<&'static str> {
     *group = group.trim().to_owned();
     if group.chars().count() > MAX_GROUP || group.chars().any(char::is_control) {
-        return Some("group must be at most 13 characters, without control characters");
+        return Some("分组名最多 13 个字，不能含控制字符");
     }
     None
 }
@@ -635,7 +683,7 @@ fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
     if let Some(name) = &mut node.name {
         *name = name.trim().to_owned();
         if name.is_empty() {
-            return Some("name is required");
+            return Some("请填写节点名称");
         }
     }
     if let Some(group) = &mut node.group {
@@ -655,7 +703,7 @@ fn pins(node: &mut NodePatch) -> Option<&'static str> {
     if let Some(cc) = &mut node.country_pin {
         *cc = cc.trim().to_ascii_uppercase();
         if !cc.is_empty() && !(cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_uppercase())) {
-            return Some("country must be two letters, or empty to look it up");
+            return Some("国家要填两个字母的代码，留空则自动识别");
         }
     }
     for (pin, v6) in [(&mut node.ipv4_pin, false), (&mut node.ipv6_pin, true)] {
@@ -669,8 +717,8 @@ fn pins(node: &mut NodePatch) -> Option<&'static str> {
         *pin = match parsed {
             Ok(ip) => ip.to_string(),
             Err(_) if typed.is_empty() => String::new(),
-            Err(_) if v6 => return Some("IPv6 must be an IPv6 address, or empty"),
-            Err(_) => return Some("IPv4 must be an IPv4 address, or empty"),
+            Err(_) if v6 => return Some("IPv6 要填一个 IPv6 地址，或者留空"),
+            Err(_) => return Some("IPv4 要填一个 IPv4 地址，或者留空"),
         };
     }
     None
@@ -701,11 +749,11 @@ pub async fn create_node(
     body: Result<Json<Node>, JsonRejection>,
 ) -> Response {
     if let Err(refusal) = provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, refusal).into_response();
+        return answer(StatusCode::FORBIDDEN, refusal);
     }
-    let Ok(Json(mut node)) = body else { return bad("invalid node") };
+    let Ok(Json(mut node)) = body else { return bad("节点数据格式不对") };
     if node.name.trim().is_empty() {
-        return bad("name is required");
+        return bad("请填写节点名称");
     }
     if let Some(message) =
         node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
@@ -782,7 +830,7 @@ pub async fn agent_register(
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
     if app.registrations.locked(ip) {
-        return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+        return answer(StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later");
     }
     // A rerun on a registered machine sends the token it already holds and
     // receives it back while that token still opens a node, so the rerun adds no
@@ -796,14 +844,13 @@ pub async fn agent_register(
             Ok(None) => {}
             // Read as "no node", a failed lookup would register a second node for
             // a machine whose node is intact.
-            Err(e) => return fail(e),
+            Err(e) => return script_fail(e),
         }
     }
     // One answer for both "no window is open" and "that key is wrong": the
     // difference is only useful to someone who has neither.
     let closed = || {
-        (StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
-            .into_response()
+        answer(StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
     };
     let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
     let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && Utc::now().timestamp() < until)
@@ -819,13 +866,12 @@ pub async fn agent_register(
     }
     match app.db.nodes_created_since(until - REGISTER_WINDOW) {
         Ok(n) if n >= REGISTER_LIMIT => {
-            return (
+            return answer(
                 StatusCode::FORBIDDEN,
                 "this window has registered enough nodes; open a new window from the panel's node list",
             )
-                .into_response()
         }
-        Err(e) => return fail(e),
+        Err(e) => return script_fail(e),
         Ok(_) => {}
     }
 
@@ -839,7 +885,7 @@ pub async fn agent_register(
     // and a node registered here must match one added through the panel.
     let node = match serde_json::from_value::<Node>(json!({ "name": name })) {
         Ok(node) => node,
-        Err(e) => return fail(e),
+        Err(e) => return script_fail(e),
     };
     let token = random_token();
     match app.db.create_node(&node, &token) {
@@ -848,15 +894,22 @@ pub async fn agent_register(
             invalidate_snapshot(&app);
             token.into_response()
         }
-        Err(e) => fail(e),
+        Err(e) => script_fail(e),
     }
+}
+
+/// [`fail`] for `install.sh`, whose own output is English and which prints the
+/// reply in one line after its own.
+fn script_fail(e: impl Into<anyhow::Error>) -> Response {
+    warn!("registration failed: {:#}", e.into());
+    answer(StatusCode::INTERNAL_SERVER_ERROR, "the hub hit an internal error; its log has the details")
 }
 
 /// Opens a registration window with a fresh key. Any previous key stops working
 /// the moment this returns.
 pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderMap) -> Response {
     if let Err(refusal) = provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, refusal).into_response();
+        return answer(StatusCode::FORBIDDEN, refusal);
     }
     let key = random_token();
     let until = (Utc::now().timestamp() + REGISTER_WINDOW).to_string();
@@ -880,7 +933,7 @@ pub async fn update_node(
     Path(id): Path<i64>,
     body: Result<Json<NodePatch>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(mut node)) = body else { return bad("invalid node") };
+    let Ok(Json(mut node)) = body else { return bad("节点数据格式不对") };
     if let Some(message) = patch_error(&mut node) {
         return bad(message);
     }
@@ -918,12 +971,12 @@ pub async fn update_nodes(
     body: Result<Json<NodeBatch>, JsonRejection>,
 ) -> Response {
     let Ok(Json(NodeBatch { mut ids, patch })) = body else {
-        return bad("invalid batch: only group and notify apply to several nodes at once");
+        return bad("批量修改只支持分组和通知");
     };
     ids.sort_unstable();
     ids.dedup();
     if ids.is_empty() {
-        return bad("no nodes selected");
+        return bad("没有选中节点");
     }
     let mut patch = NodePatch { group: patch.group, notify: patch.notify, ..Default::default() };
     if let Some(message) = patch_error(&mut patch) {
@@ -934,9 +987,7 @@ pub async fn update_nodes(
             invalidate_snapshot(&app);
             Json(json!({"updated": ids.len()})).into_response()
         }
-        Ok(false) => {
-            (StatusCode::NOT_FOUND, "有节点已被删除，没有做任何修改；刷新后重新选择").into_response()
-        }
+        Ok(false) => answer(StatusCode::NOT_FOUND, "有节点已被删除，没有做任何修改；刷新后重新选择"),
         Err(e) => fail(e),
     }
 }
@@ -955,8 +1006,7 @@ pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Jso
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }
-        // Every failure here indicates a malformed list from the caller.
-        Err(e) => bad(&e.to_string()),
+        Err(e) => fail(e),
     }
 }
 
@@ -1011,7 +1061,7 @@ pub async fn patch_traffic(
     Json(p): Json<TrafficPatch>,
 ) -> Response {
     if [p.total_rx, p.total_tx, p.month_rx, p.month_tx].into_iter().flatten().any(|v| v < 0) {
-        return bad("traffic must be non-negative");
+        return bad("流量不能是负数");
     }
     match app.db.set_traffic(id, &p) {
         Ok(true) => {
@@ -1035,7 +1085,7 @@ pub async fn ping_tasks(_: Admin, State(app): State<Shared>) -> Response {
 pub async fn reorder_ping_tasks(_: Admin, State(app): State<Shared>, Json(order): Json<Order>) -> Response {
     match app.db.reorder_ping_tasks(&order.ids) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => bad(&e.to_string()),
+        Err(e) => fail(e),
     }
 }
 
@@ -1072,12 +1122,12 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     task.name = task.name.trim().to_owned();
     task.target = task.target.trim().to_owned();
     if task.name.is_empty() || task.target.is_empty() {
-        return bad("name and target are required");
+        return bad("请填写名称和目标");
     }
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
     if !valid_target(&task.target) {
-        return bad("target must be host:port, for example 1.1.1.1:443 or [2606:4700:4700::1111]:443");
+        return bad("目标要写成「主机:端口」，例如 1.1.1.1:443 或 [2606:4700:4700::1111]:443");
     }
     // Refused rather than clamped, for the reason `setting_error` gives for
     // `retention_days`: the agent clamps this again on arrival, so an
@@ -1087,17 +1137,14 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     // task is assigned to; the panel reaches 0 simply by having its interval
     // field cleared.
     if !(Db::MIN_PROBE_INTERVAL..=3_600).contains(&task.interval) {
-        return bad(&format!("interval must be from {} to 3600 seconds", Db::MIN_PROBE_INTERVAL));
+        return bad(&format!("间隔要在 {} 到 3600 秒之间", Db::MIN_PROBE_INTERVAL));
     }
     match app.db.save_ping_task(&task) {
         Ok(id) => {
             agent_ws::push_ping_tasks(&app);
             Json(json!({"id": id})).into_response()
         }
-        // Every failure here originates with the caller: a node id that does not
-        // exist, or more probes on one node than the agent will run. The same
-        // reasoning as `reorder_nodes`.
-        Err(e) => bad(&e.to_string()),
+        Err(e) => fail(e),
     }
 }
 
@@ -1172,10 +1219,10 @@ pub struct Chunk {
 /// and would save about a second on a 6.7 MB backup.
 async fn receive(path: &str, chunk: &Chunk, max: u64, body: axum::body::Body) -> Result<u64, anyhow::Error> {
     if chunk.total == 0 || chunk.total > max {
-        anyhow::bail!("文件必须在 1 字节到 {} MiB 之间", max / 1024 / 1024);
+        refuse!("文件必须在 1 字节到 {} MiB 之间", max / 1024 / 1024);
     }
     if chunk.offset > chunk.total {
-        anyhow::bail!("分片位置越过了文件末尾");
+        refuse!("分片位置越过了文件末尾");
     }
 
     let mut options = std::fs::OpenOptions::new();
@@ -1191,14 +1238,14 @@ async fn receive(path: &str, chunk: &Chunk, max: u64, body: axum::body::Body) ->
     let mut file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("这次上传已经不在了，请从头开始")
+            refuse!("这次上传已经不在了，请从头开始")
         }
         Err(e) => return Err(e.into()),
     };
 
     let already = file.metadata()?.len();
     if already != chunk.offset {
-        anyhow::bail!("分片接不上：已经收到 {already} 字节，这一片却从 {} 开始", chunk.offset);
+        refuse!("分片接不上：已经收到 {already} 字节，这一片却从 {} 开始", chunk.offset);
     }
 
     match append(&mut file, chunk, body).await {
@@ -1231,7 +1278,7 @@ async fn append(
         let piece = piece?;
         received += piece.len() as u64;
         if chunk.offset + received > chunk.total {
-            anyhow::bail!("这一片超出了声明的文件大小");
+            refuse!("这一片超出了声明的文件大小");
         }
         file.write_all(&piece)?;
     }
@@ -1323,7 +1370,7 @@ pub async fn db_restore(
     let path = format!("{}.upload", app.db.file());
     let received = match receive(&path, &chunk, MAX_RESTORE, body).await {
         Ok(received) => received,
-        Err(e) => return bad(&format!("{e:#}")),
+        Err(e) => return fail(e),
     };
     if received < chunk.total {
         return Json(json!({"received": received})).into_response();
@@ -1346,7 +1393,7 @@ pub async fn db_restore(
     let source = scratch_path(&app, "restoring");
     if let Err(e) = std::fs::rename(&path, &source) {
         let _ = std::fs::remove_file(&path);
-        return bad(&format!("上传收齐了却取不到文件：{e}"));
+        return fail(e);
     }
 
     let outcome = restore(&app, &source).await;
@@ -1372,7 +1419,7 @@ pub async fn db_restore(
             };
             with_cookies(Json(json!({"ok": true})), [cookie])
         }
-        Err(e) => bad(&format!("{e:#}")),
+        Err(e) => fail(e),
     }
 }
 
@@ -1423,7 +1470,7 @@ pub async fn upload_theme(
     let name = path.to_string_lossy().into_owned();
     let received = match receive(&name, &chunk, MAX_THEME, body).await {
         Ok(received) => received,
-        Err(e) => return bad(&format!("{e:#}")),
+        Err(e) => return fail(e),
     };
     if received < chunk.total {
         return Json(json!({"received": received})).into_response();
@@ -1437,7 +1484,7 @@ pub async fn upload_theme(
     let source = app.themes.join(format!(".installing-{}.tar.gz", &random_token()[..16]));
     if let Err(e) = std::fs::rename(&path, &source) {
         let _ = std::fs::remove_file(&path);
-        return bad(&format!("上传收齐了却取不到文件：{e}"));
+        return fail(e);
     }
 
     // Off the runtime: gunzip plus a few thousand small writes.
@@ -1451,7 +1498,7 @@ pub async fn upload_theme(
     let _ = std::fs::remove_file(&source);
     match installed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(theme) => Json(json!({"theme": theme})).into_response(),
-        Err(e) => bad(&format!("{e:#}")),
+        Err(e) => fail(e),
     }
 }
 
@@ -1584,23 +1631,33 @@ fn path_segment(segment: &str) -> bool {
 pub async fn update_theme(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match update(&app, &short).await {
         Ok((updated, version)) => Json(json!({"updated": updated, "version": version})).into_response(),
-        Err(e) => bad(&format!("{e:#}")),
+        Err(e) => fail(e),
     }
 }
 
 async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error> {
-    use anyhow::{bail, Context};
+    use anyhow::Context;
 
-    let installed = crate::frontend::themes(app)?
-        .into_iter()
-        .find(|theme| theme.short == short)
-        .context("没有这个主题")?;
-    let (owner, repo) = github_repo(&installed.url)
-        .context("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包")?;
+    let Some(installed) = crate::frontend::themes(app)?.into_iter().find(|theme| theme.short == short) else {
+        refuse!("没有这个主题");
+    };
+    let Some((owner, repo)) = github_repo(&installed.url) else {
+        refuse!("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包");
+    };
 
-    let release = latest_release(app, &format!("{owner}/{repo}"))
-        .await
-        .with_context(|| format!("读不到 {owner}/{repo} 的最新 release"))?;
+    let release = match latest_release(app, &format!("{owner}/{repo}")).await {
+        Ok(release) => release,
+        Err(e) => {
+            let why = match e.status().map(|s| s.as_u16()) {
+                Some(404) => "这个仓库还没有正式 release",
+                // Unauthenticated callers get 60 requests an hour per address.
+                Some(403 | 429) => "GitHub 限制了这台机器的请求次数，过一小时再试",
+                Some(_) => "GitHub 接口出错，稍后再试",
+                None => "hub 连不上 api.github.com，检查它的网络",
+            };
+            return Err(e).context(crate::Shown(format!("读不到 {owner}/{repo} 的最新 release：{why}")));
+        }
+    };
 
     // Tags read `v1.2.3` while manifests carry `1.2.3`. Equal means up to date;
     // anything else is installed, including a deliberate downgrade, since the
@@ -1610,12 +1667,12 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
         return Ok((false, installed.version));
     }
     if !path_segment(tag) {
-        bail!("release 的 tag {tag:?} 不能出现在下载地址里");
+        refuse!("release 的 tag {tag:?} 不能出现在下载地址里");
     }
     // Checked here rather than by downloading and reading a 404: the asset name is
     // the contract, and stating so is the entire error message.
     if !release.assets.iter().any(|asset| asset.name == ARCHIVE) {
-        bail!("release {tag} 里没有 {ARCHIVE}");
+        refuse!("release {tag} 里没有 {ARCHIVE}");
     }
 
     // Through the panel's GitHub proxy when one is configured, the archive being
@@ -1624,17 +1681,26 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     // has the upload path.
     let url =
         crate::proxied(app, format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}"));
-    let response =
-        app.http.get(url).timeout(std::time::Duration::from_secs(120)).send().await?.error_for_status()?;
+    let unreachable = || crate::Shown(format!("下载 {ARCHIVE} 失败，检查 hub 的网络或面板里的 GitHub 代理"));
+    let response = app
+        .http
+        .get(url)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(unreachable)?;
     // The transfer stops at Content-Length, so checking it checks the body: a
     // header understating the archive cannot make more arrive. GitHub always
     // sends one; a proxy that omits it is refused rather than read unbounded.
     match response.content_length() {
         Some(size) if size <= MAX_THEME => {}
-        Some(size) => bail!("主题包 {} MiB，超过 {} MiB 的上限", size / 1024 / 1024, MAX_THEME / 1024 / 1024),
-        None => bail!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
+        Some(size) => {
+            refuse!("主题包 {} MiB，超过 {} MiB 的上限", size / 1024 / 1024, MAX_THEME / 1024 / 1024)
+        }
+        None => refuse!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
     }
-    let archive = response.bytes().await?;
+    let archive = response.bytes().await.with_context(unreachable)?;
 
     // The same unpacking, validation and atomic replace an upload undergoes,
     // constrained to the theme it may replace. The built-in theme has no
@@ -1669,7 +1735,7 @@ pub async fn theme_preview(_: Admin, State(app): State<Shared>, Path(short): Pat
 pub async fn delete_theme(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match crate::frontend::remove(&app.themes, &short) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => bad(&format!("{e:#}")),
+        Err(e) => fail(e),
     }
 }
 
@@ -1700,7 +1766,7 @@ pub async fn theme_config(
     Path(short): Path<String>,
 ) -> Response {
     if !authed(&app, &headers) && !app.public_page() {
-        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+        return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
     if !crate::frontend::valid_short(&short) {
         return StatusCode::NOT_FOUND.into_response();
@@ -1724,7 +1790,7 @@ pub async fn save_theme_config(
     Json(values): Json<serde_json::Map<String, Value>>,
 ) -> Response {
     if !crate::frontend::valid_short(&short) || !crate::frontend::selectable(&app, &short) {
-        return bad("theme is not installed");
+        return bad("主题没有安装");
     }
     match app.db.set(&theme_config_key(&short), &Value::Object(values).to_string()) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1809,13 +1875,13 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
     // `{"public_page": false}`, `{"retention_days": 7}` -- was formerly skipped by
     // a bare `continue`, so nothing was written while the response reported
     // success.
-    let Some(value) = value.as_str() else { return Some(format!("{key} must be a string")) };
+    let Some(value) = value.as_str() else { return Some(format!("设置 {key} 的值格式不对")) };
     match key {
-        "theme" if !crate::frontend::selectable(app, value) => Some("theme is not installed".into()),
+        "theme" if !crate::frontend::selectable(app, value) => Some("主题没有安装".into()),
         // Housekeeping clamps whatever it reads, so an unparsable value would be
         // stored, echoed back, and silently mean 7 days indefinitely.
         "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
-            Some("retention days must be a number from 1 to 3650".into())
+            Some("历史保留天数要在 1 到 3650 之间".into())
         }
         // The hub fetches this URL itself, so it must be one: a scheme it cannot
         // speak turns every agent download into a 502 that says nothing about the
@@ -1827,13 +1893,13 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         // chooses that binary, while the node still sees a valid TLS connection to
         // the hub.
         "github_proxy" if !(value.is_empty() || value.starts_with("https://")) => {
-            Some("GitHub proxy must start with https://: the agent binary is fetched through it and installed on every node".into())
+            Some("GitHub 代理必须以 https:// 开头：agent 程序经它下载，再安装到每个节点".into())
         }
-        "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
+        "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
-        _ => Some(format!("unknown setting: {key}")),
+        _ => Some(format!("没有这个设置项：{key}")),
     }
 }
 
@@ -1843,7 +1909,7 @@ pub async fn save_settings(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(map) = body.as_object() else { return bad("expected an object") };
+    let Some(map) = body.as_object() else { return bad("设置格式不对") };
     for (key, value) in map {
         if let Some(message) = setting_error(&app, key, value) {
             return bad(&message);
@@ -3352,5 +3418,35 @@ mod tests {
         for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
             assert!(!body.to_string().contains(secret), "{secret}");
         }
+    }
+
+    /// What every error response is held to: text written for the reader passes
+    /// as it is, and nothing else -- a library's error, axum's rejection wording
+    /// -- reaches the body.
+    #[tokio::test]
+    async fn only_written_text_reaches_an_error_response() {
+        let read = |r: Response| async move {
+            let r = plain_errors(r).await;
+            let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+        let raw = || std::io::Error::other("/opt/monitor/data/themes/.staging-1: incomplete deflate stream");
+
+        let internal = fail(raw());
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(read(internal).await, INTERNAL);
+
+        // The shown message, wherever it sits in the chain, and never its cause.
+        let wrapped =
+            anyhow::Error::from(raw()).context(crate::Shown("主题包损坏".into())).context("installing");
+        let refused = fail(wrapped);
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(read(refused).await, "主题包损坏");
+
+        let rejection =
+            (StatusCode::UNPROCESSABLE_ENTITY, "Failed to deserialize the JSON body").into_response();
+        assert_eq!(read(rejection).await, "请求格式不对");
+        assert_eq!(read(StatusCode::UNAUTHORIZED.into_response()).await, "登录已失效，请重新登录");
+        assert_eq!(read(bad("请填写节点名称")).await, "请填写节点名称");
     }
 }

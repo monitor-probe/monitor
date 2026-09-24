@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::api::Admin;
+use crate::api::{answer, Admin};
 use crate::{App, Shared};
 
 /// One alert. `node` lists the node names it concerns, comma-separated, and is
@@ -123,14 +123,19 @@ pub fn settings(app: &App, out: &mut serde_json::Map<String, Value>) {
 pub fn setting_error(key: &str, value: &str) -> Option<String> {
     if let Some((_, min, max, _)) = NUMBERS.iter().find(|(k, ..)| *k == key) {
         let fits = value.parse::<i64>().is_ok_and(|n| (*min..=*max).contains(&n));
-        return (!fits).then(|| format!("{key} must be a number from {min} to {max}"));
+        let label = match key {
+            "notify_grace" => "离线宽限期",
+            "notify_traffic" => "流量提醒",
+            _ => "到期提醒",
+        };
+        return (!fits).then(|| format!("{label}要填 {min} 到 {max} 之间的整数"));
     }
     let only = |s: &str, extra: &[u8]| {
         !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
     };
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let problem = match key {
-        "notify_login" => (!matches!(value, "on" | "off")).then_some("notify_login must be on or off"),
+        "notify_login" => (!matches!(value, "on" | "off")).then_some("登录提醒只能是 on 或 off"),
         "notify_webhook_headers" => return parse_headers(value).err(),
         // Empty clears a channel's field, or restores a template's default.
         "notify_telegram_token"
@@ -147,24 +152,24 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
         // is accepted.
         "notify_telegram_token" => {
             (!value.split_once(':').is_some_and(|(id, secret)| digits(id) && only(secret, b"_-")))
-                .then_some("Telegram bot token must look like 123456:ABC-DEF")
+                .then_some("Telegram Bot Token 的格式应为 123456:ABC-DEF")
         }
         "notify_telegram_chat" => {
             let valid = match value.strip_prefix('@') {
                 Some(name) => only(name, b"_"),
                 None => digits(value.strip_prefix('-').unwrap_or(value)),
             };
-            (!valid).then_some("Telegram chat must be a numeric id or an @username")
+            (!valid).then_some("Telegram Chat ID 要填数字 ID 或 @用户名")
         }
         // Plain http is accepted: a relay on the hub's own host or network is a
         // common target, and only an admin can set this.
         "notify_webhook_url" => (!reqwest::Url::parse(value)
             .is_ok_and(|u| matches!(u.scheme(), "http" | "https")))
-        .then_some("webhook URL must start with http:// or https://"),
+        .then_some("Webhook URL 必须以 http:// 或 https:// 开头"),
         "notify_webhook_body" => serde_json::from_str::<Value>(&render(value, &sample(), r#"s"i\te"#, true))
             .is_err()
-            .then_some("webhook body must be valid JSON once filled in; keep each placeholder inside quotes"),
-        _ => return Some(format!("unknown setting: {key}")),
+            .then_some("Webhook 请求体填入内容后必须是合法的 JSON，占位符要放在引号里"),
+        _ => return Some(format!("没有这个设置项：{key}")),
     };
     problem.map(Into::into)
 }
@@ -187,12 +192,11 @@ fn parse_headers(text: &str) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
-            let (name, value) =
-                line.split_once(':').ok_or("every webhook header line must read Name: value")?;
+            let (name, value) = line.split_once(':').ok_or("Webhook 请求头每行要写成「名称: 值」")?;
             let name = HeaderName::try_from(name.trim())
-                .map_err(|_| format!("invalid header name {:?}", name.trim()))?;
+                .map_err(|_| format!("Webhook 请求头名称 {:?} 不合法", name.trim()))?;
             let value = HeaderValue::try_from(value.trim())
-                .map_err(|_| format!("invalid value for header {name}"))?;
+                .map_err(|_| format!("Webhook 请求头 {name} 的值不合法"))?;
             Ok((name, value))
         })
         .collect()
@@ -244,8 +248,8 @@ enum Channel {
 impl Channel {
     fn name(&self) -> &'static str {
         match self {
-            Channel::Telegram { .. } => "telegram",
-            Channel::Webhook { .. } => "webhook",
+            Channel::Telegram { .. } => "Telegram",
+            Channel::Webhook { .. } => "Webhook",
         }
     }
 }
@@ -271,9 +275,13 @@ fn channels(app: &App) -> Vec<Channel> {
 /// Why a delivery failed, and whether another attempt could change that. A
 /// refused credential or a malformed request fails identically every time, and
 /// retrying it would hold the queue for 20 s per alert.
+///
+/// `reason` is the far end's own answer, for the log; `shown` is what the panel
+/// says, composed here from the status rather than quoted from the answer.
 struct Failure {
     retry: bool,
     reason: String,
+    shown: String,
 }
 
 /// The client alerts are sent with, separate from `App::http` because it must not
@@ -308,7 +316,12 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
             // default instead of in its place.
             let mut map = HeaderMap::new();
             map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            for (name, value) in parse_headers(headers).map_err(|reason| Failure { retry: false, reason })? {
+            let headers = parse_headers(headers).map_err(|reason| Failure {
+                retry: false,
+                shown: reason.clone(),
+                reason,
+            })?;
+            for (name, value) in headers {
                 map.insert(name, value);
             }
             client().post(url).headers(map).body(render(body, note, &site, true))
@@ -319,21 +332,31 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
     // and the panel.
     let mut response = request.send().await.map_err(|e| Failure {
         retry: true,
+        shown: if e.is_timeout() { "请求超时" } else { "连不上对方服务器" }.into(),
         reason: format!("{:#}", anyhow::Error::from(e.without_url())),
     })?;
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
-    if status.is_redirection() {
-        let reason = format!("{status}: the URL redirects; enter the address it redirects to");
-        return Err(Failure { retry: false, reason });
-    }
     // The first chunk carries the reason (Telegram's `description`, Discord's
     // `message`) without reading an error page of arbitrary length.
     let head = response.chunk().await.ok().flatten().unwrap_or_default();
+    let code = status.as_u16();
+    let why = match (channel, code) {
+        (_, 300..=399) => "地址发生了跳转，请填写跳转后的地址",
+        (Channel::Telegram { .. }, 401 | 404) => "Bot Token 不对",
+        (Channel::Telegram { .. }, 400) => "Chat ID 不对，或者 bot 还没有加入这个会话",
+        (Channel::Telegram { .. }, 403) => "bot 被这个会话移除或屏蔽了",
+        (_, 401 | 403) => "对方拒绝了鉴权，检查 URL 或请求头里的凭据",
+        (_, 404) => "地址不存在，检查 URL",
+        (_, 429) => "发送太频繁，被对方限流",
+        (_, 500..) => "对方服务器出错",
+        _ => "对方拒收了这条消息，检查请求体格式",
+    };
     Err(Failure {
         retry: status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
+        shown: format!("{why}（HTTP {code}）"),
         reason: format!(
             "{status}: {}",
             String::from_utf8_lossy(&head).chars().take(300).collect::<String>().trim()
@@ -380,7 +403,7 @@ pub async fn deliver(app: Shared, mut inbox: mpsc::Receiver<Note>) {
 pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
     let channels = channels(&app);
     if channels.is_empty() {
-        return (StatusCode::BAD_REQUEST, "no notification channel is configured").into_response();
+        return answer(StatusCode::BAD_REQUEST, "还没有配置通知渠道");
     }
     let note = Note {
         event: "test",
@@ -392,13 +415,14 @@ pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
     let mut failed = Vec::new();
     for channel in &channels {
         if let Err(f) = post(&app, channel, &note).await {
-            failed.push(format!("{}: {}", channel.name(), f.reason));
+            warn!("{} test alert not delivered: {}", channel.name(), f.reason);
+            failed.push(format!("{}：{}", channel.name(), f.shown));
         }
     }
     if failed.is_empty() {
         Json(json!({"sent": channels.iter().map(Channel::name).collect::<Vec<_>>()})).into_response()
     } else {
-        (StatusCode::BAD_GATEWAY, failed.join("; ")).into_response()
+        answer(StatusCode::BAD_GATEWAY, failed.join("；"))
     }
 }
 

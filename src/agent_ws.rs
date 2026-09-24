@@ -12,7 +12,7 @@ use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use chrono::{DateTime, Local};
 use serde::Deserialize;
 use serde_json::json;
@@ -266,11 +266,11 @@ pub async fn handler(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let Some(token) = bearer(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing token").into_response();
+        return crate::api::answer(StatusCode::UNAUTHORIZED, "missing token");
     };
     let Ok(Some(node_id)) = app.db.node_by_token(token) else {
         // The same response whether the token is malformed or merely unknown.
-        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        return crate::api::answer(StatusCode::UNAUTHORIZED, "invalid token");
     };
     let ip = node_ip(&headers, peer.ip()).to_string();
 
