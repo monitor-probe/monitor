@@ -18,7 +18,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -51,10 +51,10 @@ fn no_such_node() -> Response {
 
 // ---- read paths, shared between the panel and the public page ----
 
-/// Everything a report may expose under `metrics` on the public page: the agent
-/// contract minus the raw kernel counters, which are a wire-protocol detail
-/// disclosing a machine's entire lifetime traffic, plus the four figures the hub
-/// folds in itself. The panel sees the report as it arrived.
+/// Everything a report may expose under `metrics`: the agent contract minus the
+/// raw kernel counters, which are a wire-protocol detail disclosing a machine's
+/// entire lifetime traffic, plus the four traffic figures `node_view` fills in.
+/// The panel additionally sees `iface`.
 pub(crate) const PUBLIC_METRICS: [&str; 18] = [
     "uptime",
     "cpu",
@@ -79,17 +79,17 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
 fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool, today: NaiveDate) -> Value {
-    // The three capacities arrive twice: once in `Facts`, sent at the handshake
-    // and stored, and again in every `Metrics`. A machine that gains a disk while
-    // the agent is running -- the agent re-reads its mount table every sample so
-    // that it appears -- then has a stored figure that is stale until the next
-    // reconnect, possibly days away. Using the report while a node is connected
+    // The three capacities arrive twice: once in `Facts`, sent at the handshake,
+    // and again in every `Metrics`. The stored figure follows the reports a
+    // minute at a time and as the session ends, so it lags a disk mounted while
+    // the agent runs -- the agent re-reads its mount table every sample so that
+    // it appears -- by up to a minute. Using the report while a node is connected
     // keeps every consumer of this view on one number: the card reads the live
     // metrics and the detail page reads these, and they previously showed the
-    // same machine two different capacities. Offline, the stored figure is all
-    // there is. No floor is applied: a host whose swap has just been disabled
-    // reports zero and means it. A node connected but not yet reporting holds
-    // `Null`, where `get` returns nothing and the stored figure stands.
+    // same machine two different capacities. Offline, the stored figure is the
+    // last one reported. No floor is applied: a host whose swap has just been
+    // disabled reports zero and means it. A node connected but not yet reporting
+    // holds `Null`, where `get` returns nothing and the stored figure stands.
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
@@ -144,12 +144,22 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
     });
-    // An allowlist rather than a denylist: the agent ships from its own
-    // repository, so a field added there would otherwise reach anonymous visitors
-    // the day it is released. No address, hostname or note may ever do so.
-    if !full {
-        if let Some(m) = view["metrics"].as_object_mut() {
-            m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()));
+    // An allowlist rather than a denylist, for the panel as well: the agent ships
+    // from its own repository, so a field added there would otherwise reach
+    // anonymous visitors the day it is released, and a node token in the wrong
+    // hands could fill the panel's frame with whatever it sends. No address,
+    // hostname or note may ever reach a visitor.
+    if let Some(m) = view["metrics"].as_object_mut() {
+        m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()) || (full && k == "iface"));
+        // The same figures as the top-level ones, from the same row. Both official
+        // themes refuse a node's live view without them.
+        for (key, value) in agent_ws::INJECTED.into_iter().zip([
+            traffic.total_rx,
+            traffic.total_tx,
+            traffic.month_rx,
+            traffic.month_tx,
+        ]) {
+            m.insert(key.into(), json!(value));
         }
     }
     // Address, private notes and the token never leave the panel. The token is
@@ -903,6 +913,9 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // metrics. Dropped after the delete, so the reconnect that follows finds no
     // token to accept. The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // Its held reading as well, which would otherwise be booked into the node
+    // that inherits the id.
+    app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
 }
@@ -1004,8 +1017,8 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     // number is 5 seconds, the fastest probe available, run by every node the
     // task is assigned to; the panel reaches 0 simply by having its interval
     // field cleared.
-    if !(5..=3_600).contains(&task.interval) {
-        return bad("interval must be from 5 to 3600 seconds");
+    if !(Db::MIN_PROBE_INTERVAL..=3_600).contains(&task.interval) {
+        return bad(&format!("interval must be from {} to 3600 seconds", Db::MIN_PROBE_INTERVAL));
     }
     match app.db.save_ping_task(&task) {
         Ok(id) => {
@@ -1281,6 +1294,8 @@ pub async fn db_restore(
             // now belong to different nodes, or to none. Dropping the senders ends
             // those loops; each reconnects against the restored database.
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+            // Held readings belong to the database just replaced.
+            app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
             invalidate_snapshot(&app);
             let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
                 Ok(cookie) => cookie,
@@ -2151,7 +2166,7 @@ mod tests {
         for i in 0..30 * 1440 {
             app.db.insert_metric(id, now - i * 60, &json!({"cpu": 1.0})).unwrap();
             for task in 1..=PROBES {
-                app.db.insert_ping(id, task, now - i * 20, 42).unwrap();
+                app.db.insert_pings(id, &[(task, now - i * 20, 42)]).unwrap();
             }
         }
 
@@ -2221,11 +2236,11 @@ mod tests {
             task(&app, vec![id]);
         }
         for (i, latency) in [30, -1, -1, -1].into_iter().enumerate() {
-            app.db.insert_ping(id, 1, base + 10 + i as i64 * 20, latency).unwrap();
+            app.db.insert_pings(id, &[(1, base + 10 + i as i64 * 20, latency)]).unwrap();
         }
         // A second probe that never answered, and a third that answered cleanly.
-        app.db.insert_ping(id, 2, base + 10, -1).unwrap();
-        app.db.insert_ping(id, 3, base + 10, 12).unwrap();
+        app.db.insert_pings(id, &[(2, base + 10, -1)]).unwrap();
+        app.db.insert_pings(id, &[(3, base + 10, 12)]).unwrap();
 
         let m = &app.db.metrics(id, base, 120).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
@@ -2260,7 +2275,7 @@ mod tests {
         let wide_probe = task(&app, vec![wide]);
         let wide_base = base / 180 * 180;
         for i in 0..180 {
-            app.db.insert_ping(wide, wide_probe, wide_base + i, if i == 0 { -1 } else { 20 }).unwrap();
+            app.db.insert_pings(wide, &[(wide_probe, wide_base + i, if i == 0 { -1 } else { 20 })]).unwrap();
         }
         let (rows, _) = app.db.ping_records(wide, wide_base, 180).unwrap();
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
@@ -2273,7 +2288,7 @@ mod tests {
         let jitter = node(&app, "jitter", true);
         let jitter_probe = task(&app, vec![jitter]);
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
-            app.db.insert_ping(jitter, jitter_probe, wide_base + i as i64, latency).unwrap();
+            app.db.insert_pings(jitter, &[(jitter_probe, wide_base + i as i64, latency)]).unwrap();
         }
         let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().0[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
@@ -2285,7 +2300,7 @@ mod tests {
         let even = node(&app, "even", true);
         let even_probe = task(&app, vec![even]);
         for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
-            app.db.insert_ping(even, even_probe, wide_base + i as i64, latency).unwrap();
+            app.db.insert_pings(even, &[(even_probe, wide_base + i as i64, latency)]).unwrap();
         }
         assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().0[0]["latency"], 25);
     }
@@ -2307,9 +2322,9 @@ mod tests {
         // A full minute at five seconds per round with no loss, then a minute
         // holding one sample, which was lost, before the probe stopped.
         for i in 0..12 {
-            app.db.insert_ping(id, probe, base + i * 5, 20).unwrap();
+            app.db.insert_pings(id, &[(probe, base + i * 5, 20)]).unwrap();
         }
-        app.db.insert_ping(id, probe, base + 60, -1).unwrap();
+        app.db.insert_pings(id, &[(probe, base + 60, -1)]).unwrap();
 
         let (rows, loss) = app.db.ping_records(id, base, 60).unwrap();
         let per_bucket: Vec<i64> = rows.iter().map(|r| r["loss"].as_i64().unwrap_or(0)).collect();
@@ -2334,8 +2349,8 @@ mod tests {
         let _held = connect(
             &app,
             open,
-            json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0,
-                   "hostname": "db-prod-01", "ip": "203.0.113.7"}),
+            json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0, "iface": "eth1",
+                   "hostname": "db-prod-01", "ip": "203.0.113.7", "total_rx": 1}),
         );
 
         let public = visible_nodes(&app, false).unwrap();
@@ -2356,11 +2371,22 @@ mod tests {
             assert!(public[0]["metrics"].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert_eq!(public[0]["metrics"]["cpu"], 1.0, "the rest of the report still goes out");
+        assert!(public[0]["metrics"].get("iface").is_none(), "the interface list is the panel's");
 
         let admin = visible_nodes(&app, true).unwrap();
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
+        // The panel reads `iface` and nothing else the contract leaves out.
+        assert_eq!(admin[0]["metrics"]["iface"], "eth1");
+        for hidden in ["boot_id", "net_rx_total", "hostname", "ip"] {
+            assert!(admin[0]["metrics"].get(hidden).is_none(), "{hidden} is not part of the panel's frame");
+        }
+        // The traffic inside `metrics` is the hub's, whatever the report claimed.
+        for view in [&public[0], &admin[0]] {
+            assert_eq!(view["metrics"]["total_rx"], view["total_rx"]);
+            assert_eq!(view["metrics"]["month_tx"], view["month_tx"]);
+        }
     }
 
     #[tokio::test]
@@ -2824,9 +2850,9 @@ mod tests {
     fn a_node_view_carries_traffic_even_while_offline() {
         let app = app();
         let id = node(&app, "n", true);
-        app.db.accumulate(id, "b", Some((100, 100))).unwrap();
-        app.db.accumulate(id, "b", Some((900, 500))).unwrap();
-        app.db.touch_seen(id, 1_700_000_000).unwrap();
+        app.db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
+        app.db.accumulate(id, "b", (900, 500), Local::now()).unwrap();
+        app.db.touch_seen(id, 1_700_000_000, &serde_json::Value::Null).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
         assert_eq!(view["online"], false);

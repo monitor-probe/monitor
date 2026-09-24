@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, Local, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -476,7 +476,7 @@ fn one() -> u32 {
     1
 }
 
-#[derive(Serialize, Debug, Clone, Default)]
+#[derive(Serialize, Debug, Clone, Default, PartialEq)]
 pub struct Traffic {
     pub total_rx: i64,
     pub total_tx: i64,
@@ -692,10 +692,19 @@ impl Db {
         Ok(self.conn().query_row("SELECT COUNT(*) FROM node WHERE created_at >= ?1", [ts], |r| r.get(0))?)
     }
 
-    /// Records that the node reported. Written on the same cadence as the metric
-    /// row, so it costs one update per minute rather than one per report.
-    pub fn touch_seen(&self, id: i64, ts: i64) -> Result<()> {
-        self.conn().execute("UPDATE node SET last_seen=?2 WHERE id=?1", params![id, ts])?;
+    /// Records when the node last reported, with the capacities that report
+    /// carried. Written with each metric row and once more as the session ends,
+    /// so an offline node shows the disk it last had rather than the one it
+    /// connected with. A capacity absent from `metrics` keeps its stored value.
+    pub fn touch_seen(&self, id: i64, ts: i64, metrics: &serde_json::Value) -> Result<()> {
+        let n = |k: &str| metrics.get(k).and_then(serde_json::Value::as_i64);
+        self.conn()
+            .prepare_cached(
+                "UPDATE node SET last_seen=?2, mem_total=COALESCE(?3,mem_total),
+                                 swap_total=COALESCE(?4,swap_total), disk_total=COALESCE(?5,disk_total)
+                 WHERE id=?1",
+            )?
+            .execute(params![id, ts, n("mem_total"), n("swap_total"), n("disk_total")])?;
         Ok(())
     }
 
@@ -946,17 +955,51 @@ impl Db {
         rows.map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
-    /// Folds one report's raw kernel counters into the node's running totals.
+    /// The traffic row as stored, without the period gate `all_traffic` applies,
+    /// for tests that compare what two ways of booking left behind.
+    #[cfg(test)]
+    pub fn stored_traffic(&self, node_id: i64) -> Traffic {
+        self.conn()
+            .query_row(
+                "SELECT total_rx, total_tx, month_rx, month_tx, month_start, day_rx, day_tx
+                 FROM traffic WHERE node_id=?1",
+                [node_id],
+                |r| {
+                    Ok(Traffic {
+                        total_rx: r.get(0)?,
+                        total_tx: r.get(1)?,
+                        month_rx: r.get(2)?,
+                        month_tx: r.get(3)?,
+                        month_start: r.get(4)?,
+                        day_rx: r.get(5)?,
+                        day_tx: r.get(6)?,
+                    })
+                },
+            )
+            .expect("a traffic row")
+    }
+
+    /// Books one reading of a node's raw kernel counters into its running totals.
     ///
-    /// A changed boot_id, or a counter that moved backwards, means the readings
-    /// no longer continue the previous ones; the total must not follow them
-    /// downward. `None` denotes a report carrying no readable counters at all --
-    /// see below.
+    /// A changed boot_id, or a counter that moved backwards, means the reading no
+    /// longer continues the previous one; the total must not follow it downward.
+    /// Readings arrive here about once a minute rather than with every report,
+    /// which gives the same totals: see `agent_ws::file`.
+    ///
+    /// `at` is when the hub received the reading, and dates it for the day and
+    /// billing period. A reading held back over midnight is booked after it, and
+    /// still belongs to the day it arrived in.
     ///
     /// The billing reset day is read here rather than passed in: it is one join
     /// from a row this already reads, and fetching it separately would cost every
-    /// report a second acquisition of the single write connection.
-    pub fn accumulate(&self, node_id: i64, boot_id: &str, counters: Option<(i64, i64)>) -> Result<Traffic> {
+    /// booking a second acquisition of the single write connection.
+    pub fn accumulate(
+        &self,
+        node_id: i64,
+        boot_id: &str,
+        (rx, tx): (i64, i64),
+        at: DateTime<Local>,
+    ) -> Result<Traffic> {
         let conn = self.conn();
         let (
             prev_boot,
@@ -999,7 +1042,7 @@ impl Db {
         // from, and a bare reading represents the machine's entire history.
         //
         // The baseline can be missing in three ways, all handled identically. A
-        // first report has none. A reading that shrank under the same boot lost
+        // first reading has none. A reading that shrank under the same boot lost
         // one -- an interface included in the sum has disappeared -- so the
         // reading is the remainder of that history and booking it would count it
         // twice. A changed boot_id means the counters restarted, that the agent
@@ -1008,24 +1051,18 @@ impl Db {
         // indistinguishably from here, that a second machine shares the token.
         // Realigning costs the seconds since the reboot; the alternative costs
         // hundreds of gigabytes against a total that only increases.
-        //
-        // A fourth case: no reading at all. The row is left exactly as it was,
-        // since writing zero would realign the baseline to zero and book the next
-        // report's lifetime counter as a single delta.
-        let (d_rx, d_tx) = match counters {
-            None => (0, 0),
-            Some(_) if prev_boot.is_empty() || prev_boot != boot_id => {
-                // Logged in either case: on a healthy node this is a reboot or
-                // the agent summing a different set of interfaces, while one
-                // every few seconds indicates two machines sharing a token or
-                // counted interfaces coming and going. The value stays out of
-                // the log: it is the agent's text.
-                if !prev_boot.is_empty() {
-                    info!("node {node_id} reports a new boot_id; re-aligning");
-                }
-                (0, 0)
+        let (d_rx, d_tx) = if prev_boot.is_empty() || prev_boot != boot_id {
+            // Logged in either case: on a healthy node this is a reboot or the
+            // agent summing a different set of interfaces, while one every few
+            // seconds indicates two machines sharing a token or counted
+            // interfaces coming and going. The value stays out of the log: it is
+            // the agent's text.
+            if !prev_boot.is_empty() {
+                info!("node {node_id} reports a new boot_id; re-aligning");
             }
-            Some((rx, tx)) => ((rx.saturating_sub(last_rx)).max(0), (tx.saturating_sub(last_tx)).max(0)),
+            (0, 0)
+        } else {
+            ((rx.saturating_sub(last_rx)).max(0), (tx.saturating_sub(last_tx)).max(0))
         };
         // Saturating rather than a plain `+`: the release profile disables
         // overflow checks, so a total near i64::MAX would wrap to a large
@@ -1043,29 +1080,35 @@ impl Db {
         // Both boundaries are calendar dates -- the day a provider resets an
         // allowance, the day a person means by "today" -- so both follow the
         // hub's local timezone rather than UTC.
-        let period = period_start(Local::now().date_naive(), reset_day).to_string();
+        //
+        // Never dated before a period the row already carries. The panel stamps
+        // the current period with a correction, which a reading held back from
+        // before the boundary would otherwise read as a new period and discard;
+        // a wall clock stepped back would likewise restart the day. A date later
+        // than the stamp is used as it is, so a changed reset day still takes
+        // effect.
+        let date = at.date_naive();
+        let dated = |stored: &str| stored.parse::<NaiveDate>().map_or(date, |stamp| stamp.max(date));
+        let period = period_start(dated(&month_start), reset_day).to_string();
         if month_start != period {
             // A new billing period restarts the month counter but not the total.
             month_rx = d_rx;
             month_tx = d_tx;
         }
-        let today = Local::now().date_naive().to_string();
-        if day_start != today {
+        let day = dated(&day_start).to_string();
+        if day_start != day {
             day_rx = d_rx;
             day_tx = d_tx;
         }
 
-        if let Some((rx, tx)) = counters {
-            conn.prepare_cached(
-                "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
-                                month_rx=?7, month_tx=?8, month_start=?9, day_rx=?10, day_tx=?11,
-                                day_start=?12 WHERE node_id=?1",
-            )?
-            .execute(params![
-                node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx,
-                today
-            ])?;
-        }
+        conn.prepare_cached(
+            "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
+                            month_rx=?7, month_tx=?8, month_start=?9, day_rx=?10, day_tx=?11,
+                            day_start=?12 WHERE node_id=?1",
+        )?
+        .execute(params![
+            node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx, day
+        ])?;
         Ok(Traffic { total_rx, total_tx, month_rx, month_tx, month_start: period, day_rx, day_tx })
     }
 
@@ -1210,7 +1253,12 @@ impl Db {
     ///
     /// The hub knows the total, so the hub issues the refusal. The two must stay
     /// in step; the agent's copy is the backstop rather than the message.
-    const MAX_PROBES_PER_NODE: i64 = 64;
+    pub const MAX_PROBES_PER_NODE: i64 = 64;
+
+    /// The shortest probe interval in seconds. The agent clamps to the same
+    /// floor, so together with [`Self::MAX_PROBES_PER_NODE`] it bounds how many
+    /// results an honest node can send.
+    pub const MIN_PROBE_INTERVAL: i64 = 5;
 
     /// Replaces the assignments wholesale, or with `base` applies only what
     /// changed from it. Either way in one transaction: failing between the
@@ -1356,9 +1404,13 @@ impl Db {
         Ok(serde_json::Value::Object(names))
     }
 
-    /// Files one probe result, and only under a probe this node is assigned. A
-    /// result for anything else is dropped rather than treated as an error, since
-    /// the agent can do nothing useful with the distinction.
+    /// Files a node's probe results as `(task_id, ts, latency)`, each only under a
+    /// probe this node is assigned. A result for anything else is dropped rather
+    /// than treated as an error, since the agent can do nothing useful with the
+    /// distinction.
+    ///
+    /// One transaction for the batch: the session gathers a minute of results and
+    /// files them together, since each commit writes at least one page.
     ///
     /// The assignment is tested inside the statement because that is the only
     /// place it is atomic with the write: `ping_record` carries no foreign key,
@@ -1366,20 +1418,25 @@ impl Db {
     /// without an assignment. A result already in flight when the panel deleted
     /// its probe, which would otherwise land after `delete_ping_task` swept the
     /// history and be inherited by whichever probe SQLite assigns the id to next.
-    /// And a node token in the wrong hands: every other write an agent can cause
-    /// is bounded -- one `metric` row per node per minute, one `traffic` row per
-    /// node -- while `task_id` is chosen by the reporter, making this the one
-    /// write whose row count would otherwise be unbounded.
+    /// And a node token in the wrong hands: `task_id` is chosen by the reporter,
+    /// so without the test the rows it could create would be unbounded.
     ///
     /// The chart's `task_id IN (assignments)` filter hides both afterwards, but
     /// does not prevent the write, its storage, or the id being reused.
-    pub fn insert_ping(&self, node_id: i64, task_id: i64, ts: i64, latency: i64) -> Result<()> {
-        self.conn().execute(
-            "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
-             SELECT ?1, ?2, ?3, ?4
-             WHERE EXISTS (SELECT 1 FROM ping_node WHERE task_id = ?2 AND node_id = ?1)",
-            params![node_id, task_id, ts, latency],
-        )?;
+    pub fn insert_pings(&self, node_id: i64, results: &[(i64, i64, i64)]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
+                 SELECT ?1, ?2, ?3, ?4
+                 WHERE EXISTS (SELECT 1 FROM ping_node WHERE task_id = ?2 AND node_id = ?1)",
+            )?;
+            for (task_id, ts, latency) in results {
+                insert.execute(params![node_id, task_id, ts, latency])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2003,7 +2060,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
+        db.insert_pings(id, &[(task, now - 9 * 86_400, 12)]).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 9 * 86_400);
 
         db.set("retention_days", "9999").unwrap();
@@ -2137,20 +2194,20 @@ mod tests {
         let id = node(&db, 1);
 
         // The first report only establishes the baseline.
-        let t = db.accumulate(id, "boot-a", Some((5_000, 3_000))).unwrap();
+        let t = db.accumulate(id, "boot-a", (5_000, 3_000), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (0, 0));
 
-        let t = db.accumulate(id, "boot-a", Some((9_000, 6_000))).unwrap();
+        let t = db.accumulate(id, "boot-a", (9_000, 6_000), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000));
 
         // Reboot: a new boot_id with counters restarting near zero. The total must
         // not fall back to the fresh value, and the 700 bytes moved before the
         // first report are not booked, nothing having measured them.
-        let t = db.accumulate(id, "boot-b", Some((700, 400))).unwrap();
+        let t = db.accumulate(id, "boot-b", (700, 400), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000), "a reboot must not reset the total");
 
         // Counting resumes from the new baseline.
-        let t = db.accumulate(id, "boot-b", Some((1_700, 900))).unwrap();
+        let t = db.accumulate(id, "boot-b", (1_700, 900), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (5_000, 3_500));
         assert_eq!((t.month_rx, t.month_tx), (5_000, 3_500));
     }
@@ -2165,15 +2222,15 @@ mod tests {
         let id = node(&db, 1);
         let (a, b) = (100_000_000_000, 80_000_000_000); // two lifetime counters
 
-        db.accumulate(id, "boot-a", Some((a, a))).unwrap();
-        let t = db.accumulate(id, "boot-a", Some((a + 1_000, a + 1_000))).unwrap();
+        db.accumulate(id, "boot-a", (a, a), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (a + 1_000, a + 1_000), Local::now()).unwrap();
         assert_eq!(t.total_rx, 1_000, "the real machine's own traffic still counts");
 
         // Every swap presents a boot_id with no baseline, so every swap books
         // nothing.
         for round in 0..3 {
-            db.accumulate(id, "boot-b", Some((b + round, b + round))).unwrap();
-            db.accumulate(id, "boot-a", Some((a + 1_000 + round, a + 1_000 + round))).unwrap();
+            db.accumulate(id, "boot-b", (b + round, b + round), Local::now()).unwrap();
+            db.accumulate(id, "boot-a", (a + 1_000 + round, a + 1_000 + round), Local::now()).unwrap();
         }
         let t = db.all_traffic()[&id].clone();
         assert!(t.total_rx < 10_000, "six swaps booked {} bytes, not a lifetime counter", t.total_rx);
@@ -2183,27 +2240,27 @@ mod tests {
     fn a_shrinking_reading_re_aligns_instead_of_re_counting_history() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", Some((10_000, 10_000))).unwrap();
-        let t = db.accumulate(id, "boot-a", Some((12_000, 12_000))).unwrap();
+        db.accumulate(id, "boot-a", (10_000, 10_000), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (12_000, 12_000), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // The same boot with a reduced reading: an interface included in the sum
         // has gone, so this is the remainder of the machine's history rather than
         // new bytes.
-        let t = db.accumulate(id, "boot-a", Some((500, 500))).unwrap();
+        let t = db.accumulate(id, "boot-a", (500, 500), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // Aligned to the smaller baseline, counting resumes from there.
-        let t = db.accumulate(id, "boot-a", Some((900, 900))).unwrap();
+        let t = db.accumulate(id, "boot-a", (900, 900), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // A new boot realigns identically, for the same reason: it has no baseline
         // either.
-        let t = db.accumulate(id, "boot-b", Some((300, 300))).unwrap();
+        let t = db.accumulate(id, "boot-b", (300, 300), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // One direction shrinking does not deprive the other of its increment.
-        let t = db.accumulate(id, "boot-b", Some((100, 900))).unwrap();
+        let t = db.accumulate(id, "boot-b", (100, 900), Local::now()).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 3_000));
     }
 
@@ -2214,24 +2271,54 @@ mod tests {
     fn day_and_month_restart_independently_while_the_total_keeps_climbing() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", Some((0, 0))).unwrap();
-        let t = db.accumulate(id, "boot-a", Some((8_000, 4_000))).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (8_000, 4_000), Local::now()).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (8_000, 4_000));
         assert_eq!((t.month_rx, t.month_tx), (8_000, 4_000));
 
         // Midnight passes, forced through the stored date the rollover reads.
         db.conn().execute("UPDATE traffic SET day_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", Some((9_500, 4_600))).unwrap();
+        let t = db.accumulate(id, "boot-a", (9_500, 4_600), Local::now()).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (1_500, 600), "a new day counts only this report's delta");
         assert_eq!(t.month_rx, 9_500, "the month is not a day");
         assert_eq!(t.total_rx, 9_500, "and the total is neither");
 
         // The billing period then rolls over, partway through that same day.
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", Some((10_000, 4_700))).unwrap();
+        let t = db.accumulate(id, "boot-a", (10_000, 4_700), Local::now()).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (500, 100), "a new period counts only this report's delta");
         assert_eq!((t.day_rx, t.day_tx), (2_000, 700), "the day carries on across a billing rollover");
         assert_eq!(t.total_rx, 10_000, "lifetime total is untouched by either rollover");
+    }
+
+    /// A reading is dated by its arrival, which for one held back over a boundary
+    /// is earlier than its booking. It must never take the row back into a period
+    /// already stamped on it: the panel stamps the current one with a correction,
+    /// and a wall clock stepped back would otherwise restart the day. A later
+    /// date still moves the period, as a changed reset day requires.
+    #[test]
+    fn a_reading_is_never_booked_into_a_period_already_left() {
+        use chrono::TimeZone;
+        let db = db();
+        let id = node(&db, 20);
+        let on = |d: u32| Local.with_ymd_and_hms(2026, 9, d, 12, 0, 0).unwrap();
+        db.accumulate(id, "boot-a", (1_000, 0), on(24)).unwrap();
+        db.accumulate(id, "boot-a", (3_000, 0), on(24)).unwrap();
+        let t = db.accumulate(id, "boot-a", (3_500, 0), on(23)).unwrap();
+        assert_eq!(t.day_rx, 2_500, "a reading dated the day before does not restart today");
+        assert_eq!(t.month_start, "2026-09-20");
+
+        // The reset day moves to the 1st: the period now starts earlier, and a
+        // reading dated after the stamp still switches to it.
+        db.update_node(id, &NodePatch { traffic_reset_day: Some(1), ..Default::default() }).unwrap();
+        let t = db.accumulate(id, "boot-a", (4_000, 0), on(24)).unwrap();
+        assert_eq!((t.month_start.as_str(), t.month_rx), ("2026-09-01", 500));
+
+        // A correction stamps the current period; a reading from the one before,
+        // held over the boundary, lands on top of it rather than discarding it.
+        db.set_traffic(id, &TrafficPatch { month_rx: Some(10_000), ..Default::default() }).unwrap();
+        let t = db.accumulate(id, "boot-a", (4_500, 0), Local::now() - chrono::Duration::days(40)).unwrap();
+        assert_eq!(t.month_rx, 10_500, "the correction survives a reading dated before it");
     }
 
     /// The other half of the rollover: the counters restart on the node's next
@@ -2241,8 +2328,8 @@ mod tests {
     fn a_node_that_went_quiet_before_a_boundary_reads_as_zero_this_period() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", Some((0, 0))).unwrap();
-        db.accumulate(id, "boot-a", Some((8_000, 4_000))).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (8_000, 4_000), Local::now()).unwrap();
         assert_eq!(db.all_traffic()[&id].day_rx, 8_000, "still today, so it still counts");
 
         // Offline across both boundaries, with no report to restart either.
@@ -2295,9 +2382,9 @@ mod tests {
             ..Default::default()
         };
         let task = db.save_ping_task(&probe(vec![id])).unwrap();
-        db.accumulate(id, "b", Some((10, 10))).unwrap();
+        db.accumulate(id, "b", (10, 10), Local::now()).unwrap();
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
-        db.insert_ping(id, task, 1, 42).unwrap();
+        db.insert_pings(id, &[(task, 1, 42)]).unwrap();
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 0);
@@ -2329,7 +2416,7 @@ mod tests {
             ..Default::default()
         };
         let old = db.save_ping_task(&probe("tokyo")).unwrap();
-        db.insert_ping(id, old, 1, 999).unwrap();
+        db.insert_pings(id, &[(old, 1, 999)]).unwrap();
         db.delete_ping_task(old).unwrap();
 
         let fresh = db.save_ping_task(&probe("singapore")).unwrap();
@@ -2359,14 +2446,14 @@ mod tests {
             })
             .unwrap();
 
-        db.insert_ping(mine, task, 1, 42).unwrap();
+        db.insert_pings(mine, &[(task, 1, 42)]).unwrap();
         assert_eq!(rows().unwrap(), 1, "the node the probe is assigned to files its own result");
 
         // A probe that exists but belongs to another node, and ids naming no probe
         // at all: what a node token can place on the wire.
-        db.insert_ping(other, task, 1, 42).unwrap();
+        db.insert_pings(other, &[(task, 1, 42)]).unwrap();
         for invented in [7, 999_999, i64::from(i32::MAX) + 1] {
-            db.insert_ping(mine, invented, 1, 42).unwrap();
+            db.insert_pings(mine, &[(invented, 1, 42)]).unwrap();
         }
         assert_eq!(rows().unwrap(), 1, "nothing else reaches the table");
 
@@ -2374,7 +2461,7 @@ mod tests {
         // cannot land after the sweep and be inherited by the next probe to take
         // the id.
         db.delete_ping_task(task).unwrap();
-        db.insert_ping(mine, task, 2, 42).unwrap();
+        db.insert_pings(mine, &[(task, 2, 42)]).unwrap();
         assert_eq!(rows().unwrap(), 0, "a late result for a deleted probe is dropped");
     }
 
@@ -2401,7 +2488,7 @@ mod tests {
     fn a_month_correction_is_stamped_with_the_period_it_was_made_in() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", Some((0, 0))).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
         // A node silent since before its reset day still holds the old period.
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
 
@@ -2418,7 +2505,7 @@ mod tests {
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (300, 100), "the correction reads back as this period's");
 
-        let t = db.accumulate(id, "boot-a", Some((500, 50))).unwrap();
+        let t = db.accumulate(id, "boot-a", (500, 50), Local::now()).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (800, 150), "and the next report adds to it");
         assert_eq!((t.total_rx, t.total_tx), (4_500, 2_050));
     }
@@ -2443,8 +2530,8 @@ mod tests {
         assert_eq!(n.price, 0.0);
         assert_eq!(n.expires_at, None);
 
-        db.accumulate(id, "boot", Some((0, 0))).unwrap();
-        db.accumulate(id, "boot", Some((120_000, 10_000))).unwrap();
+        db.accumulate(id, "boot", (0, 0), Local::now()).unwrap();
+        db.accumulate(id, "boot", (120_000, 10_000), Local::now()).unwrap();
         db.set_traffic(id, &TrafficPatch { month_tx: Some(3_000), ..Default::default() }).unwrap();
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.total_rx, t.total_tx, t.month_rx, t.month_tx), (120_000, 10_000, 120_000, 3_000));
@@ -2503,8 +2590,8 @@ mod tests {
     fn prune_drops_history_but_never_traffic_totals() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "b", Some((100, 100))).unwrap();
-        db.accumulate(id, "b", Some((900, 900))).unwrap();
+        db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
+        db.accumulate(id, "b", (900, 900), Local::now()).unwrap();
         let old = Utc::now().timestamp() - 40 * 86_400;
         db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
@@ -2722,7 +2809,7 @@ mod tests {
             .unwrap()
         };
         let task = probe(vec![id], 0);
-        db.insert_ping(id, task, 100, 42).unwrap();
+        db.insert_pings(id, &[(task, 100, 42)]).unwrap();
         assert_eq!(db.ping_records(id, 0, 60).unwrap().0.len(), 1, "an assigned probe draws");
 
         probe(vec![], task);

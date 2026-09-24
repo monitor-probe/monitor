@@ -646,7 +646,7 @@ mod tests {
             .create_node(&Node { name: name.into(), traffic_reset_day: 1, ..Default::default() }, name)
             .unwrap();
         app.db.update_node(id, &NodePatch { notify: Some(notify), ..Default::default() }).unwrap();
-        app.db.touch_seen(id, last_seen).unwrap();
+        app.db.touch_seen(id, last_seen, &serde_json::Value::Null).unwrap();
         id
     }
 
@@ -776,11 +776,11 @@ mod tests {
         };
         let back = |now| {
             connect(&app, id);
-            app.db.touch_seen(id, now).unwrap();
+            app.db.touch_seen(id, now, &serde_json::Value::Null).unwrap();
         };
         let gone = |last_seen| {
             app.agents.write().unwrap().remove(&id);
-            app.db.touch_seen(id, last_seen).unwrap();
+            app.db.touch_seen(id, last_seen, &serde_json::Value::Null).unwrap();
         };
 
         // A five-minute absence is an ordinary outage.
@@ -845,7 +845,7 @@ mod tests {
         metered(new);
         assert_eq!(at(t + 60), ["traffic"]);
         connect(&app, new);
-        app.db.touch_seen(new, t + 600).unwrap();
+        app.db.touch_seen(new, t + 600, &serde_json::Value::Null).unwrap();
         assert!(at(t + 600).is_empty());
         app.agents.write().unwrap().remove(&new);
         assert!(at(t + 630).is_empty());

@@ -38,6 +38,10 @@ pub struct App {
     /// and its latest report. A single map, since connectivity and current
     /// figures are one fact about a node rather than two. See `agent_ws`.
     pub agents: RwLock<HashMap<i64, Agent>>,
+    /// Each node's newest traffic reading, booked about once a minute rather
+    /// than with every report. Per node rather than per connection; see
+    /// `agent_ws::file`.
+    pub readings: Mutex<HashMap<i64, agent_ws::Reading>>,
     /// Last rendered node list per audience, `[public, admin]`, with the
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
@@ -78,6 +82,7 @@ impl App {
         Self {
             db,
             agents: RwLock::default(),
+            readings: Mutex::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
@@ -432,6 +437,7 @@ async fn main() -> Result<()> {
         );
     }
 
+    let held = app.clone();
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
@@ -523,6 +529,10 @@ async fn main() -> Result<()> {
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await?;
+    // The readings held back from the traffic rows. Unbooked, they cost nothing
+    // to a node that reports again under the same boot, but a node rebooting
+    // while the hub is down would take them with it.
+    agent_ws::book_held(&held, None);
     Ok(())
 }
 
