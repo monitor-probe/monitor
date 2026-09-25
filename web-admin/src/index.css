@@ -39,6 +39,8 @@
   --chart-5: oklch(0.769 0.188 70.08);
   --ok: oklch(0.63 0.17 149);
   --warn: oklch(0.75 0.17 70);
+  --near: oklch(0.575 0.12 55);
+  --over: oklch(0.5 0.14 27);
 }
 
 .dark {
@@ -67,6 +69,8 @@
   --chart-5: oklch(0.645 0.246 16.439);
   --ok: oklch(0.7 0.16 150);
   --warn: oklch(0.8 0.16 75);
+  --near: oklch(0.8 0.1 65);
+  --over: oklch(0.7 0.11 25);
 }
 
 @theme inline {
@@ -99,6 +103,8 @@
   --color-chart-5: var(--chart-5);
   --color-ok: var(--ok);
   --color-warn: var(--warn);
+  --color-near: var(--near);
+  --color-over: var(--over);
 }
 
 @layer base {

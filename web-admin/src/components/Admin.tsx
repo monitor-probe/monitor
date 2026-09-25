@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
@@ -193,6 +193,15 @@ function DragHandle({ name, disabled, title = "拖动排序", ...events }: React
 }
 
 function copy(text: string, done = "已复制") {
+  // navigator.clipboard exists only in a secure context. Over plain http the
+  // copy command still works from a click, the clipboard filled from its event.
+  if (!navigator.clipboard) {
+    const put = (e: ClipboardEvent) => { e.clipboardData?.setData("text/plain", text); e.preventDefault() }
+    document.addEventListener("copy", put)
+    const ok = document.execCommand("copy")
+    document.removeEventListener("copy", put)
+    return ok ? toast.success(done) : toast.error("复制失败")
+  }
   navigator.clipboard.writeText(text).then(
     () => toast.success(done),
     () => toast.error("复制失败"),
@@ -209,39 +218,46 @@ const SOURCES: Record<Source, string> = {
 // The address a node is reached by, one per family, each click-to-copy: pasting
 // one into an ssh command is why they are shown. Where each came from is in the
 // tooltip, keeping the column to addresses alone.
-function Addresses({ node }: { node: Node }) {
-  const list = node.addresses ?? []
-  if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
-  return (
-    // As wide as the longer address, so both tooltips open from one right
-    // edge and the one for a short IPv4 does not cover the IPv6 below it.
-    <div className="grid w-fit gap-y-0.5">
-      {list.map(({ address, source }) => (
-        // Beside the addresses rather than under one, where it would cover
-        // the other; and gone once the pointer leaves it.
-        <Tooltip key={address} disableHoverableContent>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              // The toast names what was copied: a tap shows no tooltip, and
-              // the cell may show the address shortened.
-              onClick={() => copy(address, `已复制 ${address}`)}
-              aria-label={`复制 ${address}`}
-              className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
-            >
-              {shortAddress(address)}
-              <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="right" sideOffset={6} className="max-w-xs">
-            <div className="tnum">{address}</div>
-            <div className="opacity-70">{SOURCES[source]}，点击复制</div>
-          </TooltipContent>
-        </Tooltip>
-      ))}
-    </div>
-  )
-}
+//
+// Drawn again only when the addresses change. The table re-renders on every
+// push, and redrawing a tooltip per address took the panel's script time at a
+// hundred nodes from 66 to 128 ms a second.
+const Addresses = memo(
+  function Addresses({ list }: { list: NonNullable<Node["addresses"]> }) {
+    if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
+    return (
+      // As wide as the longer address, so both tooltips open from one right
+      // edge and the one for a short IPv4 does not cover the IPv6 below it.
+      <div className="grid w-fit gap-y-0.5">
+        {list.map(({ address, source }) => (
+          // Beside the addresses rather than under one, where it would cover
+          // the other; and gone once the pointer leaves it.
+          <Tooltip key={address} disableHoverableContent>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                // The toast names what was copied: a tap shows no tooltip, and
+                // the cell may show the address shortened.
+                onClick={() => copy(address, `已复制 ${address}`)}
+                aria-label={`复制 ${address}`}
+                className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
+              >
+                {shortAddress(address)}
+                <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right" sideOffset={6} className="max-w-xs">
+              <div className="tnum">{address}</div>
+              <div className="opacity-70">{SOURCES[source]}，点击复制</div>
+            </TooltipContent>
+          </Tooltip>
+        ))}
+      </div>
+    )
+  },
+  // Rows arrive as fresh objects on every push, so the list is compared by value.
+  (a, b) => JSON.stringify(a.list) === JSON.stringify(b.list),
+)
 
 // Name, address, country and group: what a node is looked up by, in every node list.
 function searchNodes(nodes: Node[], query: string) {
@@ -574,7 +590,7 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
             勾选节点，设为同一个分组。改名或解散：先筛选出这个分组、全选，再填新名字或清空。
           </DialogDescription>
         </DialogHeader>
-        <form className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
           <div className="space-y-4">
             <Field label="分组名" hint="公开页可见，最多 13 字；留空为移出分组">
               <GroupInput nodes={nodes} value={name} onChange={setName} />
@@ -690,6 +706,8 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
 
   async function save() {
     if (!form.name.trim()) return toast.error("请填写节点名称")
+    const resetOn = Number(resetDay)
+    if (!Number.isInteger(resetOn) || resetOn < 1 || resetOn > 31) return toast.error("每月重置日要填 1–31 之间的整数")
     const patch = changes(node, {
       name: form.name.trim(),
       public: form.public,
@@ -697,7 +715,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
       group: (form.group ?? "").trim(),
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
-      traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(resetDay) || node.traffic_reset_day))),
+      traffic_reset_day: resetOn,
       notify: !!form.notify,
       ipv4_pin: (form.ipv4_pin ?? "").trim(),
       ipv6_pin: (form.ipv6_pin ?? "").trim(),
@@ -736,7 +754,11 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
-        <form className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+        {/* noValidate here and in the other dialogs: save() checks every field.
+            The browser's own check would refuse a fractional GB against the
+            default step of 1, and cannot point at a field folded inside
+            流量校正, so the save button would do nothing. */}
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
           <div className="space-y-6">
             <section className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
@@ -873,7 +895,7 @@ function BillingForm({ node, onClose, onSaved }: {
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
-        <form className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
           <div className="space-y-5">
             <div className="grid grid-cols-2 gap-4">
               <Field label="价格" hint="留空或 0 为免费">
@@ -1267,26 +1289,43 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
+// Width in ems, near enough: a CJK character is one, anything else about half.
+const ems = (word: string) => [...word].reduce((n, c) => n + (c > "\u2e7f" ? 1 : 0.55), 0)
+
 // A node name, broken at its spaces and after the dots of a hostname --
-// registered nodes are named after theirs -- so neither a city nor a label is
-// split. A short hyphenated word such as GIA-E stays whole, where the browser
-// would leave its last letter to open the next line; a long one may still break
-// at its hyphens. A separator such as the · in 香港 09 · DMIT is held to the word
-// before it, so no line opens with one.
+// registered nodes are named after theirs. A word up to eight ems stays whole,
+// a city, a label or a hyphenated one such as GIA-E, where the browser would
+// leave its last letter to open the next line. A wider word, as a name typed
+// without spaces usually is, breaks between its CJK characters, and a run of
+// letters only where nothing else fits: kept whole, it would set the column's
+// minimum width and push the table past the screen. A separator such as the ·
+// in 香港 09 · DMIT, or a dash, is held to the word before it, so no line opens
+// with one.
 function nameText(name: string) {
   return name
-    .replace(/ (?=[·|/] )/g, "\u00a0")
+    .replace(/ (?=[·|/｜—–-] )/g, "\u00a0")
     .split(/( )/)
-    .map((word, i) =>
-      word.includes("-") && word.length <= 12 ? (
-        <span key={i} className="whitespace-nowrap">{word}</span>
-      ) : (
-        word.split(".").flatMap((part, j) => (j ? [".", <wbr key={`${i}.${j}`} />, part] : [part]))
-      ),
-    )
+    .map((word, i) => {
+      const parts = word.split(".").flatMap((part, j) => (j ? [".", <wbr key={j} />, part] : [part]))
+      if (ems(word) > 8) return <span key={i} className="wrap-anywhere [word-break:normal]">{parts}</span>
+      return word.includes("-") ? <span key={i} className="whitespace-nowrap">{word}</span> : parts
+    })
+}
+
+// Traffic turns a subdued orange at the alert threshold and a subdued red once
+// the allowance is used up, so the table agrees with the alerts. With alerts
+// off, the threshold's default of 80 % still marks a node running short.
+function trafficTone(n: Node, warnAt: number) {
+  if (n.traffic_limit <= 0) return ""
+  if (n.month_used >= n.traffic_limit) return "text-over"
+  return n.month_used * 100 >= n.traffic_limit * warnAt ? "text-near" : ""
 }
 
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
+  const [warnAt, setWarnAt] = useState(80)
+  useEffect(() => {
+    api<Settings>("/settings").then((s) => Number(s.notify_traffic) > 0 && setWarnAt(Number(s.notify_traffic))).catch(() => {})
+  }, [])
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -1299,14 +1338,14 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [group, setGroup] = useGroupFilter(nodes)
   const [grouping, setGrouping] = useState(false)
   // A new node lands last, a hundred rows down on a large fleet, so it is
-  // brought into view once the list carries it.
+  // brought into view once the list carries it. A filter hiding it cancels the
+  // scroll rather than leaving one to fire when the filter is cleared.
   const added = useRef<number | null>(null)
   const drag = useDragOrder(nodes, "nodes", refresh)
   const visible = inGroup(searchNodes(drag.order, query), group)
   useEffect(() => {
-    const row = added.current === null ? null : document.querySelector(`tbody tr[data-id="${added.current}"]`)
-    if (!row) return
-    row.scrollIntoView({ block: "center", behavior: "smooth" })
+    if (added.current === null || !nodes.some((n) => n.id === added.current)) return
+    document.querySelector(`tbody tr[data-id="${added.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
     added.current = null
   })
   const searching = query.trim() !== "" || group !== "all"
@@ -1368,8 +1407,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           <TableBody>
             {visible.map((n) => (
               <TableRow key={n.id} {...drag.row(n.id)}>
-                {/* Wraps: the cell's nowrap let one long name widen the table
-                    until the actions left the screen. */}
+                {/* Wraps: under the cell's default nowrap, one long name would
+                    widen the table until the actions left the screen. */}
                 <TableCell className="whitespace-normal">
                   <div className="flex items-center gap-2">
                     <DragHandle
@@ -1379,11 +1418,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                       title={searching ? "清空搜索和分组筛选后可拖动排序" : undefined}
                     />
                     <div className="min-w-24">
-                      {/* Lines are balanced, so neither ends on a character or
-                          two. The column is at least as wide as the longest
-                          word, which breaks only when it exceeds the whole
-                          table. */}
-                      <div className="font-medium text-balance break-keep wrap-break-word">
+                      {/* Lines are balanced, so none ends on a character or two. */}
+                      <div className="font-medium text-balance break-keep">
                         {nameText(n.name)}
                         {/* In the name's flow, a fixed gap after its last word.
                             Beside the block it would sit at the cell's edge
@@ -1402,13 +1438,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                           </Badge>
                         )}
                       </div>
-                      {n.group && <div className="text-xs text-balance text-muted-foreground wrap-break-word">{n.group}</div>}
+                      {n.group && <div className="text-xs text-balance text-muted-foreground">{n.group}</div>}
                     </div>
                   </div>
                 </TableCell>
                 {/* Addresses live only here, never on the public page. */}
                 <TableCell>
-                  <Addresses node={n} />
+                  <Addresses list={n.addresses ?? []} />
                 </TableCell>
                 <TableCell>
                   {/* Stacked and centred on one axis. The slot is as wide as
@@ -1434,11 +1470,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   </div>
                 </TableCell>
                 {/* Counted by the node's own billing rule, as on the public
-                    page, and red once past the allowance. Two unbreakable
-                    halves, so a narrow table moves the limit to a second line
-                    rather than splitting a figure. */}
+                    page. Two unbreakable halves, so a narrow table moves the
+                    limit to a second line rather than splitting a figure. */}
                 <TableCell className="tnum text-sm whitespace-normal">
-                  <span className={`whitespace-nowrap ${n.traffic_limit > 0 && n.month_used > n.traffic_limit ? "text-destructive" : ""}`}>
+                  <span className={`whitespace-nowrap ${trafficTone(n, warnAt)}`}>
                     {bytes(n.month_used)}
                   </span>{" "}
                   <span className="whitespace-nowrap text-muted-foreground">
@@ -1606,7 +1641,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
         <DialogHeader>
           <DialogTitle>{task.id ? "编辑监控" : "添加监控"}</DialogTitle>
         </DialogHeader>
-        <form className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
           <div className="space-y-6">
             {/* On a phone the name takes the first row and the target shares the
                 second with the interval, so the tab order matches the screen. */}
@@ -1651,7 +1686,14 @@ function Ping({ nodes }: { nodes: Node[] }) {
   const [deleting, setDeleting] = useState<PingTask | null>(null)
   const [removing, setRemoving] = useState(false)
 
-  const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
+  // A failed first load draws the page empty, keeping 添加监控 in reach.
+  const load = () =>
+    api<{ tasks: PingTask[] }>("/ping-tasks")
+      .then((d) => setTasks(d.tasks))
+      .catch((e: Error) => {
+        toast.error(e.message)
+        setTasks((tasks) => tasks ?? [])
+      })
   // A node added or removed changes assignments on the hub: auto_join adds, a
   // deletion cascades.
   useEffect(() => { load() }, [nodes.length])
@@ -1755,20 +1797,9 @@ type Theme = {
   builtin: boolean
   // theme.json 里声明的设置表单，原样转过来，由 configFields 挑出能画的字段。
   config?: unknown
-  // 面板自己探测：preview.png 能否加载。
-  preview?: boolean
+  // 主题包是否带 preview.png，由 hub 告知，卡片的高度一次排定，不因图片晚到而改变。
+  preview: boolean
 }
-
-// 预览图是主题包里可选的 preview.png，hub 不报告有没有，只能加载一次看看。在画卡片
-// 之前探测完：图片晚到会把标题和按钮整体往下推一截。同一文档里再用这个地址时直接
-// 取已加载的图，不会下载第二次。
-const probePreview = (short: string) =>
-  new Promise<boolean>((resolve) => {
-    const img = new Image()
-    img.onload = () => resolve(true)
-    img.onerror = () => resolve(false)
-    img.src = `/api/themes/${short}/preview`
-  })
 
 // 主题在 theme.json 里声明的设置。hub 只存与默认值不同的项，其余由主题用自己的默认值补上，
 // 所以主题作者日后改了某个默认值，没动过这一项的站点会跟着变。
@@ -1950,12 +1981,7 @@ function Themes() {
   const picker = useRef<HTMLInputElement>(null)
 
   const load = () =>
-    api<{ themes: Theme[] }>("/themes")
-      .then(async ({ themes }) => {
-        const shown = await Promise.all(themes.map((theme) => probePreview(theme.short)))
-        setThemes(themes.map((theme, i) => ({ ...theme, preview: shown[i] })))
-      })
-      .catch(() => setThemes([]))
+    api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
   useEffect(() => { load() }, [])
 
   async function select(short: string) {
@@ -2176,10 +2202,16 @@ function useSettings() {
     save: async (patch: Record<string, string>, done = "已保存") => {
       try {
         await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
-        toast.success(done)
-        // Only the saved keys and the `*_set` flags are taken from the hub: a
-        // credential comes back as a flag, so the typed value must not linger,
-        // while another card's unsaved edits on the same page must survive.
+      } catch (e) {
+        toast.error((e as Error).message)
+        return false
+      }
+      toast.success(done)
+      // Only the saved keys and the `*_set` flags are taken from the hub: a
+      // credential comes back as a flag, so the typed value must not linger,
+      // while another card's unsaved edits on the same page must survive. A
+      // failed read leaves the form as typed; the save itself stands.
+      try {
         const fresh = await api<Settings>("/settings")
         setS((old) => {
           const next = { ...old }
@@ -2187,11 +2219,10 @@ function useSettings() {
           for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set")) next[key] = value
           return next
         })
-        return true
       } catch (e) {
         toast.error((e as Error).message)
-        return false
       }
+      return true
     },
   }
 }
@@ -2549,7 +2580,18 @@ type Session = { id: string; current: boolean; created_at: number }
 
 function useSessions() {
   const [rows, setRows] = useState<Session[] | null>(null)
-  const load = useCallback(() => api<Session[]>("/sessions").then(setRows).catch((e: Error) => toast.error(e.message)), [])
+  // A failed load leaves the list empty rather than absent: the security page
+  // waits for it, and the password card must stay reachable.
+  const load = useCallback(
+    () =>
+      api<Session[]>("/sessions")
+        .then(setRows)
+        .catch((e: Error) => {
+          toast.error(e.message)
+          setRows((rows) => rows ?? [])
+        }),
+    [],
+  )
   useEffect(() => { load() }, [load])
   return { rows, load }
 }
