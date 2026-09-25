@@ -235,9 +235,13 @@ function Addresses({ node }: { node: Node }) {
   const list = node.addresses ?? []
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
-    <div className="flex flex-col items-start gap-y-0.5">
+    // As wide as the longer address, so both tooltips open from one right
+    // edge and the one for a short IPv4 does not cover the IPv6 below it.
+    <div className="grid w-fit gap-y-0.5">
       {list.map(({ address, source }) => (
-        <Tooltip key={address}>
+        // Beside the addresses rather than under one, where it would cover
+        // the other; and gone once the pointer leaves it.
+        <Tooltip key={address} disableHoverableContent>
           <TooltipTrigger asChild>
             <button
               type="button"
@@ -251,7 +255,7 @@ function Addresses({ node }: { node: Node }) {
               <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="bottom" align="start" className="max-w-xs">
+          <TooltipContent side="right" sideOffset={6} className="max-w-xs">
             <div className="tnum">{address}</div>
             <div className="opacity-70">{SOURCES[source]}，点击复制</div>
           </TooltipContent>
