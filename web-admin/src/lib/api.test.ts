@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
+import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -52,6 +52,13 @@ assert.deepEqual(trafficCorrection(shown, { ...shown, total_rx: "   " }), {})
 assert.deepEqual(trafficCorrection(shown, { ...shown, total_rx: "0" }), { total_rx: 0 })
 assert.deepEqual(trafficCorrection(shown, { ...shown, total_tx: "3" }), { total_tx: 3 * GIB })
 assert.deepEqual(trafficCorrection(shown, shown), {})
+// A long IPv6 keeps two groups each side; short ones and IPv4 are left whole,
+// and a :: in what is kept survives.
+assert.equal(shortAddress("2605:52c0:1:ca9:be24:11ff:fe84:2c48"), "2605:52c0…fe84:2c48")
+assert.equal(shortAddress("2604:a880:800:10::7a1:e001"), "2604:a880…7a1:e001")
+assert.equal(shortAddress("2a0e:1d80:ffff:ffff::1234"), "2a0e:1d80…ffff::1234")
+assert.equal(shortAddress("2001:db8:1054:84::a4"), "2001:db8:1054:84::a4")
+assert.equal(shortAddress("203.0.113.84"), "203.0.113.84")
 console.log("partial edits, traffic corrections and provisioning checks passed")
 
 // --iface from the two lists the install dialogs show, and back.

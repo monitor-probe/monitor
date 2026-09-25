@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -31,12 +31,19 @@ const TRAFFIC_MODES: Record<string, string> = {
   down: "仅下行",
 }
 
-// Reordering uses the browser's view transitions, so displaced rows slide.
-// Browsers without support jump instead. A drag starts a transition on every row
-// it crosses, each skipping the last, and a skipped transition rejects `ready`.
-function animate(update: () => void) {
-  if (document.startViewTransition) document.startViewTransition(() => flushSync(update)).ready.catch(() => {})
-  else flushSync(update)
+// Displaced rows slide from where they were drawn to their new place: each is
+// offset back by the distance it moved, then released. Transforms leave layout
+// and stacking alone, so hit-testing mid-slide reads layout positions and the
+// sticky header stays on top. A slide cut short restarts from where it was drawn.
+function slide(rows: HTMLTableSectionElement | null, update: () => void) {
+  const before = new Map([...(rows?.rows ?? [])].map((row) => [row, row.getBoundingClientRect().top]))
+  for (const row of before.keys()) row.getAnimations().forEach((a) => a.id === "slide" && a.cancel())
+  flushSync(update)
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return
+  for (const [row, top] of before) {
+    const dy = top - row.getBoundingClientRect().top
+    if (dy) row.animate({ transform: [`translateY(${dy}px)`, "none"] }, { id: "slide", duration: 150, easing: "ease-out" })
+  }
 }
 
 // Drag-to-reorder for a table whose order the hub stores at `/${path}/order`.
@@ -47,10 +54,6 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
   const [manualOrder, setManualOrder] = useState<number[]>([])
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
-  // The order last asked for. A view transition renders it a frame or more
-  // later, and a repeated key or a quick drag must build on it rather than on
-  // the order still on screen.
-  const pending = useRef<number[] | null>(null)
   const body = useRef<HTMLTableSectionElement | null>(null)
   // One save in flight at a time, so two quick reorders reach the hub in order.
   const saving = useRef<Promise<unknown>>(Promise.resolve())
@@ -60,7 +63,7 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     ...manualOrder.map((id) => byId.get(id)).filter((item): item is T => Boolean(item)),
     ...items.filter((item) => !orderedIds.has(item.id)),
   ]
-  const ids = () => pending.current ?? order.map((item) => item.id)
+  const ids = () => order.map((item) => item.id)
 
   // Once the hub lists this order, its list is followed again, so a reorder made
   // in another tab appears here instead of being overwritten by the next drag.
@@ -68,79 +71,61 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     setManualOrder([])
   }
 
-  // Handled on the document by where the pointer is, not by the row under it:
-  // while a view transition runs, Chrome hit-tests drag events to the root
-  // element, so row handlers would miss every row crossed during a 150 ms slide,
-  // and a release then would count as a drop outside the table. Re-attached on
-  // every render, since `order` changes as rows are displaced.
+  // Handled on the document by layout position, not by the row under the
+  // pointer: a sliding row is drawn away from its place, and the one under the
+  // pointer mid-slide is not the one it would displace. Re-attached on every
+  // render, since `order` changes as rows are displaced.
+  //
+  // Dragenter is accepted as well as dragover: over a new element the browser
+  // fires only dragenter until its next update, and a release in between -- as
+  // when a reorder brings another row under a still pointer -- would otherwise
+  // count as a drop outside and restore the order.
   useEffect(() => {
     const rows = body.current
     if (dragging === null || !rows) return
     const over = (e: DragEvent) => {
-      const table = rows.getBoundingClientRect()
+      // The header row counts as inside: a drag to the top readily overshoots
+      // onto it, and a release there would otherwise discard the drag.
+      const table = rows.parentElement!.getBoundingClientRect()
       if (e.clientX < table.left || e.clientX > table.right || e.clientY < table.top || e.clientY > table.bottom) return
       e.preventDefault()
       if (e.type === "drop") return
       if (e.dataTransfer) e.dataTransfer.dropEffect = "move"
-      // Nothing while a move waits on its transition: the rows on screen are
-      // not yet the order asked for, and the next dragover follows within
-      // 50 ms.
-      if (pending.current) return
       const list = [...rows.rows]
+      // Offsets count from the rows' container, which does not slide.
+      const y = e.clientY - list[0].offsetParent!.getBoundingClientRect().top
       const from = list.findIndex((row) => row.dataset.id === String(dragging))
-      const to = list.findIndex((row) => {
-        const r = row.getBoundingClientRect()
-        return e.clientY >= r.top && e.clientY < r.bottom
-      })
+      const to = list.findIndex((row) => y >= row.offsetTop && y < row.offsetTop + row.offsetHeight)
       if (from < 0 || to < 0 || from === to) return
       // Moved only where the pointer would then rest on the dragged row. Rows
       // differ in height: a short row moved past a tall one would leave the
       // tall one under the pointer, and the two would swap back and forth.
-      const target = list[to].getBoundingClientRect()
-      const height = list[from].getBoundingClientRect().height
-      if (to > from ? e.clientY < target.bottom - height : e.clientY >= target.top + height) return
+      const target = list[to]
+      const height = list[from].offsetHeight
+      if (to > from ? y < target.offsetTop + target.offsetHeight - height : y >= target.offsetTop + height) return
       move(dragging, to)
     }
-    document.addEventListener("dragover", over)
-    document.addEventListener("drop", over)
+    const types = ["dragenter", "dragover", "drop"] as const
+    for (const type of types) document.addEventListener(type, over)
     return () => {
-      document.removeEventListener("dragover", over)
-      document.removeEventListener("drop", over)
+      for (const type of types) document.removeEventListener(type, over)
     }
   })
-
-  // A transition superseded before it ran applies nothing: a later move, or a
-  // refused save falling back to the hub's order, has replaced it.
-  //
-  // Only the rows on screen are named for the slide. Every named element is
-  // captured on each transition: with all of a hundred rows named, a drag
-  // across twelve held the main thread for 2.7 s, against 0.3 s with none.
-  function show(next: number[]) {
-    pending.current = next
-    for (const row of body.current?.rows ?? []) {
-      const { top, bottom } = row.getBoundingClientRect()
-      row.style.viewTransitionName = bottom > 0 && top < innerHeight ? `${path}-${row.dataset.id}` : ""
-    }
-    animate(() => {
-      if (pending.current !== next) return
-      pending.current = null
-      setManualOrder(next)
-    })
-  }
 
   function move(id: number, to: number) {
     const next = [...ids()]
     const from = next.indexOf(id)
     if (from < 0 || to < 0 || to >= next.length || from === to) return
     next.splice(to, 0, ...next.splice(from, 1))
-    show(next)
+    slide(body.current, () => setManualOrder(next))
     return next
   }
 
   // Dropped outside the table or cancelled with Escape: the order is restored.
   function cancel() {
     setDragging(null)
-    if (orderBeforeDrag.current.length) show(orderBeforeDrag.current)
+    const before = orderBeforeDrag.current
+    if (before.length) slide(body.current, () => setManualOrder(before))
   }
 
   function save(next: number[]) {
@@ -152,7 +137,6 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     // A refusal falls back to whatever the hub holds, which a save queued
     // behind it may still change.
     saving.current = saving.current.then(put).then(reload, (e: Error) => {
-      pending.current = null
       setManualOrder([])
       reload()
       toast.error(e.message)
@@ -164,7 +148,10 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     row: (id: number) => ({
       "data-id": id,
       "data-dragging": dragging === id || undefined,
-      className: "transition-opacity data-[dragging]:opacity-40",
+      // Opaque, with the dragged row beneath the rest: two rows crossing mid-slide
+      // would otherwise draw their text over each other. No hover tint during a
+      // drag, since the browser keeps it on whichever row reaches the start point.
+      className: `relative z-1 bg-card transition-opacity data-[dragging]:z-0 data-[dragging]:opacity-40 ${dragging === null ? "" : "hover:bg-card"}`,
     }),
     handle: (id: number) => ({
       onDragStart: (e: React.DragEvent<HTMLElement>) => {
@@ -222,15 +209,6 @@ const SOURCES: Record<Source, string> = {
 // The address a node is reached by, one per family, each click-to-copy: pasting
 // one into an ssh command is why they are shown. Where each came from is in the
 // tooltip, keeping the column to addresses alone.
-// A full-length IPv6 is shown as its first two groups and its last two, which
-// name the provider and tell machines on one prefix apart. Cut at group
-// boundaries rather than at the column's edge, which would split a group; the
-// title and the copy carry the whole address.
-function shortAddress(address: string) {
-  const groups = address.split(":")
-  return address.length > 19 && groups.length > 4 ? `${groups.slice(0, 2).join(":")}…${groups.slice(-2).join(":")}` : address
-}
-
 function Addresses({ node }: { node: Node }) {
   const list = node.addresses ?? []
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
@@ -1289,6 +1267,25 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
+// A node name, broken at its spaces and after the dots of a hostname --
+// registered nodes are named after theirs -- so neither a city nor a label is
+// split. A short hyphenated word such as GIA-E stays whole, where the browser
+// would leave its last letter to open the next line; a long one may still break
+// at its hyphens. A separator such as the · in 香港 09 · DMIT is held to the word
+// before it, so no line opens with one.
+function nameText(name: string) {
+  return name
+    .replace(/ (?=[·|/] )/g, "\u00a0")
+    .split(/( )/)
+    .map((word, i) =>
+      word.includes("-") && word.length <= 12 ? (
+        <span key={i} className="whitespace-nowrap">{word}</span>
+      ) : (
+        word.split(".").flatMap((part, j) => (j ? [".", <wbr key={`${i}.${j}`} />, part] : [part]))
+      ),
+    )
+}
+
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
@@ -1382,18 +1379,31 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                       title={searching ? "清空搜索和分组筛选后可拖动排序" : undefined}
                     />
                     <div className="min-w-24">
-                      <div className="font-medium [overflow-wrap:anywhere]">{n.name}</div>
-                      {n.group && <div className="text-xs text-muted-foreground [overflow-wrap:anywhere]">{n.group}</div>}
+                      {/* Lines are balanced, so neither ends on a character or
+                          two. The column is at least as wide as the longest
+                          word, which breaks only when it exceeds the whole
+                          table. */}
+                      <div className="font-medium text-balance break-keep wrap-break-word">
+                        {nameText(n.name)}
+                        {/* In the name's flow, a fixed gap after its last word.
+                            Beside the block it would sit at the cell's edge
+                            whenever the name or group wraps, since a wrapped
+                            block spans the whole width. The gap is a figure
+                            space, which does not break: the badge moves down
+                            with the last word rather than open a line alone. */}
+                        {n.country && "\u2007"}
+                        {n.country && (
+                          <Badge
+                            variant="outline"
+                            title={n.country_pin ? "手动指定" : undefined}
+                            className="align-middle font-normal text-muted-foreground"
+                          >
+                            {n.country}
+                          </Badge>
+                        )}
+                      </div>
+                      {n.group && <div className="text-xs text-balance text-muted-foreground wrap-break-word">{n.group}</div>}
                     </div>
-                    {n.country && (
-                      <Badge
-                        variant="outline"
-                        title={n.country_pin ? "手动指定" : undefined}
-                        className="shrink-0 font-normal text-muted-foreground"
-                      >
-                        {n.country}
-                      </Badge>
-                    )}
                   </div>
                 </TableCell>
                 {/* Addresses live only here, never on the public page. */}
@@ -1410,10 +1420,15 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                     </Badge>
                     {!n.public && <Badge variant="outline" className="font-normal">不公开</Badge>}
                     {/* Under the badge, not inside it: the column is a tenth of
-                        the table and the three do not share one line. */}
+                        the table and the three do not share one line. A slot of
+                        the pills' width that the text spills out of evenly, so a
+                        long duration does not widen the slot and move the
+                        pills off the axis the other rows share. */}
                     {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
-                      <div className="tnum text-xs whitespace-nowrap text-muted-foreground">
-                        {uptime(Date.now() / 1000 - n.last_seen)}
+                      <div className="flex w-14 justify-center">
+                        <span className="tnum text-xs whitespace-nowrap text-muted-foreground">
+                          {uptime(Date.now() / 1000 - n.last_seen)}
+                        </span>
                       </div>
                     )}
                   </div>
