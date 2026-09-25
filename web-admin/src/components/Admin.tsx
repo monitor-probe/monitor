@@ -81,13 +81,24 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
       e.preventDefault()
       if (e.type === "drop") return
       if (e.dataTransfer) e.dataTransfer.dropEffect = "move"
-      const at = [...rows.rows].findIndex((row) => {
+      // Nothing while a move waits on its transition: the rows on screen are
+      // not yet the order asked for, and the next dragover follows within
+      // 50 ms.
+      if (pending.current) return
+      const list = [...rows.rows]
+      const from = list.findIndex((row) => row.dataset.id === String(dragging))
+      const to = list.findIndex((row) => {
         const r = row.getBoundingClientRect()
         return e.clientY >= r.top && e.clientY < r.bottom
       })
-      // By position rather than by the row there, which may be one a pending
-      // transition has yet to move.
-      if (at >= 0) move(dragging, at)
+      if (from < 0 || to < 0 || from === to) return
+      // Moved only where the pointer would then rest on the dragged row. Rows
+      // differ in height: a short row moved past a tall one would leave the
+      // tall one under the pointer, and the two would swap back and forth.
+      const target = list[to].getBoundingClientRect()
+      const height = list[from].getBoundingClientRect().height
+      if (to > from ? e.clientY < target.bottom - height : e.clientY >= target.top + height) return
+      move(dragging, to)
     }
     document.addEventListener("dragover", over)
     document.addEventListener("drop", over)

@@ -136,6 +136,12 @@
   animation-duration: 150ms;
 }
 
+/* The sliding rows are drawn above the whole page, the sticky header included,
+   so a row scrolled beneath it would cover it for each slide. The header takes
+   part as well and is raised over them. */
+header { view-transition-name: page-header; }
+::view-transition-group(page-header) { z-index: 1; }
+
 @media (prefers-reduced-motion: reduce) {
   ::view-transition-group(*) {
     animation: none;
