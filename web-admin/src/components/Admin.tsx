@@ -1378,21 +1378,23 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   <Addresses node={n} />
                 </TableCell>
                 <TableCell>
-                  {/* Gapped rather than margined, so a narrow column stacks the
-                      two flush left instead of indenting the second. */}
-                  <div className="flex flex-wrap gap-1">
-                    <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
+                  {/* Stacked, and every pill as wide as the three-character
+                      不公开 with its text centred, so the two line up on both
+                      edges and the column reads the same down every row. */}
+                  <div className="flex flex-col items-start gap-1">
+                    <Badge variant={n.online ? "default" : "secondary"} className="min-w-14 font-normal">
                       {n.online ? "在线" : "离线"}
                     </Badge>
-                    {!n.public && <Badge variant="outline" className="font-normal">不公开</Badge>}
+                    {!n.public && <Badge variant="outline" className="min-w-14 font-normal">不公开</Badge>}
+                    {/* Under the badge, not inside it: the column is a tenth of
+                        the table and the three do not share one line. Centred
+                        under it while shorter, flush left once longer. */}
+                    {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
+                      <div className="tnum min-w-14 text-center text-xs text-muted-foreground">
+                        {uptime(Date.now() / 1000 - n.last_seen)}
+                      </div>
+                    )}
                   </div>
-                  {/* Under the badge, not inside it: the column is a tenth of
-                      the table and the three do not share one line. */}
-                  {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
-                    <div className="tnum mt-1 text-xs text-muted-foreground">
-                      {uptime(Date.now() / 1000 - n.last_seen)}
-                    </div>
-                  )}
                 </TableCell>
                 {/* Counted by the node's own billing rule, as on the public
                     page. Two unbreakable halves, so a narrow table moves the
