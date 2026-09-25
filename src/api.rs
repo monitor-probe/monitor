@@ -1721,9 +1721,8 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     Ok((true, theme.version))
 }
 
-/// The thumbnail the theme list displays, where the theme provides one. A theme
-/// without one returns 404, on which the panel hides the image, so nothing need
-/// report whether a preview exists.
+/// The thumbnail the theme list displays, where the theme provides one; the list
+/// reports which do.
 pub async fn theme_preview(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match crate::frontend::preview(&app.themes, &short) {
         // Not cached: reinstalling a theme under the same name also replaces the
@@ -1807,7 +1806,14 @@ pub async fn save_theme_config(
 
 pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
     match crate::frontend::themes(&app) {
-        Ok(themes) => Json(json!({"themes": themes})).into_response(),
+        Ok(mut themes) => {
+            // Reads each image to answer, as serving it would: a handful of
+            // themes, each image capped at 8 MiB.
+            for theme in &mut themes {
+                theme.preview = crate::frontend::preview(&app.themes, &theme.short).is_some();
+            }
+            Json(json!({"themes": themes})).into_response()
+        }
         Err(e) => fail(e),
     }
 }

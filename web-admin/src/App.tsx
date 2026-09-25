@@ -6,6 +6,7 @@ import { Admin } from "@/components/Admin"
 import { Login } from "@/components/Login"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { TooltipProvider } from "@/components/ui/tooltip"
 import { api, provisionRefusal, useNodes } from "@/lib/api"
 
 type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
@@ -61,8 +62,18 @@ function useTheme() {
   )
   const dark = saved ? saved === "dark" : system
 
+  // Switched with every transition held. Buttons, badges and table rows fade
+  // their colours over 150 ms while everything else changes at once, leaving
+  // the page in both palettes for that long.
   useEffect(() => {
+    const hold = document.createElement("style")
+    hold.textContent = "*,*::before,*::after{transition:none!important}"
+    document.head.append(hold)
     document.documentElement.classList.toggle("dark", dark)
+    // Resolves the new colours while transitions are off, so removing the
+    // hold starts none.
+    void document.body.offsetWidth
+    hold.remove()
   }, [dark])
 
   return [
@@ -128,53 +139,58 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-svh">
-      <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
-          {/* The site name is the way back to the status page, as in the
-              theme's own header. */}
-          <a href="/" className="font-semibold transition-opacity hover:opacity-70">
-            {me.site_name || "Monitor"}
-          </a>
-          <span className="text-xs text-muted-foreground">后台</span>
-          <div className="flex-1" />
-          {/* The status page is a separate app, so this is a navigation. */}
-          <Button variant="ghost" size="sm" asChild>
-            <a href="/">
-              <ExternalLink /> 状态面板
+    // The browser's own title tooltip waits a second or more and cannot be
+    // shortened; these open after 300 ms.
+    <TooltipProvider delayDuration={300}>
+      <div className="min-h-svh">
+        <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
+          <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
+            {/* The site name is the way back to the status page, as in the
+                theme's own header. */}
+            <a href="/" className="font-semibold transition-opacity hover:opacity-70">
+              {me.site_name || "Monitor"}
             </a>
-          </Button>
-          <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
-            {dark ? <Sun /> : <Moon />}
-          </Button>
-          <Button variant="ghost" size="icon" onClick={signOut} title="退出登录">
-            <LogOut />
-          </Button>
-        </div>
-      </header>
+            <span className="text-xs text-muted-foreground">后台</span>
+            <div className="flex-1" />
+            {/* The status page is a separate app, so this is a navigation. */}
+            <Button variant="ghost" size="sm" asChild>
+              <a href="/">
+                <ExternalLink /> 状态面板
+              </a>
+            </Button>
+            <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
+              {dark ? <Sun /> : <Moon />}
+            </Button>
+            <Button variant="ghost" size="icon" onClick={signOut} title="退出登录">
+              <LogOut />
+            </Button>
+          </div>
+        </header>
 
-      <main className="mx-auto max-w-7xl space-y-5 px-4 py-6">
-        {error && <p className="text-sm text-destructive">{error}</p>}
-        {!nodes ? (
-          <Skeleton className="h-64" />
-        ) : (
-          <Admin
-            path={path}
-            go={go}
-            nodes={sorted}
-            refresh={refresh}
-            // The hub's own public URL rather than this browser's address: the
-            // panel is frequently reached over a loopback port behind a proxy,
-            // while the install command and OAuth callback need the real one.
-            site={me.site || location.origin}
-            // Why this page cannot add nodes, measured by the rule the hub applies
-            // to the `Origin` it receives; empty when it can.
-            refusal={provisionRefusal(location.origin, me.site)}
-          />
-        )}
-      </main>
+        <main className="mx-auto max-w-7xl space-y-5 px-4 py-6">
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          {!nodes ? (
+            <Skeleton className="h-64" />
+          ) : (
+            <Admin
+              path={path}
+              go={go}
+              nodes={sorted}
+              refresh={refresh}
+              // The hub's own public URL rather than this browser's address: the
+              // panel is frequently reached over a loopback port behind a proxy,
+              // while the install command and OAuth callback need the real one.
+              site={me.site || location.origin}
+              // Why this page cannot add nodes, measured by the rule the hub applies
+              // to the `Origin` it receives; empty when it can.
+              refusal={provisionRefusal(location.origin, me.site)}
+              reloadMe={loadMe}
+            />
+          )}
+        </main>
 
-      <Toaster position="top-center" theme={dark ? "dark" : "light"} />
-    </div>
+        <Toaster position="top-center" theme={dark ? "dark" : "light"} />
+      </div>
+    </TooltipProvider>
   )
 }

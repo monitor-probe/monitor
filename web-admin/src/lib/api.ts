@@ -237,6 +237,20 @@ export function trafficCorrection(
   )
 }
 
+/**
+ * An address as the node table shows it. An IPv6 longer than 22 characters --
+ * a full SLAAC address runs to 39 -- keeps its first two groups and its last
+ * two, which name the provider and tell machines on one prefix apart, and
+ * elides the middle. The groups are cut from the text as written, so a `::`
+ * inside what is kept stays intact rather than reading as a lone colon.
+ */
+export function shortAddress(address: string): string {
+  const groups = [...address.matchAll(/[^:]+/g)]
+  if (address.length <= 22 || groups.length < 5) return address
+  const head = groups[1], tail = groups[groups.length - 2]
+  return `${address.slice(0, head.index + head[0].length)}…${address.slice(tail.index)}`
+}
+
 /** Where a shown address comes from, which the panel gives as its tooltip. */
 export type Source = "manual" | "interface" | "exit" | "connection"
 
@@ -465,14 +479,18 @@ export function useNodes() {
     let retry: ReturnType<typeof setTimeout> | null = null
     let closed = false
 
+    // A refresh replaces this effect, and an answer to the one it replaced may
+    // still arrive after the newer one; it is dropped rather than shown.
     const fetchOnce = () =>
       api<{ nodes: Node[]; admin: boolean }>("/nodes")
         .then((d) => {
+          if (closed) return
           setNodes(d.nodes)
           setAdmin(d.admin)
           setError(null)
         })
         .catch((e: Error) => {
+          if (closed) return
           setError(e.message)
           // With the public page switched off, a revoked session receives a 401
           // here and on the stream, so the frame that would report admin=false

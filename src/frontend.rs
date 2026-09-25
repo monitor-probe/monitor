@@ -55,6 +55,10 @@ pub struct Theme {
     /// deleted.
     #[serde(skip_deserializing)]
     pub builtin: bool,
+    /// Whether [`preview`] has an image for it. Filled in for the panel's list
+    /// only, so it lays each card out once rather than when the image arrives.
+    #[serde(skip_deserializing)]
+    pub preview: bool,
 }
 
 pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
