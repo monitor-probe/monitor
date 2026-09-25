@@ -1434,10 +1434,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   </div>
                 </TableCell>
                 {/* Counted by the node's own billing rule, as on the public
-                    page. Two unbreakable halves, so a narrow table moves the
-                    limit to a second line rather than splitting a figure. */}
+                    page, and red once past the allowance. Two unbreakable
+                    halves, so a narrow table moves the limit to a second line
+                    rather than splitting a figure. */}
                 <TableCell className="tnum text-sm whitespace-normal">
-                  <span className="whitespace-nowrap">{bytes(n.month_used)}</span>{" "}
+                  <span className={`whitespace-nowrap ${n.traffic_limit > 0 && n.month_used > n.traffic_limit ? "text-destructive" : ""}`}>
+                    {bytes(n.month_used)}
+                  </span>{" "}
                   <span className="whitespace-nowrap text-muted-foreground">
                     / {n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
                   </span>
