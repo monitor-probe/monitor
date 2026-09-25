@@ -13,6 +13,7 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
@@ -204,9 +205,9 @@ function DragHandle({ name, disabled, title = "拖动排序", ...events }: React
   )
 }
 
-function copy(text: string) {
+function copy(text: string, done = "已复制") {
   navigator.clipboard.writeText(text).then(
-    () => toast.success("已复制"),
+    () => toast.success(done),
     () => toast.error("复制失败"),
   )
 }
@@ -221,22 +222,40 @@ const SOURCES: Record<Source, string> = {
 // The address a node is reached by, one per family, each click-to-copy: pasting
 // one into an ssh command is why they are shown. Where each came from is in the
 // tooltip, keeping the column to addresses alone.
+// A full-length IPv6 is shown as its first two groups and its last two, which
+// name the provider and tell machines on one prefix apart. Cut at group
+// boundaries rather than at the column's edge, which would split a group; the
+// title and the copy carry the whole address.
+function shortAddress(address: string) {
+  const groups = address.split(":")
+  return address.length > 19 && groups.length > 4 ? `${groups.slice(0, 2).join(":")}…${groups.slice(-2).join(":")}` : address
+}
+
 function Addresses({ node }: { node: Node }) {
   const list = node.addresses ?? []
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
     <div className="flex flex-col items-start gap-y-0.5">
       {list.map(({ address, source }) => (
-        <button
-          key={address}
-          type="button"
-          onClick={() => copy(address)}
-          title={`${SOURCES[source]}。点击复制`}
-          className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
-        >
-          {address}
-          <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
-        </button>
+        <Tooltip key={address}>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              // The toast names what was copied: a tap shows no tooltip, and
+              // the cell may show the address shortened.
+              onClick={() => copy(address, `已复制 ${address}`)}
+              aria-label={`复制 ${address}`}
+              className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
+            >
+              {shortAddress(address)}
+              <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" align="start" className="max-w-xs">
+            <div className="tnum">{address}</div>
+            <div className="opacity-70">{SOURCES[source]}，点击复制</div>
+          </TooltipContent>
+        </Tooltip>
       ))}
     </div>
   )
@@ -1334,8 +1353,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             {/* Percentages, or the address column swallows every spare pixel
                 and pushes status across the table. */}
             <TableRow>
-              <TableHead className="w-[20%]">名称</TableHead>
-              <TableHead className="w-[22%]">IP</TableHead>
+              <TableHead className="w-[26%]">名称</TableHead>
+              <TableHead className="w-[18%]">IP</TableHead>
               <TableHead className="w-[12%]">状态</TableHead>
               <TableHead className="w-[16%]">流量</TableHead>
               {/* Below xl the expiry date moves under the price: seven
@@ -1378,19 +1397,18 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   <Addresses node={n} />
                 </TableCell>
                 <TableCell>
-                  {/* Stacked, and every pill as wide as the three-character
-                      不公开 with its text centred, so the two line up on both
-                      edges and the column reads the same down every row. */}
-                  <div className="flex flex-col items-start gap-1">
-                    <Badge variant={n.online ? "default" : "secondary"} className="min-w-14 font-normal">
+                  {/* Stacked and centred on one axis. The slot is as wide as
+                      the three-character 不公开, so a lone pill sits where it
+                      would above that one and every row lines up. */}
+                  <div className="flex w-fit min-w-14 flex-col items-center gap-1">
+                    <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
                       {n.online ? "在线" : "离线"}
                     </Badge>
-                    {!n.public && <Badge variant="outline" className="min-w-14 font-normal">不公开</Badge>}
+                    {!n.public && <Badge variant="outline" className="font-normal">不公开</Badge>}
                     {/* Under the badge, not inside it: the column is a tenth of
-                        the table and the three do not share one line. Centred
-                        under it while shorter, flush left once longer. */}
+                        the table and the three do not share one line. */}
                     {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
-                      <div className="tnum min-w-14 text-center text-xs text-muted-foreground">
+                      <div className="tnum text-xs whitespace-nowrap text-muted-foreground">
                         {uptime(Date.now() / 1000 - n.last_seen)}
                       </div>
                     )}
