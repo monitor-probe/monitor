@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS metric (
   mem_used INTEGER NOT NULL, swap_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
   net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
   tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
+  net_rx_max INTEGER NOT NULL DEFAULT 0, net_tx_max INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (node_id, ts)
 ) WITHOUT ROWID;
 
@@ -162,7 +163,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -294,6 +295,13 @@ fn migrate_to_9(conn: &Connection) -> Result<()> {
     add_column(conn, "ping_task", "sort INTEGER NOT NULL DEFAULT 0")
 }
 
+/// Rows written before the peak existed hold 0, which `Db::metrics` reads as
+/// the row's mean rather than rewriting every row of history here.
+fn migrate_to_10(conn: &Connection) -> Result<()> {
+    add_column(conn, "metric", "net_rx_max INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "metric", "net_tx_max INTEGER NOT NULL DEFAULT 0")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -333,6 +341,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 9 {
         migrate_to_9(&tx)?;
+    }
+    if from < 10 {
+        migrate_to_10(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -1176,8 +1187,9 @@ impl Db {
         self.conn()
             .prepare_cached(
                 "INSERT OR REPLACE INTO metric
-               (node_id, ts, cpu, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+               (node_id, ts, cpu, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs,
+                net_rx_max, net_tx_max)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             )?
             .execute(params![
                 node_id,
@@ -1190,7 +1202,9 @@ impl Db {
                 n("net_tx"),
                 n("tcp"),
                 n("udp"),
-                n("procs")
+                n("procs"),
+                n("net_rx_max"),
+                n("net_tx_max")
             ])?;
         Ok(())
     }
@@ -1212,12 +1226,20 @@ impl Db {
     ///
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
+    ///
+    /// `net_rx_max` and `net_tx_max` are the bucket's highest rather than its
+    /// mean, since a maximum of maxima loses nothing: a week's window peaks at
+    /// the same rate as the minute that reached it. Each row counts as at least
+    /// its own mean. Rows predating the column hold 0, and the mean divides by
+    /// the hub's clock in whole seconds, which over a minute of steady traffic
+    /// can put it 1-2% above the agent's per-second rates.
     pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
                     CAST(AVG(disk_used) AS INTEGER),
-                    CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER)
+                    CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
+                    MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max))
              FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
         )?;
         let rows = stmt.query_map(params![node_id, since, step], |r| {
@@ -1225,6 +1247,7 @@ impl Db {
                 "ts": r.get::<_, i64>(0)?, "cpu": r.get::<_, f64>(1)?,
                 "mem_used": r.get::<_, i64>(2)?, "disk_used": r.get::<_, i64>(3)?,
                 "net_rx": r.get::<_, i64>(4)?, "net_tx": r.get::<_, i64>(5)?,
+                "net_rx_max": r.get::<_, i64>(6)?, "net_tx_max": r.get::<_, i64>(7)?,
             }))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
