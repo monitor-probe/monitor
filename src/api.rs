@@ -2377,8 +2377,15 @@ mod tests {
         let base = Utc::now().timestamp() / 120 * 120 - 120;
         // One bucket: a quiet minute and a busy one, then a probe that answered
         // once and timed out three times.
-        app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
-        app.db.insert_metric(id, base + 70, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
+        // The quiet minute predates the peak column, whose default is 0.
+        app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0, "net_tx": 3_000})).unwrap();
+        app.db
+            .insert_metric(
+                id,
+                base + 70,
+                &json!({"cpu": 40.0, "net_rx": 1_000, "net_rx_max": 4_000, "net_tx": 1_000, "net_tx_max": 2_000}),
+            )
+            .unwrap();
         for _ in 0..3 {
             task(&app, vec![id]);
         }
@@ -2392,6 +2399,8 @@ mod tests {
         let m = &app.db.metrics(id, base, 120).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
         assert_eq!(m["net_rx"], 500);
+        assert_eq!(m["net_rx_max"], 4_000, "the bucket peaks where its busiest minute did");
+        assert_eq!(m["net_tx_max"], 3_000, "a row without a peak counts as its own mean");
         assert_eq!(m["ts"], base, "stamped with the bucket, so every series shares a grid");
 
         // Keyed by task rather than index: the order is the panel's, which
