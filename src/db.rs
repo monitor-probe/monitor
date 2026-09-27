@@ -1230,9 +1230,9 @@ impl Db {
     /// `net_rx_max` and `net_tx_max` are the bucket's highest rather than its
     /// mean, since a maximum of maxima loses nothing: a week's window peaks at
     /// the same rate as the minute that reached it. Each row counts as at least
-    /// its own mean. Rows predating the column hold 0, and the mean divides by
-    /// the hub's clock in whole seconds, which over a minute of steady traffic
-    /// can put it 1-2% above the agent's per-second rates.
+    /// its own mean: rows predating the column hold 0, and the mean, timed by
+    /// the hub's arrivals rather than the agent's clock, can edge past the
+    /// agent's own rates by the network's jitter.
     pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(

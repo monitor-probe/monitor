@@ -130,7 +130,7 @@ impl Agent {
 /// `tick` is an `Instant` rather than the wall clock, because the rate divides by
 /// a duration. NTP stepping the clock backwards -- a fresh boot correcting
 /// itself, a restored snapshot -- makes a wall-clock difference negative, and the
-/// `.max(1)` guarding the division would then divide a whole minute of bytes by
+/// `.max(1.0)` guarding the division would then divide a whole minute of bytes by
 /// one second. The agent computes its own rate against `Instant` for the same
 /// reason.
 #[derive(Debug)]
@@ -778,9 +778,11 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
         entry.minute.write_into(&mut row);
         if let (Some((epoch, (rx, tx))), Some(mark), Some(obj)) = (&span, &entry.mark, row.as_object_mut()) {
             if mark.epoch == *epoch {
-                let elapsed = arrival.tick.saturating_duration_since(mark.tick).as_secs().max(1) as i64;
-                obj.insert("net_rx".into(), json!((rx - mark.counters.0).max(0) / elapsed));
-                obj.insert("net_tx".into(), json!((tx - mark.counters.1).max(0) / elapsed));
+                // Fractional seconds: whole ones would drop up to 0.99 s of the
+                // minute and overstate its rate by up to 1.7%.
+                let elapsed = arrival.tick.saturating_duration_since(mark.tick).as_secs_f64().max(1.0);
+                obj.insert("net_rx".into(), json!(((rx - mark.counters.0).max(0) as f64 / elapsed) as i64));
+                obj.insert("net_tx".into(), json!(((tx - mark.counters.1).max(0) as f64 / elapsed) as i64));
             }
         }
         entry.last_minute = Some(minute);
@@ -1101,13 +1103,17 @@ mod tests {
 
         // Busy for half the minute, then idle; 60 MB arrive in between, and by
         // the next sample both have ended. The sample halfway caught the busiest
-        // second of the burst.
-        send(&app, id, &mut session, 0, &burst(1_000, 0, 100.0, 100)).unwrap();
+        // second of the burst. The first lands half a second in, so the row spans
+        // 59.5 s.
+        dispatch(&app, id, "ip", &burst(1_000, 0, 100.0, 100), &mut session, at_ms(500)).unwrap();
         send(&app, id, &mut session, 30, &burst(1_000 + 45_000_000, 3_000_000, 50.0, 151)).unwrap();
         send(&app, id, &mut session, 60, &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
 
         let row = &app.db.metrics(id, 0, 60).unwrap()[0];
-        assert_eq!(row["net_rx"], 1_000_000, "60 MB over 60 s is 1 MB/s, not the agent's 0");
+        assert_eq!(
+            row["net_rx"], 1_008_403,
+            "60 MB over 59.5 s, not the agent's 0 nor over 59 whole seconds"
+        );
         assert_eq!(row["net_rx_max"], 3_000_000, "the busiest second survives the mean");
         assert_eq!(row["cpu"], 50.0, "the mean of the minute, not the idle second it ended on");
         // Integers remain integral: the column is read with as_i64, which returns
