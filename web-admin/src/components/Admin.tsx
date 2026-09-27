@@ -1,6 +1,6 @@
-import { lazy, memo, Suspense, useCallback, useEffect, useId, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, CalendarDays, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -9,7 +9,7 @@ import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -901,62 +901,6 @@ function currencyHint(code: string) {
   }
 }
 
-const pad = (n: number) => String(n).padStart(2, "0")
-
-// 23 kB gzipped, a sixth of the panel, for one field: loaded with the dialog
-// that holds it rather than with every page.
-const loadCalendar = () => import("@/components/ui/calendar")
-const Calendar = lazy(() => loadCalendar().then((m) => ({ default: m.Calendar })))
-
-// The panel's own calendar rather than the browser's date field. Expiry dates
-// run years ahead, so month and year are dropdowns.
-function DateInput({ value, onChange }: { value: string; onChange: (value: string) => void }) {
-  const [open, setOpen] = useState(false)
-  useEffect(() => void loadCalendar(), [])
-  const [y, m, d] = value.split("-").map(Number)
-  const date = value ? new Date(y, m - 1, d) : undefined
-  const year = new Date().getFullYear()
-  const pick = (value: string) => {
-    onChange(value)
-    setOpen(false)
-  }
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button type="button" variant="outline" className="w-full justify-between px-3 font-normal">
-          <span className={value ? "tnum" : "text-muted-foreground"}>{value || "长期有效"}</span>
-          <CalendarDays className="text-muted-foreground" />
-        </Button>
-      </PopoverTrigger>
-      {/* Focus goes to the chosen day once the calendar mounts, not to 清除,
-          the one control present while the chunk is still loading. */}
-      <PopoverContent align="end" className="w-auto p-0" onOpenAutoFocus={(e) => e.preventDefault()}>
-        <Suspense>
-        <Calendar
-          autoFocus
-          mode="single"
-          required
-          captionLayout="dropdown"
-          startMonth={new Date(year - 10, 0)}
-          endMonth={new Date(year + 30, 11)}
-          defaultMonth={date}
-          selected={date}
-          // The local date; toISOString would give UTC's, a day early east of it.
-          onSelect={(d) => pick(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`)}
-        />
-        </Suspense>
-        {value && (
-          <div className="border-t p-2">
-            <Button type="button" variant="ghost" size="sm" className="w-full" onClick={() => pick("")}>
-              清除到期日
-            </Button>
-          </div>
-        )}
-      </PopoverContent>
-    </Popover>
-  )
-}
-
 function BillingForm({ node, onClose, onSaved }: {
   node: Node
   onClose: () => void
@@ -1065,7 +1009,7 @@ function BillingForm({ node, onClose, onSaved }: {
                 </div>
               </Field>
               <Field label="到期时间">
-                <DateInput value={form.expires_at ?? ""} onChange={(v) => set("expires_at", v)} />
+                <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
               </Field>
             </div>
           </div>
