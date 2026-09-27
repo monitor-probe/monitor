@@ -1904,9 +1904,6 @@ function ThemeSettings({ theme, saved, onClose }: {
       >
         <DialogHeader>
           <DialogTitle>{theme.name} 设置</DialogTitle>
-          <DialogDescription className="leading-relaxed">
-            保存后公开页刷新即生效，更新、重装主题都不会丢失。这里填的内容所有访客都能看到，不要填密码或密钥。
-          </DialogDescription>
         </DialogHeader>
         <form className="flex min-h-0 flex-1 flex-col gap-4" onSubmit={save}>
           <div className="flex min-h-0 flex-1 flex-col gap-4 sm:flex-row">
