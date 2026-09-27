@@ -220,8 +220,8 @@ const SOURCES: Record<Source, string> = {
 // tooltip, keeping the column to addresses alone.
 //
 // Drawn again only when the addresses change. The table re-renders on every
-// push, and redrawing a tooltip per address took the panel's script time at a
-// hundred nodes from 66 to 128 ms a second.
+// push, and redrawing a tooltip per address would raise the panel's script time
+// at a hundred nodes from 66 to 128 ms a second.
 const Addresses = memo(
   function Addresses({ list }: { list: NonNullable<Node["addresses"]> }) {
     if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
@@ -1322,10 +1322,7 @@ function trafficTone(n: Node, warnAt: number) {
 }
 
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
-  const [warnAt, setWarnAt] = useState(80)
-  useEffect(() => {
-    api<Settings>("/settings").then((s) => Number(s.notify_traffic) > 0 && setWarnAt(Number(s.notify_traffic))).catch(() => {})
-  }, [])
+  const warnAt = Number(useSettings().s?.notify_traffic) || 80
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
