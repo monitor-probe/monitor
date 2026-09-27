@@ -15,7 +15,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
-import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
+import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
@@ -855,6 +855,20 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
   )
 }
 
+const CURRENCY_NAMES = new Intl.DisplayNames(["zh-CN"], { type: "currency" })
+
+// The name confirms a code the hub can only check the shape of. DisplayNames
+// echoes back a code outside ISO 4217 and throws on anything but three letters,
+// which the hub refuses with its own message.
+function currencyHint(code: string) {
+  try {
+    const name = CURRENCY_NAMES.of(code)
+    return name === code ? "未知代码，照原样显示" : name
+  } catch {
+    return undefined
+  }
+}
+
 function BillingForm({ node, onClose, onSaved }: {
   node: Node
   onClose: () => void
@@ -864,6 +878,10 @@ function BillingForm({ node, onClose, onSaved }: {
   // Text rather than a number: a numeric state cannot represent an empty field,
   // so clearing it would snap back to 0 mid-entry. Empty means free.
   const [price, setPrice] = useState(node.price > 0 ? String(node.price) : "")
+  // Whole years are entered in years, the way a five-year plan is sold.
+  const months = cycleMonths(node.billing_cycle)
+  const [unit, setUnit] = useState(months === 0 ? "once" : months % 12 ? "months" : "years")
+  const [count, setCount] = useState(String(months % 12 ? months : months / 12 || 1))
   const [saving, setSaving] = useState(false)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
@@ -875,7 +893,8 @@ function BillingForm({ node, onClose, onSaved }: {
         body: JSON.stringify(changes(node, {
           price: Math.max(0, Number(price) || 0),
           currency: form.currency,
-          billing_cycle: form.billing_cycle,
+          // The hub refuses a length out of range and stores a named one by name.
+          billing_cycle: unit === "once" ? "once" : `${Number(count) * (unit === "years" ? 12 : 1)}m`,
           expires_at: form.expires_at || null,
         })),
       })
@@ -908,27 +927,40 @@ function BillingForm({ node, onClose, onSaved }: {
                   placeholder="免费"
                 />
               </Field>
-              <Field label="货币">
-                <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent position="popper">
-                    {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => (
-                      <SelectItem key={c} value={c}>{c}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+              <Field label="货币" hint={currencyHint(form.currency)}>
+                <Input
+                  maxLength={3}
+                  autoCapitalize="characters"
+                  spellCheck={false}
+                  value={form.currency}
+                  onChange={(e) => set("currency", e.target.value.toUpperCase())}
+                  placeholder="USD"
+                />
               </Field>
             </div>
             <div className="grid grid-cols-2 gap-4">
               <Field label="付款周期">
-                <Select value={form.billing_cycle} onValueChange={(v) => set("billing_cycle", v)}>
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent position="popper">
-                    {Object.entries(CYCLES).map(([k, v]) => (
-                      <SelectItem key={k} value={k}>{v}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <div className="flex gap-2">
+                  {unit !== "once" && (
+                    <Input
+                      type="number"
+                      min="1"
+                      step="1"
+                      aria-label="周期长度"
+                      className="w-16"
+                      value={count}
+                      onChange={(e) => setCount(e.target.value)}
+                    />
+                  )}
+                  <Select value={unit} onValueChange={setUnit}>
+                    <SelectTrigger className="min-w-0 flex-1"><SelectValue /></SelectTrigger>
+                    <SelectContent position="popper">
+                      <SelectItem value="months">个月</SelectItem>
+                      <SelectItem value="years">年</SelectItem>
+                      <SelectItem value="once">一次性</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
               </Field>
               <Field label="到期时间">
                 <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />

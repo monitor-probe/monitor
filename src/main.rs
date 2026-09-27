@@ -673,17 +673,34 @@ fn new_password(db: &Db) -> Result<String> {
     Ok(password)
 }
 
+/// Cycles stored under a name. Any other length is stored as `<n>m`; the names
+/// remain because themes built for hub 1.3.0 and earlier recognize only these.
+const NAMED_CYCLES: [(&str, u32); 6] = [
+    ("monthly", 1),
+    ("quarterly", 3),
+    ("semiannual", 6),
+    ("yearly", 12),
+    ("biennial", 24),
+    ("triennial", 36),
+];
+
+/// The longest cycle accepted, in months: 100 years.
+const MAX_CYCLE: u32 = 1_200;
+
 /// Billing cycles as whole months. `once` has none, so it never rolls over.
 fn cycle_months(cycle: &str) -> Option<u32> {
-    Some(match cycle {
-        "monthly" => 1,
-        "quarterly" => 3,
-        "semiannual" => 6,
-        "yearly" => 12,
-        "biennial" => 24,
-        "triennial" => 36,
-        _ => return None,
-    })
+    match NAMED_CYCLES.iter().find(|(name, _)| *name == cycle) {
+        Some(&(_, months)) => Some(months),
+        None => cycle.strip_suffix('m')?.parse().ok().filter(|m| (1..=MAX_CYCLE).contains(m)),
+    }
+}
+
+/// The stored spelling of a cycle of `months`: its name where it has one.
+fn cycle_name(months: u32) -> String {
+    NAMED_CYCLES
+        .iter()
+        .find(|(_, m)| *m == months)
+        .map_or_else(|| format!("{months}m"), |(name, _)| (*name).into())
 }
 
 /// A node still reporting past its expiry date has been renewed, so the date is
@@ -798,6 +815,8 @@ mod tests {
         assert_eq!(renewed(d("2026-01-31"), "monthly", d("2026-02-01")), Some(d("2026-02-28")));
         // Years overdue: cycles are added until the date is in the future.
         assert_eq!(renewed(d("2024-03-10"), "yearly", d("2026-08-28")), Some(d("2027-03-10")));
+        // A length without a name rolls the same way.
+        assert_eq!(renewed(d("2026-03-10"), "60m", d("2026-08-28")), Some(d("2031-03-10")));
         // Not yet due, and one-off billing: both left unchanged.
         assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
         assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
