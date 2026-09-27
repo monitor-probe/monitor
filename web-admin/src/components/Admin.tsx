@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -377,13 +377,45 @@ function Command({ className = "", children }: { className?: string; children: R
   )
 }
 
-function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
+function Field({ label, hint, help, className = "", children }: {
+  label: string
+  hint?: string
+  help?: React.ReactNode
+  className?: string
+  children: React.ReactNode
+}) {
+  const title = <Label className="text-sm font-medium">{label}</Label>
   return (
     <div className={`space-y-2 ${className}`}>
-      <Label className="text-sm font-medium">{label}</Label>
+      {help ? <div className="flex items-center gap-1.5">{title}<Help>{help}</Help></div> : title}
       {children}
       {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
+  )
+}
+
+// A tap shows no tooltip on its own, so a click opens it as well. The trigger's
+// own handlers would close it on press and on click; both are prevented.
+function Help({ children }: { children: React.ReactNode }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <Tooltip open={open} onOpenChange={setOpen}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label="说明"
+          className="text-muted-foreground hover:text-foreground"
+          onPointerDown={(e) => e.preventDefault()}
+          onClick={(e) => {
+            e.preventDefault()
+            setOpen(true)
+          }}
+        >
+          <CircleQuestionMark className="size-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-64 space-y-1 text-left">{children}</TooltipContent>
+    </Tooltip>
   )
 }
 
@@ -927,7 +959,21 @@ function BillingForm({ node, onClose, onSaved }: {
                   placeholder="免费"
                 />
               </Field>
-              <Field label="货币" hint={currencyHint(form.currency)}>
+              <Field
+                label="货币"
+                hint={currencyHint(form.currency)}
+                help={
+                  <>
+                    <p>填三个字母的货币代码，大小写都行。</p>
+                    <p>
+                      例如：
+                      {["美元 USD", "人民币 CNY", "港币 HKD", "新台币 TWD", "欧元 EUR", "日元 JPY"].map((c, i) => (
+                        <span key={c}>{i > 0 && "、"}<span className="whitespace-nowrap">{c}</span></span>
+                      ))}
+                    </p>
+                  </>
+                }
+              >
                 <Input
                   maxLength={3}
                   autoCapitalize="characters"
