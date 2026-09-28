@@ -694,7 +694,7 @@ fn billing_error(currency: Option<&mut String>, cycle: Option<&mut String>) -> O
     }
     if let Some(cycle) = cycle.filter(|c| *c != "once") {
         let Some(months) = crate::cycle_months(cycle) else {
-            return Some("付款周期要在 1 个月到 100 年之间");
+            return Some("付款周期要是整月，在 1 个月到 100 年之间");
         };
         *cycle = crate::cycle_name(months);
     }

@@ -918,6 +918,9 @@ function BillingForm({ node, onClose, onSaved }: {
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
   async function save() {
+    // The hub refuses a length out of range and stores a named one by name, so
+    // an unchanged length is compared in months, not in spelling.
+    const cycle = unit === "once" ? "once" : `${Number(count) * (unit === "years" ? 12 : 1)}m`
     setSaving(true)
     try {
       await api(`/nodes/${node.id}`, {
@@ -925,8 +928,7 @@ function BillingForm({ node, onClose, onSaved }: {
         body: JSON.stringify(changes(node, {
           price: Math.max(0, Number(price) || 0),
           currency: form.currency,
-          // The hub refuses a length out of range and stores a named one by name.
-          billing_cycle: unit === "once" ? "once" : `${Number(count) * (unit === "years" ? 12 : 1)}m`,
+          billing_cycle: cycleMonths(cycle) === months ? node.billing_cycle : cycle,
           expires_at: form.expires_at || null,
         })),
       })
@@ -961,7 +963,7 @@ function BillingForm({ node, onClose, onSaved }: {
               </Field>
               <Field
                 label="货币"
-                hint={currencyHint(form.currency)}
+                hint={currencyHint(form.currency.toUpperCase())}
                 help={
                   <>
                     <p>填三个字母的货币代码，大小写都行。</p>
@@ -974,12 +976,15 @@ function BillingForm({ node, onClose, onSaved }: {
                   </>
                 }
               >
+                {/* Uppercased by CSS: rewriting the value mid-composition would
+                    break an input method, and the hub stores it uppercased. */}
                 <Input
                   maxLength={3}
                   autoCapitalize="characters"
                   spellCheck={false}
+                  className="uppercase"
                   value={form.currency}
-                  onChange={(e) => set("currency", e.target.value.toUpperCase())}
+                  onChange={(e) => set("currency", e.target.value)}
                   placeholder="USD"
                 />
               </Field>
