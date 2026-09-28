@@ -43,7 +43,10 @@
   --over: oklch(0.5 0.14 27);
 }
 
+/* `color-scheme` draws the browser's own controls -- the date picker icon,
+   number spinners, checkboxes, scrollbars -- in the dark palette as well. */
 .dark {
+  color-scheme: dark;
   --background: oklch(0.129 0.042 264.695);
   --foreground: oklch(0.984 0.003 247.858);
   --card: oklch(0.208 0.042 265.755);
