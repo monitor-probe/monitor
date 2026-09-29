@@ -2167,8 +2167,8 @@ function Themes() {
             autoCapitalize="off"
             autoCorrect="off"
             spellCheck={false}
-            placeholder="https://github.com/作者/仓库"
-            aria-label="主题的 GitHub 仓库地址"
+            placeholder="主题 GitHub 仓库地址"
+            aria-label="主题 GitHub 仓库地址"
             className="h-8 flex-1 basis-60"
           />
           <Button size="sm" type="submit" disabled={!!busy || !repo.trim()}>
