@@ -18,7 +18,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{self, Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -338,7 +338,7 @@ fn default_hours() -> i64 {
 
 /// How many history windows are built concurrently.
 ///
-/// `PUBLIC_HOURS` bounds what one request costs; this bounds how many may run,
+/// `span` bounds what one request costs; this bounds how many may run,
 /// closing the same gap `main::RELAY_GATE` and `auth::PASSWORD_GATE` close on
 /// the other two paths an anonymous caller can make expensive. This is the most
 /// expensive of the three: every request holds the single connection the agents
@@ -383,9 +383,8 @@ pub async fn metrics(
     let Ok(_permit) = HISTORY_GATE.try_acquire() else {
         return answer(StatusCode::SERVICE_UNAVAILABLE, "查询历史的请求太多，稍后再试");
     };
-    let hours = w.hours.clamp(1, if full { ADMIN_HOURS } else { PUBLIC_HOURS });
-    let since = Utc::now().timestamp() - hours * 3_600;
-    let step = sample_step(hours, w.points);
+    let hours = w.hours.clamp(1, app.db.retention_days() * 24);
+    let span = span(hours, w.points, Utc::now().timestamp());
     let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
     let (want_metrics, want_ping) = (wants("metrics"), wants("ping"));
     // Off the runtime, for the reason given in `db_stats` below: this reads every
@@ -403,15 +402,14 @@ pub async fn metrics(
         // has nothing to label and this costs a turn at the write connection.
         let probes =
             if want_ping { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
-        let metrics = if want_metrics { app.db.metrics(id, since, step)? } else { vec![] };
+        let metrics = if want_metrics { app.db.metrics(id, span)? } else { vec![] };
         // `loss` is per probe across the whole window, alongside the per-bucket
         // `loss` on the rows. Both are required and neither replaces the other:
         // the row figure is what a tooltip reads, while the window figure is the
         // only one that can be accurate, since the denominators it divides by are
         // gone by the time the rows are built. Additive, so a theme unaware of it
         // continues to work.
-        let (ping, loss) =
-            if want_ping { app.db.ping_records(id, since, step)? } else { (vec![], json!({})) };
+        let (ping, loss) = if want_ping { app.db.ping_records(id, span)? } else { (vec![], json!({})) };
         anyhow::Ok(json!({"metrics": metrics, "ping": ping, "probes": probes, "loss": loss}))
     })
     .await;
@@ -421,40 +419,38 @@ pub async fn metrics(
     }
 }
 
-/// Widest history window each audience may request.
+/// The window a chart request is answered with, `hours` wide.
 ///
-/// The thinning below bounds the response, not the scan behind it: `hours=2160`
-/// returns 320 rows after reading every probe result the node has retained. At a
-/// month of retention that is 224 ms holding the single write connection the
-/// agents report through, growing with `retention_days`.
-///
-/// The public ceiling is a week because that is the widest chart the themes
-/// draw, so nothing in use is lost. The panel retains the quarter year, being
-/// one signed-in operator rather than an anonymous caller.
-const PUBLIC_HOURS: i64 = 24 * 7;
-const ADMIN_HOURS: i64 = 24 * 90;
-
-/// Seconds between the samples a window is drawn from.
+/// The width is capped by the retention window alone, the same for every
+/// caller, because no width costs more than the week: up to `DETAIL_DAYS` a
+/// request reads minute rows, 10,080 per series at most, and past it hourly
+/// rows, 8,760 per series at a year. The scan is what a request costs -- the
+/// thinning below bounds the response, not the rows read -- and the anonymous
+/// ceiling used to be a week for that reason.
 ///
 /// Thinning exists for what the screen cannot draw rather than as a convention:
 /// where the samples fit, every one is sent. A chart of a hundred points reads
 /// as a hundred samples taken, which for a probe is a claim about the network.
-/// Whole minutes, matching the grid the metric rows sit on.
+/// Whole minutes, matching the grid the metric rows sit on, and whole hours
+/// past the week, so that no hourly row straddles two points.
 ///
 /// `points` is what the caller reports it can draw, and can only lower the
 /// budget: `SAMPLES` is the hub's ceiling rather than the caller's, set at a day
-/// of minutes so the widest charted probe window returns intact.
+/// of minutes so the day's probe window returns intact.
 // ponytail: the budget is per series, so a response is SAMPLES × (1 + probes) --
 // bounded by how many probes the admin created, not by the caller. Four probes
 // at a day is ~90 kB gzipped; if that list ever grows long, scale SAMPLES by
 // the probe count.
-fn sample_step(hours: i64, points: Option<i64>) -> i64 {
+fn span(hours: i64, points: Option<i64>, now: i64) -> db::Span {
     const SAMPLES: i64 = 1_440;
     let budget = points.unwrap_or(SAMPLES).clamp(60, SAMPLES);
+    let hourly = hours > db::DETAIL_DAYS * 24;
+    let unit = if hourly { 3_600 } else { 60 };
     // Rounded up, or the budget would not be one: a window that does not divide
     // evenly would keep the finer step and exceed it. `i64::div_ceil` is still
     // unstable, and both operands are positive here.
-    60 * ((hours * 60 + budget - 1) / budget).max(1)
+    let step = unit * ((hours * 3_600 / unit + budget - 1) / budget).max(1);
+    db::Span { since: now - hours * 3_600, step, hourly }
 }
 
 /// Guards a per-node read: the panel sees everything, while the public page sees
@@ -757,6 +753,9 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
+        // How far back a chart may reach, so a theme offers only windows the hub
+        // answers in full; `metrics` narrows a wider one without saying so.
+        "history_days": app.db.retention_days(),
         // Whether this browser may provision is not answered here: a GET carries
         // no `Origin`, so the panel applies `provisioning_allowed`'s rule itself.
         //
@@ -1917,8 +1916,10 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "theme" if !crate::frontend::selectable(app, value) => Some("主题没有安装".into()),
         // Housekeeping clamps whatever it reads, so an unparsable value would be
         // stored, echoed back, and silently mean 7 days indefinitely.
-        "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
-            Some("历史保留天数要在 1 到 3650 之间".into())
+        "retention_days"
+            if !value.parse::<i64>().is_ok_and(|d| (1..=db::MAX_RETENTION_DAYS).contains(&d)) =>
+        {
+            Some(format!("历史保留天数要在 1 到 {} 之间", db::MAX_RETENTION_DAYS))
         }
         // The hub fetches this URL itself, so it must be one: a scheme it cannot
         // speak turns every agent download into a 502 that says nothing about the
@@ -1981,7 +1982,7 @@ mod tests {
     use super::*;
     // Sessions remain hashed; only node tokens are stored in the clear.
     use crate::auth::sha256;
-    use crate::db::Db;
+    use crate::db::{Db, Span};
 
     /// What a browser on `https://monitor.example.com` sends with a panel write.
     fn panel_headers() -> HeaderMap {
@@ -2334,8 +2335,9 @@ mod tests {
         let app = app();
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
-        // A month of history at the rate the hub writes it. Two probes, because
-        // the budget is per series and a single-probe fixture would conceal that.
+        // A month of history at the rate the hub writes it, folded as the hourly
+        // pass would. Two probes, because the budget is per series and a
+        // single-probe fixture would conceal that.
         const PROBES: i64 = 2;
         for _ in 0..PROBES {
             task(&app, vec![id]);
@@ -2343,17 +2345,21 @@ mod tests {
         for i in 0..30 * 1440 {
             app.db.insert_metric(id, now - i * 60, &json!({"cpu": 1.0})).unwrap();
             for task in 1..=PROBES {
-                app.db.insert_pings(id, &[(task, now - i * 20, 42)]).unwrap();
+                app.db.insert_pings(id, &[(task, now - i * 60, 42)]).unwrap();
             }
         }
+        app.db.roll_up(now, 365).unwrap();
 
         // Including windows that do not divide evenly, which are where a step
-        // rounded the wrong way overruns.
-        for hours in [1, 6, 13, 23, 24, 168, 2_160] {
-            let step = sample_step(hours, None);
-            let since = now - hours * 3_600;
-            let metrics = app.db.metrics(id, since, step).unwrap();
-            let (ping, _) = app.db.ping_records(id, since, step).unwrap();
+        // rounded the wrong way overruns, and both sides of the hourly tier.
+        for hours in [1, 6, 13, 23, 24, 168, 169, 720, 8_760] {
+            let span = span(hours, None, now);
+            assert_eq!(span.hourly, hours > 168, "{hours}h");
+            if span.hourly {
+                assert_eq!(span.step % 3_600, 0, "{hours}h: an hourly row straddles two points");
+            }
+            let metrics = app.db.metrics(id, span).unwrap();
+            let (ping, _) = app.db.ping_records(id, span).unwrap();
             // Against the budget itself rather than whatever the step produced:
             // derived from the step, this would only demonstrate that division
             // works. One bucket of slack, as the window rarely divides evenly.
@@ -2368,24 +2374,23 @@ mod tests {
             assert!(!metrics.is_empty() && !ping.is_empty(), "{hours}h returned nothing");
             // A bucket the window opens partway through begins before it.
             assert!(
-                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= since - step),
+                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= span.since - span.step),
                 "{hours}h reached back too far"
             );
         }
-        // The widest window costs no more than a narrow one: unthinned, a month of
-        // history is 43,200 rows.
-        assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160, None)).unwrap().len() <= 1_441);
 
         // A day returns every minute it holds: thinning exists only for what the
         // screen cannot draw.
-        assert_eq!(sample_step(24, Some(2_000)), 60, "a day of minutes fits under the ceiling");
-        assert_eq!(sample_step(6, Some(2_000)), 60, "and so does six hours");
+        let step = |hours, points| span(hours, points, now).step;
+        assert_eq!(step(24, Some(2_000)), 60, "a day of minutes fits under the ceiling");
+        assert_eq!(step(6, Some(2_000)), 60, "and so does six hours");
+        assert_eq!(step(720, None), 3_600, "a month is its hours");
 
         // A caller may request less than the budget, never more: the ceiling
         // belongs to the hub, since this path takes no credentials.
-        assert!(sample_step(24, Some(390)) > sample_step(24, None));
-        assert_eq!(sample_step(24, Some(100_000)), sample_step(24, None));
-        assert_eq!(sample_step(24, Some(0)), sample_step(24, Some(60)));
+        assert!(step(24, Some(390)) > step(24, None));
+        assert_eq!(step(24, Some(100_000)), step(24, None));
+        assert_eq!(step(24, Some(0)), step(24, Some(60)));
 
         // Requesting one half leaves the other empty rather than sending it: on
         // the day window that half was two thirds of the response.
@@ -2426,7 +2431,7 @@ mod tests {
         app.db.insert_pings(id, &[(2, base + 10, -1)]).unwrap();
         app.db.insert_pings(id, &[(3, base + 10, 12)]).unwrap();
 
-        let m = &app.db.metrics(id, base, 120).unwrap()[0];
+        let m = &app.db.metrics(id, Span::minutes(base, 120)).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
         assert_eq!(m["net_rx"], 500);
         assert_eq!(m["net_rx_max"], 4_000, "the bucket peaks where its busiest minute did");
@@ -2435,7 +2440,7 @@ mod tests {
 
         // Keyed by task rather than index: the order is the panel's, which
         // `a_probe_chart_follows_the_panel_order` covers.
-        let (rows, window_loss) = app.db.ping_records(id, base, 120).unwrap();
+        let (rows, window_loss) = app.db.ping_records(id, Span::minutes(base, 120)).unwrap();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
         };
@@ -2463,7 +2468,7 @@ mod tests {
         for i in 0..180 {
             app.db.insert_pings(wide, &[(wide_probe, wide_base + i, if i == 0 { -1 } else { 20 })]).unwrap();
         }
-        let (rows, _) = app.db.ping_records(wide, wide_base, 180).unwrap();
+        let (rows, _) = app.db.ping_records(wide, Span::minutes(wide_base, 180)).unwrap();
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
         let row = &rows[0];
         assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
@@ -2476,7 +2481,7 @@ mod tests {
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
             app.db.insert_pings(jitter, &[(jitter_probe, wide_base + i as i64, latency)]).unwrap();
         }
-        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().0[0];
+        let row = &app.db.ping_records(jitter, Span::minutes(wide_base, 180)).unwrap().0[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
         assert_eq!(row["band"], json!([10, 50]));
 
@@ -2488,7 +2493,7 @@ mod tests {
         for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
             app.db.insert_pings(even, &[(even_probe, wide_base + i as i64, latency)]).unwrap();
         }
-        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().0[0]["latency"], 25);
+        assert_eq!(app.db.ping_records(even, Span::minutes(wide_base, 180)).unwrap().0[0]["latency"], 25);
     }
 
     /// What a window lost is the proportion of its samples lost, and only the hub
@@ -2512,7 +2517,7 @@ mod tests {
         }
         app.db.insert_pings(id, &[(probe, base + 60, -1)]).unwrap();
 
-        let (rows, loss) = app.db.ping_records(id, base, 60).unwrap();
+        let (rows, loss) = app.db.ping_records(id, Span::minutes(base, 60)).unwrap();
         let per_bucket: Vec<i64> = rows.iter().map(|r| r["loss"].as_i64().unwrap_or(0)).collect();
         assert_eq!(per_bucket, vec![0, 100], "the buckets are right about themselves");
 
@@ -3215,7 +3220,7 @@ mod tests {
         assert_eq!(app.db.node(id).unwrap().unwrap().disk_total, 30i64 << 30, "and no extra write to get it");
     }
 
-    /// `PUBLIC_HOURS` bounds one window; this bounds how many are built
+    /// `span` bounds one window; this bounds how many are built
     /// concurrently. Each holds the connection the agents report through for its
     /// entire scan, and the path takes no credentials. `PASSWORD_GATE` refuses the
     /// same way; `RELAY_GATE` queues briefly instead, as a batch install is one
@@ -3314,11 +3319,12 @@ mod tests {
         assert!(readable(&app, true, open), "and never closes it for the panel");
     }
 
-    /// The window ceiling is a scan bound rather than a response bound: the
-    /// thinning already limits the row count, while a quarter-year still reads
-    /// every row behind it holding the write connection.
+    /// The retention window is the ceiling for every caller: no width reads more
+    /// than the week of minute rows, so wider windows need no separate bound for
+    /// anonymous callers, and a window past what is kept would only draw
+    /// history that is not there.
     #[tokio::test]
-    async fn an_anonymous_history_window_stops_at_a_week() {
+    async fn a_history_window_stops_at_the_retention_window() {
         let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
@@ -3330,25 +3336,32 @@ mod tests {
         for day in 0..30 {
             app.db.insert_metric(id, now - day * 86_400 + 60, &json!({"cpu": 1.0})).unwrap();
         }
+        app.db.roll_up(now, 90).unwrap();
         let ask = |hours| {
             let query = format!("hours={hours}&series=metrics");
-            metrics(
-                State(app.clone()),
-                HeaderMap::new(),
-                Path(id),
-                Query(serde_urlencoded::from_str::<Window>(&query).unwrap()),
-            )
+            let app = app.clone();
+            async move {
+                let answer = metrics(
+                    State(app),
+                    HeaderMap::new(),
+                    Path(id),
+                    Query(serde_urlencoded::from_str::<Window>(&query).unwrap()),
+                )
+                .await;
+                axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap()
+            }
         };
         let rows =
-            |body: &str| serde_json::from_str::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
+            |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
 
-        let week = axum::body::to_bytes(ask(168).await.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(rows(std::str::from_utf8(&week).unwrap()), 8, "a week reaches back seven days");
+        app.db.set("retention_days", "7").unwrap();
+        let week = ask(168).await;
+        assert_eq!(rows(&week), 8, "a week reaches back seven days");
+        assert_eq!(ask(2_160).await, week, "a window past the retention window is narrowed to it");
 
-        // Requesting the quarter year formerly available to an anonymous caller
-        // returns the week: the extra rows exist, and reading them is the cost.
-        let quarter = axum::body::to_bytes(ask(2_160).await.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(quarter, week, "an anonymous window past a week is clamped to one");
+        // Past the week, from the hourly tier and the minute rows after it.
+        app.db.set("retention_days", "30").unwrap();
+        assert_eq!(rows(&ask(2_160).await), 30, "a month reaches back thirty days");
     }
 
     #[tokio::test]
@@ -3451,7 +3464,7 @@ mod tests {
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
-        assert_eq!(read["retention_days"], "7", "the default belongs in the answer, not in each caller");
+        assert_eq!(read["retention_days"], "90", "the default belongs in the answer, not in each caller");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -3472,7 +3485,7 @@ mod tests {
             StatusCode::OK,
             "a fresh hub's own settings must survive a round trip"
         );
-        assert_eq!(app.db.retention_days(), 7, "and the stored window is the one that was shown");
+        assert_eq!(app.db.retention_days(), 90, "and the stored window is the one that was shown");
     }
 
     #[tokio::test]

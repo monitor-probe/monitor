@@ -838,7 +838,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::db::{Node, PingTask};
+    use crate::db::{Node, PingTask, Span};
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
@@ -912,7 +912,7 @@ mod tests {
     fn results(app: &App, id: i64) -> Vec<(i64, i64)> {
         let mut seen: Vec<(i64, i64)> = app
             .db
-            .ping_records(id, 0, 60)
+            .ping_records(id, Span::minutes(0, 60))
             .unwrap()
             .0
             .iter()
@@ -1047,7 +1047,7 @@ mod tests {
         assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx_total"], 6_900, "the live view follows");
         assert_eq!(total_rx(&app, id), 0, "within the minute nothing past the baseline is booked");
         assert!(
-            app.db.metrics(id, 0, 60).unwrap().is_empty(),
+            app.db.metrics(id, Span::minutes(0, 60)).unwrap().is_empty(),
             "a session writes no row for its first minute"
         );
 
@@ -1055,7 +1055,7 @@ mod tests {
         // The minute's last reading, 59 s in, is what the boundary books; the
         // reading that crossed it waits for the next.
         assert_eq!(total_rx(&app, id), 5_900);
-        let rows = app.db.metrics(id, 0, 60).unwrap();
+        let rows = app.db.metrics(id, Span::minutes(0, 60)).unwrap();
         assert_eq!(rows.len(), 1, "a minute of reports is one row");
         // History rows are keyed by (node, ts), so counting them proves nothing on
         // its own: reports a second apart collapse onto one row with or without
@@ -1109,7 +1109,7 @@ mod tests {
         send(&app, id, &mut session, 30, &burst(1_000 + 45_000_000, 3_000_000, 50.0, 151)).unwrap();
         send(&app, id, &mut session, 60, &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
 
-        let row = &app.db.metrics(id, 0, 60).unwrap()[0];
+        let row = &app.db.metrics(id, Span::minutes(0, 60)).unwrap()[0];
         assert_eq!(
             row["net_rx"], 1_008_403,
             "60 MB over 59.5 s, not the agent's 0 nor over 59 whole seconds"
@@ -1135,7 +1135,7 @@ mod tests {
         let mut session = Session::default();
         send(&app, id, &mut session, 0, &report_json("boot-a", 1_000, 500)).unwrap();
         send(&app, id, &mut session, 60, &report_json("boot-a", 2_000, 500)).unwrap();
-        let before = app.db.metrics(id, 0, 60).unwrap();
+        let before = app.db.metrics(id, Span::minutes(0, 60)).unwrap();
         assert_eq!(before.len(), 1, "the running session wrote the row for this minute");
 
         // The socket drops and the agent returns within the same minute.
@@ -1146,7 +1146,11 @@ mod tests {
                                      "net_tx_total": 4_500}})
         .to_string();
         send(&app, id, &mut Session::default(), 70, &loud).unwrap();
-        assert_eq!(app.db.metrics(id, 0, 60).unwrap(), before, "the row keeps the minute it described");
+        assert_eq!(
+            app.db.metrics(id, Span::minutes(0, 60)).unwrap(),
+            before,
+            "the row keeps the minute it described"
+        );
     }
 
     /// Booking about once a minute must leave exactly what booking every report

@@ -414,7 +414,11 @@ function Help({ children }: { children: React.ReactNode }) {
           <CircleQuestionMark className="size-3.5" />
         </button>
       </TooltipTrigger>
-      <TooltipContent className="max-w-64 space-y-1 text-left">{children}</TooltipContent>
+      {/* Chinese may break between any two characters, which in a box this
+          narrow splits words such as 季付 across lines. Kept whole, a line
+          breaks at punctuation and spaces, and mid-run only when a run cannot
+          fit at all. */}
+      <TooltipContent className="max-w-64 space-y-1 text-left break-keep wrap-anywhere">{children}</TooltipContent>
     </Tooltip>
   )
 }
@@ -2316,12 +2320,29 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
           </Field>
-          <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
+          <Field
+            label="历史数据保留天数"
+            hint="1–365 天，超出的自动清理，累计流量不受影响"
+            help={
+              <>
+                <p>
+                  推荐 <span className="whitespace-nowrap">90 天</span>（默认），月付、季付的机器都能看完一整个周期。
+                </p>
+                <p>
+                  最近 <span className="whitespace-nowrap">7 天</span>
+                  {"按分钟保存，更早的按小时保存：超过一周的图表上，两者画出来几乎一样，按小时存只占几十分之一的空间。"}
+                </p>
+                <p>
+                  年付的机器想回看整整一年，填 <span className="whitespace-nowrap">365</span>，这是上限。
+                </p>
+              </>
+            }
+          >
             <Input
               type="number"
               value={String(s.retention_days ?? "")}
               onChange={(e) => set("retention_days", e.target.value)}
-              placeholder="7"
+              placeholder="90"
             />
           </Field>
           <Field
@@ -2354,7 +2375,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 // `||` rather than `??`: the hub returns "" for an unset key
                 // rather than null, and "" is the one value this key's write path
                 // refuses.
-                retention_days: String(s.retention_days || "7"),
+                retention_days: String(s.retention_days || "90"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
               }).then((ok) => ok && onSaved())
@@ -2903,7 +2924,7 @@ function Data() {
         <div>
           <h3 className="text-sm font-medium">回收空间</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
+            清掉超出保留天数的历史，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。重建期间需要约为数据库两倍的空闲磁盘，过程中面板和上报会短暂变慢。
           </p>
         </div>
         <div>
@@ -2949,7 +2970,7 @@ function Data() {
       {confirm === "vacuum" && (
         <ConfirmDialog
           title="回收空间？"
-          description="超出保留天数的历史明细会被删除，然后重建数据库文件。累计流量不受影响。"
+          description="超出保留天数的历史会被删除，然后重建数据库文件。累计流量不受影响。"
           confirmLabel={busy === "vacuum" ? "回收中…" : "开始回收"}
           busy={!!busy}
           onClose={() => setConfirm(null)}

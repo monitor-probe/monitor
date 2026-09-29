@@ -42,7 +42,7 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{DateTime, Local, Months, NaiveDate, TimeZone, Timelike};
+use chrono::{DateTime, Local, Months, NaiveDate, TimeZone, Timelike, Utc};
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -738,8 +738,8 @@ fn renew_online_nodes(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Expires sessions, trims history, rolls over expiry dates and sends the daily
-/// expiry digest: once at startup, then on the hour of the hub's clock.
+/// Rolls over expiry dates, expires sessions, sends the daily expiry digest and
+/// folds and trims history: once at startup, then on the hour of the hub's clock.
 ///
 /// On the hour because renewal falls due when the hub's date changes. Passes
 /// counted from startup would leave an online node shown expired for up to an
@@ -748,13 +748,9 @@ fn renew_online_nodes(app: &App) -> Result<()> {
 /// next hour.
 async fn housekeeping(app: Shared) {
     loop {
-        // First, so the midnight pass does not wait on pruning.
+        // First, so the midnight pass does not wait on anything below.
         if let Err(e) = renew_online_nodes(&app) {
             warn!("rolling expiry dates failed: {e:#}");
-        }
-        let keep = app.db.retention_days();
-        if let Err(e) = app.db.prune(keep) {
-            warn!("pruning history failed: {e:#}");
         }
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
@@ -764,6 +760,25 @@ async fn housekeeping(app: Shared) {
             Ok(Some(note)) => notify::send(&app, note),
             Ok(None) => {}
             Err(e) => warn!("expiry digest failed: {e:#}"),
+        }
+        // Last, and off the runtime: the first pass after an upgrade folds every
+        // hour still held in minute rows and prunes the week's excess, which
+        // takes seconds to minutes. Folding precedes pruning, which keeps minute
+        // rows until their hour is folded.
+        let history = app.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            let keep = history.db.retention_days();
+            let folded = history.db.roll_up(Utc::now().timestamp(), keep)?;
+            // More than the hour a pass normally folds is a catch-up, which is
+            // worth a line to explain the disk activity it causes.
+            if folded > 1 {
+                info!("folded {folded} hours of history into the hourly tier");
+            }
+            history.db.prune(keep)
+        })
+        .await;
+        if let Err(e) = done.map_err(anyhow::Error::from).and_then(|r| r) {
+            warn!("maintaining history failed: {e:#}");
         }
         tokio::time::sleep(until_next_hour(Local::now())).await;
     }
