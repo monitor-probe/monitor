@@ -2140,8 +2140,10 @@ function Themes() {
         <div>
           <h3 className="text-sm font-medium">安装主题</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            填主题的 GitHub 仓库地址，hub 从它最新的 release 下载 <code>theme.tar.gz</code>；也可以上传下载好的{" "}
-            <code>theme.tar.gz</code>。同名主题整体替换。
+            填主题的 GitHub 仓库地址，如 <code>https://github.com/作者/仓库</code>，仓库首页、Releases
+            页的地址都可以，hub 总是安装最新 release 里的 <code>theme.tar.gz</code>。
+            <br />
+            也可以上传下载好的 <code>theme.tar.gz</code>。同名主题整体替换。
             <br />
             主题的 <code>url</code> 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 从它最新的
             release 取 <code>theme.tar.gz</code>，版本没变就不下载。
