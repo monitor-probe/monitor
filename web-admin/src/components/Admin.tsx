@@ -2138,18 +2138,19 @@ function Themes() {
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <div>
-          <h3 className="text-sm font-medium">安装主题</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            填主题的 GitHub 仓库地址，如 <code>https://github.com/作者/仓库</code>，仓库首页、Releases
-            页的地址都可以，hub 总是安装最新 release 里的 <code>theme.tar.gz</code>。
-            <br />
-            也可以上传下载好的 <code>theme.tar.gz</code>。同名主题整体替换。
-            <br />
-            主题的 <code>url</code> 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 从它最新的
-            release 取 <code>theme.tar.gz</code>，版本没变就不下载。
-            <br />
-            主题代码在访客浏览器中执行，请只安装可信来源。
-          </p>
+          <div className="flex items-center gap-1.5">
+            <h3 className="text-sm font-medium">安装主题</h3>
+            <Help>
+              <p>填主题的 GitHub 仓库地址，仓库首页、Releases 页的地址都可以，总是安装最新的 release。</p>
+              <p>例如：<span className="whitespace-nowrap">https://github.com/作者/仓库</span></p>
+              <p>也可以上传 release 里的 theme.tar.gz，不要选 Source code。同名主题整体替换。</p>
+              <p>
+                主题的 url 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 检查更新，版本没变就不下载。
+              </p>
+            </Help>
+          </div>
+          {/* Stays in view: it is the one line about what installing permits. */}
+          <p className="mt-1 text-xs text-muted-foreground">主题代码在访客浏览器中执行，请只安装可信来源。</p>
         </div>
         <form
           className="flex flex-wrap gap-2"
