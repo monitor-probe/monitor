@@ -421,6 +421,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(&args.themes)?;
+    if let Err(e) = db::temp_files_beside(&args.database) {
+        warn!("SQLite keeps its temporary files in its default directory: {e:#}");
+    }
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
     let url = advertised_url(&args.site, args.listen);
