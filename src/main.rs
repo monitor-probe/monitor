@@ -502,6 +502,9 @@ async fn main() -> Result<()> {
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
         .route("/api/themes/{short}/update", post(api::update_theme))
+        // Not under /api/themes/: a fixed segment there would shadow the theme
+        // of that name for the routes keyed by `{short}`.
+        .route("/api/theme-install", post(api::install_theme))
         .route("/api/themes/{short}/config", put(api::save_theme_config))
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
