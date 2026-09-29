@@ -396,7 +396,7 @@ function Field({ label, hint, help, className = "", children }: {
 
 // A tap shows no tooltip on its own, so a click opens it as well. The trigger's
 // own handlers would close it on press and on click; both are prevented.
-function Help({ children }: { children: React.ReactNode }) {
+function Help({ children, width = "max-w-64" }: { children: React.ReactNode; width?: string }) {
   const [open, setOpen] = useState(false)
   return (
     <Tooltip open={open} onOpenChange={setOpen}>
@@ -414,7 +414,9 @@ function Help({ children }: { children: React.ReactNode }) {
           <CircleQuestionMark className="size-3.5" />
         </button>
       </TooltipTrigger>
-      <TooltipContent className="max-w-64 space-y-1 text-left">{children}</TooltipContent>
+      {/* text-wrap over the component's text-balance, which breaks multi-line
+          Chinese halfway across the box. */}
+      <TooltipContent collisionPadding={16} className={`${width} space-y-1 text-left text-wrap`}>{children}</TooltipContent>
     </Tooltip>
   )
 }
@@ -2140,10 +2142,11 @@ function Themes() {
         <div>
           <div className="flex items-center gap-1.5">
             <h3 className="text-sm font-medium">安装主题</h3>
-            <Help>
-              <p>填主题的 GitHub 仓库地址，仓库首页、Releases 页的地址都可以，总是安装最新的 release。</p>
-              <p>例如：<span className="whitespace-nowrap">https://github.com/作者/仓库</span></p>
-              <p>也可以上传 release 里的 theme.tar.gz，不要选 Source code。同名主题整体替换。</p>
+            <Help width="max-w-[min(28rem,calc(100vw-2rem))]">
+              <p>填主题的 GitHub 仓库地址，例如 <span className="whitespace-nowrap">https://github.com/作者/仓库</span></p>
+              <p>仓库首页、Releases 页的地址都可以，总是安装最新的 release。</p>
+              <p>也可以上传 release 里的 theme.tar.gz，不要选 Source code。</p>
+              <p>两种方式都是同名主题整体替换。</p>
               <p>
                 主题的 url 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 检查更新，版本没变就不下载。
               </p>
