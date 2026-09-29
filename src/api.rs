@@ -1214,12 +1214,14 @@ pub const MAX_CHUNK: usize = 8 * 1024 * 1024;
 /// the first request rather than by counting bytes as they arrive, so an
 /// oversized upload is refused before a byte is sent.
 ///
-/// The backup ceiling is set where it is because restoring holds the connection
-/// every read and write passes through: at the measured ~40 MB/s that is roughly
-/// 6.5 seconds during which the panel and the public page also wait. Database
-/// sizes reachable with a few hundred nodes sit two orders of magnitude below
-/// it.
-pub const MAX_RESTORE: u64 = 256 * 1024 * 1024;
+/// The backup ceiling bounds how long a restore holds the connection every read
+/// and write passes through, while the panel and the public page wait and the
+/// agents' reports queue: a 1.5 GiB copy measured 20.5 s from the page cache, so
+/// 1 GiB is 14 s, or 27 s at the ~40 MB/s measured from disk -- within the 90 s
+/// an agent waits before reconnecting. It clears what history can reach: at 300
+/// nodes with four probes, a week of minute rows and a year of hourly ones come
+/// to about 720 MiB.
+pub const MAX_RESTORE: u64 = 1024 * 1024 * 1024;
 pub const MAX_THEME: u64 = 32 * 1024 * 1024;
 
 /// One request of an upload: `total` is the whole file, `offset` where this piece
@@ -1454,7 +1456,7 @@ pub async fn db_restore(
 
 async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
     // Both halves read the whole file, off the runtime: `PRAGMA integrity_check`
-    // on a 256 MiB upload is not runtime work, and the copy that follows holds
+    // on a 1 GiB upload is not runtime work, and the copy that follows holds
     // the connection the agents write through.
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
