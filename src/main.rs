@@ -428,12 +428,27 @@ async fn main() -> Result<()> {
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
+    let port = args.listen.port();
+    // On a container's bridge network the host side of `-p` decides who can
+    // connect, which the hub cannot see, and a loopback listener would leave the
+    // published port with nothing behind it. Under host networking the listener
+    // is the host's own, as on a bare host. The marker files do not tell the two
+    // apart, so the advice names both.
+    let close = if in_container() {
+        format!(
+            "publish it on the host's loopback only (-p 127.0.0.1:HOST_PORT:{port}) or not at all when \
+             the proxy shares the container's network; under host networking, --listen \
+             127.0.0.1:{port} instead"
+        )
+    } else {
+        format!("--listen 127.0.0.1:{port}")
+    };
     if exposed_over_plain_http(&url) {
         warn!(
             "this hub answers plain HTTP at {url}; sessions and agent tokens travel in the clear. \
              Put it behind a TLS reverse proxy -- the panel builds install commands from the \
-             browser's own address, so nothing here has to change -- then --listen 127.0.0.1:PORT \
-             so this port is no longer reachable in the clear"
+             browser's own address, so nothing here has to change -- and close this port so the \
+             proxy is the only way in: {close}"
         );
     }
     // The warning above derives from --site, the address the operator
@@ -445,10 +460,9 @@ async fn main() -> Result<()> {
     else if !args.listen.ip().is_loopback() {
         warn!(
             "listening on {} in the clear. If a TLS proxy fronts this hub, callers can still reach \
-             this port directly and set their own X-Forwarded-Proto -- --listen 127.0.0.1:{} so the \
-             proxy is the only way in",
-            args.listen,
-            args.listen.port()
+             this port directly and set their own X-Forwarded-Proto. Close it so the proxy is the \
+             only way in: {close}",
+            args.listen
         );
     }
     // Checked once here, because the answer is static: `provisioning_allowed`
@@ -654,6 +668,18 @@ fn host_is_loopback(authority: &str) -> bool {
     // resolving wherever its owner points it, and reading it as loopback would
     // suppress the only warning that the cookie travels in the clear.
     host.is_empty() || host == "localhost" || host.parse::<IpAddr>().is_ok_and(|a| a.is_loopback())
+}
+
+/// Whether the hub runs in a Docker or Podman container, which mark each one
+/// with /.dockerenv and /run/.containerenv. The wider signals
+/// (/run/systemd/container, cgroup paths) are not consulted: they also mark
+/// LXC, and a VPS that is itself an LXC container is a bare host for this
+/// purpose.
+///
+/// ponytail: Kubernetes pods carry neither marker and receive the bare-host
+/// advice; checking $KUBERNETES_SERVICE_HOST would cover them.
+fn in_container() -> bool {
+    ["/.dockerenv", "/run/.containerenv"].into_iter().any(|p| std::path::Path::new(p).exists())
 }
 
 /// Prints a one-time admin password when the database is first created, since a
