@@ -377,17 +377,18 @@ function Command({ className = "", children }: { className?: string; children: R
   )
 }
 
-function Field({ label, hint, help, className = "", children }: {
+function Field({ label, hint, help, helpWidth, className = "", children }: {
   label: string
   hint?: string
   help?: React.ReactNode
+  helpWidth?: string
   className?: string
   children: React.ReactNode
 }) {
   const title = <Label className="text-sm font-medium">{label}</Label>
   return (
     <div className={`space-y-2 ${className}`}>
-      {help ? <div className="flex items-center gap-1.5">{title}<Help>{help}</Help></div> : title}
+      {help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title}
       {children}
       {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
@@ -396,6 +397,11 @@ function Field({ label, hint, help, className = "", children }: {
 
 // A tap shows no tooltip on its own, so a click opens it as well. The trigger's
 // own handlers would close it on press and on click; both are prevented.
+//
+// `width` is fitted to each text: the narrowest at which its paragraphs take the
+// fewest lines, plus some room for a wider font. A screen too narrow for that
+// gets the narrowest width holding the lines it can fit; capping the wide box
+// at the screen instead would leave its lines well short of the right edge.
 function Help({ children, width = "max-w-64" }: { children: React.ReactNode; width?: string }) {
   const [open, setOpen] = useState(false)
   return (
@@ -974,6 +980,7 @@ function BillingForm({ node, onClose, onSaved }: {
               <Field
                 label="货币"
                 hint={currencyHint(form.currency.toUpperCase())}
+                helpWidth="max-w-72"
                 help={
                   <>
                     <p>填三个字母的货币代码，大小写都行。</p>
@@ -2150,7 +2157,7 @@ function Themes() {
         <div>
           <div className="flex items-center gap-1.5">
             <h3 className="text-sm font-medium">安装主题</h3>
-            <Help width="max-w-[min(28rem,calc(100vw-2rem))]">
+            <Help width="max-w-64 min-[480px]:max-w-112">
               <p>填主题的 GitHub 仓库地址，例如 <span className="whitespace-nowrap">https://github.com/作者/仓库</span></p>
               <p>仓库首页、Releases 页的地址都可以，总是安装最新的 release。</p>
               <p>也可以上传 release 里的 theme.tar.gz，不要选 Source code。</p>
@@ -2362,6 +2369,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           <Field
             label="历史数据保留天数"
             hint="1–365 天，超出的自动清理，累计流量不受影响"
+            helpWidth="max-w-66 min-[408px]:max-w-94"
             help={
               <>
                 <p>
@@ -2372,8 +2380,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                   {"按分钟保存，更早的按小时保存：超过一周的图表上，两者画出来几乎一样，按小时存只占几十分之一的空间。"}
                 </p>
                 <p>
-                  季付的机器想看完整个周期，填 <span className="whitespace-nowrap">92</span>；年付的想回看整整一年，填{" "}
-                  <span className="whitespace-nowrap">365</span>，这是上限。
+                  上限 <span className="whitespace-nowrap">365 天</span>。
                 </p>
               </>
             }
