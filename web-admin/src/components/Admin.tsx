@@ -2169,6 +2169,7 @@ function Themes() {
           <Input
             value={repo}
             onChange={(e) => setRepo(e.target.value)}
+            disabled={!!busy}
             inputMode="url"
             autoCapitalize="off"
             autoCorrect="off"

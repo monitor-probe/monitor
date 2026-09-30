@@ -288,8 +288,8 @@ pub fn install<R: Read>(themes: &Path, archive: R, expect: Option<&str>) -> Resu
 }
 
 /// The answer to any archive that cannot be read to the end: a download cut
-/// short, which is how a partial `theme.tar.gz` fails, or a file that is not a
-/// gzip'd tar at all.
+/// short, which is how a partial `theme.tar.gz` fails, or a gzip stream that is
+/// corrupt or holds no tar.
 const DAMAGED: &str = "主题包损坏或不完整（可能没下载完），重新下载 theme.tar.gz 再试";
 
 /// The answer to an archive whose entries cannot all be written: a file and a
@@ -306,7 +306,7 @@ pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 /// Tells a failure the archive caused from one of this machine's. Reading fails
 /// with `UnexpectedEof` where the stream stops short and `InvalidInput` for a
-/// corrupt or non-gzip one; a layout that cannot be written fails with the
+/// corrupt one; a layout that cannot be written fails with the
 /// second group. Anything else -- a full disk, a permission -- is this machine's
 /// to fix.
 fn archive_error(e: std::io::Error) -> anyhow::Error {

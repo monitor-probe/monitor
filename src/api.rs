@@ -1624,15 +1624,15 @@ struct Asset {
     name: String,
 }
 
-/// The `<owner>/<repo>` a theme's `url` names, where it names a GitHub repository
-/// at all.
+/// The `<owner>/<repo>` a theme's `url` or an address pasted to install one
+/// names, where it names a GitHub repository at all.
 ///
-/// An allowlist rather than a filter. Every address the update path fetches is
-/// constructed from these two strings, so nothing in a manifest can direct the
-/// hub at a host it did not choose, which is why no private-address check is
-/// needed here. The only host that is not github.com is the GitHub proxy in the
-/// panel's settings, configured by the operator and already used by the agent
-/// relay.
+/// An allowlist rather than a filter. Every address the update and install paths
+/// fetch is constructed from these two strings, so neither a manifest nor a pasted
+/// address can direct the hub at a host it did not choose, which is why no
+/// private-address check is needed here. The only host that is not github.com
+/// is the GitHub proxy in the panel's settings, configured by the operator and
+/// already used by the agent relay.
 fn github_repo(url: &str) -> Option<(&str, &str)> {
     let (owner, rest) = url.strip_prefix("https://github.com/")?.split_once('/')?;
     // A link to a branch or a file is still a link to the repository, as is the
@@ -1777,7 +1777,11 @@ async fn fetch_theme(
     let response = app
         .http
         .get(url)
-        .timeout(std::time::Duration::from_secs(120))
+        // With the release lookup's 15 s, this keeps the request inside the 100 s
+        // Cloudflare waits for an origin before answering 524 itself: a download
+        // too slow to finish is then reported as one, naming the proxy setting,
+        // rather than as a hub that did not respond.
+        .timeout(std::time::Duration::from_secs(75))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
