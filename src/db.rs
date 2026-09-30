@@ -613,6 +613,32 @@ pub struct PingTask {
     pub base: Option<Vec<i64>>,
 }
 
+/// Points SQLite's temporary files -- the copy `VACUUM` rebuilds the database
+/// into, and any sort too large for memory -- at the directory holding the
+/// database. Every deployment keeps that directory writable and sized for the
+/// database (the unit's `ReadWritePaths`, the image's /data), and the backup and
+/// restore scratch files already go there.
+///
+/// SQLite otherwise tries $SQLITE_TMPDIR, $TMPDIR, /var/tmp, /usr/tmp, /tmp and
+/// the working directory. The Docker image is built from scratch and has none of
+/// them writable. The rebuilt copy stays in a page cache sized like the main
+/// database's 8 MiB and needs a file only beyond it, so `VACUUM` would succeed
+/// on a database compacting to 6.3 MB and fail on one compacting to 9 MB, with
+/// "unable to determine a suitable directory for temporary files". SQLite
+/// unlinks each file as it opens it, so none remain there.
+///
+/// Process-wide and not thread-safe, so it is called once, before any
+/// connection is opened. A bare file name keeps SQLite's own search, which ends
+/// at the working directory holding it.
+pub fn temp_files_beside(database: &str) -> Result<()> {
+    let Some(dir) = std::path::Path::new(database).parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    let dir = dir.to_string_lossy().replace('\'', "''");
+    Connection::open_in_memory()?.execute_batch(&format!("PRAGMA temp_store_directory = '{dir}'"))?;
+    Ok(())
+}
+
 /// Restricts the database to its owner.
 ///
 /// It is the credential store: node tokens in the clear, the GitHub client
@@ -2074,8 +2100,9 @@ impl Db {
     ///
     /// SQLite's constraints on `VACUUM`, and why they hold here: it cannot run
     /// inside a transaction or with a live statement on the connection (there is
-    /// one connection, and this call owns it); it requires roughly as much free
-    /// disk as the database itself, and a failure rolls back leaving the original
+    /// one connection, and this call owns it); it requires free disk of about
+    /// twice the compacted database -- the temporary copy, then the same pages
+    /// again in the WAL -- and a failure rolls back leaving the original
     /// untouched; and it can renumber rowids, which nothing here keys on, since
     /// `metric` and `ping_record` are WITHOUT ROWID and every other table
     /// declares its own primary key.

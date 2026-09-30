@@ -1625,19 +1625,21 @@ struct Asset {
     name: String,
 }
 
-/// The `<owner>/<repo>` a theme's `url` names, where it names a GitHub repository
-/// at all.
+/// The `<owner>/<repo>` a theme's `url` or an address pasted to install one
+/// names, where it names a GitHub repository at all.
 ///
-/// An allowlist rather than a filter. Every address the update path fetches is
-/// constructed from these two strings, so nothing in a manifest can direct the
-/// hub at a host it did not choose, which is why no private-address check is
-/// needed here. The only host that is not github.com is the GitHub proxy in the
-/// panel's settings, configured by the operator and already used by the agent
-/// relay.
+/// An allowlist rather than a filter. Every address the update and install paths
+/// fetch is constructed from these two strings, so neither a manifest nor a pasted
+/// address can direct the hub at a host it did not choose, which is why no
+/// private-address check is needed here. The only host that is not github.com
+/// is the GitHub proxy in the panel's settings, configured by the operator and
+/// already used by the agent relay.
 fn github_repo(url: &str) -> Option<(&str, &str)> {
     let (owner, rest) = url.strip_prefix("https://github.com/")?.split_once('/')?;
-    // A link to a branch or a file is still a link to the repository.
-    let repo = rest.split('/').next()?;
+    // A link to a branch or a file is still a link to the repository, as is the
+    // `?tab=readme-ov-file` or `#readme` a browser's address bar often carries;
+    // neither part reaches the addresses built from the result.
+    let repo = rest.split(['/', '?', '#']).next()?;
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     (path_segment(owner) && path_segment(repo)).then_some((owner, repo))
 }
@@ -1667,29 +1669,13 @@ pub async fn update_theme(_: Admin, State(app): State<Shared>, Path(short): Path
 }
 
 async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error> {
-    use anyhow::Context;
-
     let Some(installed) = crate::frontend::themes(app)?.into_iter().find(|theme| theme.short == short) else {
         refuse!("没有这个主题");
     };
     let Some((owner, repo)) = github_repo(&installed.url) else {
         refuse!("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包");
     };
-
-    let release = match latest_release(app, &format!("{owner}/{repo}")).await {
-        Ok(release) => release,
-        Err(e) => {
-            let why = match e.status().map(|s| s.as_u16()) {
-                None if e.is_decode() => "GitHub 的回复无法识别，稍后再试",
-                Some(404) => "这个仓库还没有正式 release",
-                // Unauthenticated callers get 60 requests an hour per address.
-                Some(403 | 429) => "GitHub 限制了这台机器的请求次数，过一小时再试",
-                Some(_) => "GitHub 接口出错，稍后再试",
-                None => "hub 连不上 api.github.com，检查它的网络",
-            };
-            return Err(e).context(crate::Shown(format!("读不到 {owner}/{repo} 的最新 release：{why}")));
-        }
-    };
+    let release = latest_theme(app, owner, repo).await?;
 
     // Tags read `v1.2.3` while manifests carry `1.2.3`. Equal means up to date;
     // anything else is installed, including a deliberate downgrade, since the
@@ -1698,6 +1684,74 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     if tag.strip_prefix('v').unwrap_or(tag) == installed.version {
         return Ok((false, installed.version));
     }
+    // Constrained to the theme it may replace. The built-in theme has no
+    // directory until this runs: updating it writes one, which then serves in
+    // place of the embedded copy until it is deleted.
+    let theme = fetch_theme(app, owner, repo, &release, Some(short)).await?;
+    Ok((true, theme.version))
+}
+
+/// Installs a theme from the latest release of a GitHub repository the
+/// administrator pastes, in place of downloading its `theme.tar.gz` and
+/// uploading it.
+///
+/// The trust is that of an upload: either way the administrator vouches for the
+/// repository. The address is read as an update reads a manifest's `url`, with
+/// only `<owner>/<repo>` taken from it, so the hub still fetches from no host but
+/// GitHub and the configured proxy.
+pub async fn install_theme(_: Admin, State(app): State<Shared>, Json(body): Json<Repository>) -> Response {
+    let url = body.url.trim();
+    // A bare `github.com/...`, the form addresses are often passed along in.
+    let url = if url.starts_with("github.com/") { format!("https://{url}") } else { url.to_owned() };
+    let Some((owner, repo)) = github_repo(&url) else {
+        return bad("填主题的 GitHub 仓库地址，形如 https://github.com/作者/仓库");
+    };
+    let release = match latest_theme(&app, owner, repo).await {
+        Ok(release) => release,
+        Err(e) => return fail(e),
+    };
+    match fetch_theme(&app, owner, repo, &release, None).await {
+        Ok(theme) => Json(json!({"theme": theme})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Repository {
+    url: String,
+}
+
+/// The latest release of a theme's repository, with GitHub's refusal put into
+/// words the panel can show.
+async fn latest_theme(app: &App, owner: &str, repo: &str) -> Result<Release, anyhow::Error> {
+    use anyhow::Context;
+
+    latest_release(app, &format!("{owner}/{repo}")).await.or_else(|e| {
+        let why = match e.status().map(|s| s.as_u16()) {
+            None if e.is_decode() => "GitHub 的回复无法识别，稍后再试",
+            // A private repository answers the same as a missing one.
+            Some(404) => "仓库不存在，或者还没有正式 release",
+            // Unauthenticated callers get 60 requests an hour per address.
+            Some(403 | 429) => "GitHub 限制了这台机器的请求次数，过一小时再试",
+            Some(_) => "GitHub 接口出错，稍后再试",
+            None => "hub 连不上 api.github.com，检查它的网络",
+        };
+        Err(e).context(crate::Shown(format!("读不到 {owner}/{repo} 的最新 release：{why}")))
+    })
+}
+
+/// Downloads the `theme.tar.gz` of `release` and installs it; `expect` names
+/// the theme it must replace, as for [`crate::frontend::install`].
+async fn fetch_theme(
+    app: &App,
+    owner: &str,
+    repo: &str,
+    release: &Release,
+    expect: Option<&str>,
+) -> Result<crate::frontend::Theme, anyhow::Error> {
+    use anyhow::Context;
+
+    let tag = &release.tag_name;
     if !path_segment(tag) {
         refuse!("release 的 tag {tag:?} 不能出现在下载地址里");
     }
@@ -1708,16 +1762,27 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     }
 
     // Through the panel's GitHub proxy when one is configured, the archive being
-    // the part a blocked network cannot reach. The API call above is not proxied:
-    // most proxies front only releases, and a hub that cannot read the tag still
-    // has the upload path.
-    let url =
-        crate::proxied(app, format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}"));
-    let unreachable = || crate::Shown(format!("下载 {ARCHIVE} 失败，检查 hub 的网络或面板里的 GitHub 代理"));
+    // the part a blocked network cannot reach. The API call in `latest_theme` is
+    // not proxied: most proxies front only releases, and a hub that cannot read
+    // the tag still has the upload path.
+    let direct = format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}");
+    let url = crate::proxied(app, direct.clone());
+    let proxy = url != direct;
+    let unreachable = || {
+        crate::Shown(if proxy {
+            format!("经 GitHub 代理下载 {ARCHIVE} 失败，换一个代理，或清空代理让 hub 直连")
+        } else {
+            format!("下载 {ARCHIVE} 失败：hub 连不上 github.com 时，在设置里填 GitHub 代理")
+        })
+    };
     let response = app
         .http
         .get(url)
-        .timeout(std::time::Duration::from_secs(120))
+        // With the release lookup's 15 s, this keeps the request inside the 100 s
+        // Cloudflare waits for an origin before answering 524 itself: a download
+        // too slow to finish is then reported as one, naming the proxy setting,
+        // rather than as a hub that did not respond.
+        .timeout(std::time::Duration::from_secs(75))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -1733,17 +1798,22 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
         None => refuse!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
     }
     let archive = response.bytes().await.with_context(unreachable)?;
+    // Checked here as well as in `unpack`, whose answer is written for an upload.
+    // A proxy answers with a page of its own -- a block notice, a sign-in wall --
+    // under a 200.
+    if !archive.starts_with(&crate::frontend::GZIP_MAGIC) {
+        if proxy {
+            refuse!("GitHub 代理返回的不是主题包，换一个代理，或清空代理让 hub 直连");
+        }
+        refuse!("release {tag} 里的 {ARCHIVE} 不是 gzip 格式，包本身有问题，请联系主题作者");
+    }
 
-    // The same unpacking, validation and atomic replace an upload undergoes,
-    // constrained to the theme it may replace. The built-in theme has no
-    // directory until this runs: updating it writes one, which then serves in
-    // place of the embedded copy until it is deleted.
-    let (themes, short) = (app.themes.clone(), short.to_owned());
-    let theme = tokio::task::spawn_blocking(move || {
-        crate::frontend::install(&themes, std::io::Cursor::new(archive), Some(&short))
+    // The same unpacking, validation and atomic replace an upload undergoes.
+    let (themes, expect) = (app.themes.clone(), expect.map(str::to_owned));
+    tokio::task::spawn_blocking(move || {
+        crate::frontend::install(&themes, std::io::Cursor::new(archive), expect.as_deref())
     })
-    .await??;
-    Ok((true, theme.version))
+    .await?
 }
 
 /// The thumbnail the theme list displays, where the theme provides one; the list
@@ -2176,19 +2246,23 @@ mod tests {
         assert_eq!(stored, vec![5, 60, 3_600]);
     }
 
-    /// The update path follows a manifest's `url` to build a download address, so
-    /// what counts as a GitHub repository constitutes the entire trust boundary:
-    /// whatever this accepts, the hub will fetch.
+    /// The update and install paths follow a manifest's `url` or a pasted address
+    /// to build a download address, so what counts as a GitHub repository
+    /// constitutes the entire trust boundary: whatever this accepts, the hub will
+    /// fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
         assert_eq!(
             github_repo("https://github.com/monitor-probe/monitor"),
             Some(("monitor-probe", "monitor"))
         );
-        // A link to the repository, in whatever form the author wrote it.
+        // A link to the repository, in whatever form the author wrote it or the
+        // address bar showed it.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/tree/main"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/"), Some(("a", "b")));
+        assert_eq!(github_repo("https://github.com/a/b?tab=readme-ov-file"), Some(("a", "b")));
+        assert_eq!(github_repo("https://github.com/a/b#readme"), Some(("a", "b")));
 
         for hostile in [
             "",
@@ -2205,7 +2279,8 @@ mod tests {
             // Anything that could open a segment of its own in the URL built from
             // it, whether encoded, queried or fragmented.
             "https://github.com/a/b%2f..%2fc",
-            "https://github.com/a/b?x=1",
+            "https://github.com/a?x=/b",
+            "https://github.com/a#/b",
             "https://github.com/a b",
         ] {
             assert_eq!(github_repo(hostile), None, "{hostile} must not name a download");
