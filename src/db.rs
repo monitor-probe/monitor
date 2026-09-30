@@ -726,10 +726,10 @@ pub const DETAIL_DAYS: i64 = 7;
 /// where minute rows would hold 6.6 GiB.
 pub const MAX_RETENTION_DAYS: i64 = 365;
 
-/// History kept where the panel has never saved a value: a quarter, which spans
-/// the common billing cycles. Its hourly tier adds about 0.36 MiB per node with
-/// four probes to the week of minute rows every setting keeps.
-const DEFAULT_RETENTION_DAYS: i64 = 90;
+/// History kept where the panel has never saved a value: a month. Its hourly
+/// tier adds about 0.12 MiB per node with four probes to the week of minute rows
+/// every setting keeps.
+const DEFAULT_RETENTION_DAYS: i64 = 30;
 
 /// How long after an hour ends its rows may still arrive. Metric rows are
 /// written as they are stamped, but probe results wait in the session until a

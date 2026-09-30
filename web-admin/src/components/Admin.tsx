@@ -2365,14 +2365,15 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             help={
               <>
                 <p>
-                  推荐 <span className="whitespace-nowrap">90 天</span>（默认），月付、季付的机器都能看完一整个周期。
+                  默认 <span className="whitespace-nowrap">30 天</span>，能看约一个月的历史。
                 </p>
                 <p>
                   最近 <span className="whitespace-nowrap">7 天</span>
                   {"按分钟保存，更早的按小时保存：超过一周的图表上，两者画出来几乎一样，按小时存只占几十分之一的空间。"}
                 </p>
                 <p>
-                  年付的机器想回看整整一年，填 <span className="whitespace-nowrap">365</span>，这是上限。
+                  季付的机器想看完整个周期，填 <span className="whitespace-nowrap">92</span>；年付的想回看整整一年，填{" "}
+                  <span className="whitespace-nowrap">365</span>，这是上限。
                 </p>
               </>
             }
@@ -2381,7 +2382,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               type="number"
               value={String(s.retention_days ?? "")}
               onChange={(e) => set("retention_days", e.target.value)}
-              placeholder="90"
+              placeholder="30"
             />
           </Field>
           <Field
@@ -2414,7 +2415,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 // `||` rather than `??`: the hub returns "" for an unset key
                 // rather than null, and "" is the one value this key's write path
                 // refuses.
-                retention_days: String(s.retention_days || "90"),
+                retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
               }).then((ok) => ok && onSaved())

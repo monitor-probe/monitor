@@ -3547,7 +3547,7 @@ mod tests {
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
-        assert_eq!(read["retention_days"], "90", "the default belongs in the answer, not in each caller");
+        assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -3568,7 +3568,7 @@ mod tests {
             StatusCode::OK,
             "a fresh hub's own settings must survive a round trip"
         );
-        assert_eq!(app.db.retention_days(), 90, "and the stored window is the one that was shown");
+        assert_eq!(app.db.retention_days(), 30, "and the stored window is the one that was shown");
     }
 
     #[tokio::test]
