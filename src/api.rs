@@ -343,8 +343,8 @@ fn default_hours() -> i64 {
 /// the other two paths an anonymous caller can make expensive. This is the most
 /// expensive of the three: every request holds the single connection the agents
 /// report through for its entire scan, measured at 118 ms for a week of four
-/// probes and growing with `retention_days`. Without a gate, 120 requests from
-/// one machine took the panel's own node list from 1 ms to 2.8 s.
+/// probes, the most minute rows any window reads. Without a gate, 120 requests
+/// from one machine took the panel's own node list from 1 ms to 2.8 s.
 ///
 /// Four, because the requests serialise on that one connection regardless: a
 /// fifth in flight buys no throughput and merely places another scan ahead of
@@ -424,9 +424,10 @@ pub async fn metrics(
 /// The width is capped by the retention window alone, the same for every
 /// caller, because no width costs more than the week: up to `DETAIL_DAYS` a
 /// request reads minute rows, 10,080 per series at most, and past it hourly
-/// rows, 8,760 per series at a year. The scan is what a request costs -- the
-/// thinning below bounds the response, not the rows read -- and the anonymous
-/// ceiling used to be a week for that reason.
+/// rows, 8,760 per series at a year, with the minute rows not yet folded, which
+/// `Db::metrics` bounds to the newest week. The scan is what a request costs --
+/// the thinning below bounds the response, not the rows read -- so a width
+/// reading more than the week would need a lower ceiling for anonymous callers.
 ///
 /// Thinning exists for what the screen cannot draw rather than as a convention:
 /// where the samples fit, every one is sent. A chart of a hundred points reads
@@ -1987,7 +1988,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
     match key {
         "theme" if !crate::frontend::selectable(app, value) => Some("主题没有安装".into()),
         // Housekeeping clamps whatever it reads, so an unparsable value would be
-        // stored, echoed back, and silently mean 7 days indefinitely.
+        // stored, echoed back, and silently mean the default indefinitely.
         "retention_days"
             if !value.parse::<i64>().is_ok_and(|d| (1..=db::MAX_RETENTION_DAYS).contains(&d)) =>
         {
@@ -3413,7 +3414,6 @@ mod tests {
         for day in 0..30 {
             app.db.insert_metric(id, now - day * 86_400 + 60, &json!({"cpu": 1.0})).unwrap();
         }
-        app.db.roll_up(now, 90).unwrap();
         let ask = |hours| {
             let query = format!("hours={hours}&series=metrics");
             let app = app.clone();
@@ -3430,6 +3430,12 @@ mod tests {
         };
         let rows =
             |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
+
+        // Before the first rollup nothing is folded, and a window past the week
+        // reads the newest week of minute rows rather than every one.
+        app.db.set("retention_days", "30").unwrap();
+        assert_eq!(rows(&ask(720).await), 8, "unfolded minute rows past the week are not read");
+        app.db.roll_up(now, 90).unwrap();
 
         app.db.set("retention_days", "7").unwrap();
         let week = ask(168).await;
@@ -3512,8 +3518,8 @@ mod tests {
     }
 
     /// Housekeeping clamps whatever it finds, so an unparsable value is not an
-    /// error downstream: it silently means 7 days, in a field still displaying
-    /// what was entered.
+    /// error downstream: it silently means the default, in a field still
+    /// displaying what was entered.
     #[tokio::test]
     async fn a_retention_window_that_would_never_apply_is_refused() {
         let app = std::sync::Arc::new(app());

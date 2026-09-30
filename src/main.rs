@@ -606,6 +606,7 @@ async fn shutdown() {
         _ = term.recv() => {}
     }
     info!("shutting down");
+    db::halt();
 }
 
 /// The address printed at startup: `--site` when given, otherwise the listen
@@ -795,16 +796,18 @@ async fn housekeeping(app: Shared) {
         }
         // Last, and off the runtime: the first pass after an upgrade folds every
         // hour still held in minute rows and prunes the week's excess, which
-        // takes seconds to minutes. Folding precedes pruning, which keeps minute
-        // rows until their hour is folded.
+        // takes seconds to minutes. Folding precedes pruning, and pruning runs
+        // even when folding fails: it keeps minute rows until their hour is
+        // folded, and skipping it would leave the database growing.
         let history = app.clone();
         let done = tokio::task::spawn_blocking(move || {
             let keep = history.db.retention_days();
-            let folded = history.db.roll_up(Utc::now().timestamp(), keep)?;
-            // More than the hour a pass normally folds is a catch-up, which is
-            // worth a line to explain the disk activity it causes.
-            if folded > 1 {
-                info!("folded {folded} hours of history into the hourly tier");
+            match history.db.roll_up(Utc::now().timestamp(), keep) {
+                // More than the hour a pass normally folds is a catch-up, logged
+                // for the disk activity it causes.
+                Ok(folded) if folded > 1 => info!("folded {folded} hours of history into the hourly tier"),
+                Ok(_) => {}
+                Err(e) => warn!("folding history failed: {e:#}"),
             }
             history.db.prune(keep)
         })

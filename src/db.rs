@@ -331,6 +331,11 @@ fn migrate_to_10(conn: &Connection) -> Result<()> {
 /// The hourly tier. A file in service already has both tables, since `open`
 /// runs `SCHEMA` first; a backup from an earlier release does not, and restoring
 /// one would leave every rollup failing until the next restart.
+///
+/// This runs again after an earlier build has opened the file, and that build
+/// deletes nodes and probes without clearing `ping_hour`, which has no foreign
+/// key. Its rows for those ids are dropped here, or they would be drawn under
+/// whichever node or probe SQLite gives the id to next.
 fn migrate_to_11(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metric_hour (
@@ -348,7 +353,9 @@ fn migrate_to_11(conn: &Connection) -> Result<()> {
            answered INTEGER NOT NULL, lost INTEGER NOT NULL,
            latency INTEGER, lo INTEGER, hi INTEGER,
            PRIMARY KEY (node_id, ts, task_id)
-         ) WITHOUT ROWID;",
+         ) WITHOUT ROWID;
+         DELETE FROM ping_hour
+          WHERE node_id NOT IN (SELECT id FROM node) OR task_id NOT IN (SELECT id FROM ping_task);",
     )?;
     Ok(())
 }
@@ -720,7 +727,8 @@ pub const DETAIL_DAYS: i64 = 7;
 pub const MAX_RETENTION_DAYS: i64 = 365;
 
 /// History kept where the panel has never saved a value: a quarter, which spans
-/// the common billing cycles, for about 0.36 MiB per node with four probes.
+/// the common billing cycles. Its hourly tier adds about 0.36 MiB per node with
+/// four probes to the week of minute rows every setting keeps.
 const DEFAULT_RETENTION_DAYS: i64 = 90;
 
 /// How long after an hour ends its rows may still arrive. Metric rows are
@@ -758,10 +766,25 @@ impl Span {
 /// Lets a caller waiting on the connection take it between the steps of a long
 /// maintenance run. Dropping the guard alone does not: `std::sync::Mutex` is
 /// not fair, and the thread releasing it takes it back before a woken waiter
-/// runs. Measured on the upgrade of 90 days of 100 nodes, a request waited up
-/// to 12 s behind a prune that released the lock between every node.
+/// runs. Without the pause, on the upgrade of 90 days of 100 nodes, a request
+/// would wait up to 12 s behind a prune releasing the lock between nodes.
 fn let_waiters_in() {
     std::thread::sleep(std::time::Duration::from_millis(1));
+}
+
+/// Set once the hub begins to stop, and checked between the steps of
+/// `roll_up` and `prune`. The runtime waits on blocking work before the process
+/// exits, so the catch-up after an upgrade, minutes long, would otherwise hold
+/// the exit past systemd's 90-second stop timeout and end in SIGKILL. Each step
+/// commits on its own, and the next pass resumes where this one stopped.
+static HALTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn halt() {
+    HALTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn halted() -> bool {
+    HALTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The first hour not yet folded into the hourly tier, `None` before the first
@@ -1489,6 +1512,14 @@ impl Db {
     /// minute rows after it, each hour weighted by the minutes it holds, so a
     /// bucket averages the same minutes it would have were they all still kept.
     /// The integer columns lose under one unit to the truncated hourly means.
+    ///
+    /// The minute rows read are the newest `DETAIL_DAYS` at most. Normally the
+    /// watermark sits a few hours back, but it lags while a catch-up runs or a
+    /// rollup keeps failing, and every minute row the node holds would then
+    /// enter one request: 0.7–1.0 s per series at 90 days of 100 nodes during
+    /// the catch-up after an upgrade, against 13–87 ms once it completes. The
+    /// hours between the watermark and that week are missing from the chart
+    /// until they are folded.
     pub fn metrics(&self, node_id: i64, span: Span) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let row = |r: &rusqlite::Row<'_>| {
@@ -1520,10 +1551,12 @@ impl Db {
                    UNION ALL
                    SELECT ts, 1, cpu, mem_used, disk_used, net_rx, net_tx,
                           MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max)
-                   FROM metric WHERE node_id=?1 AND ts>=MAX(?2, ?4))
+                   FROM metric WHERE node_id=?1
+                        AND ts>=MAX(?2, ?4, (SELECT MAX(ts) FROM metric WHERE node_id=?1) - ?5))
              GROUP BY ts/?3 ORDER BY ts/?3",
         )?;
-        let rows = stmt.query_map(params![node_id, span.since, span.step, rolled], row)?;
+        let rows =
+            stmt.query_map(params![node_id, span.since, span.step, rolled, DETAIL_DAYS * 86_400], row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -1537,43 +1570,49 @@ impl Db {
     /// writes through between hours. At 100 nodes and four probes an hour takes
     /// about 15 ms.
     ///
-    /// Without a watermark it starts from the oldest minute row within
-    /// `keep_days`; with none at all, from the current hour, which is recorded
-    /// so that `prune` has a watermark to respect.
+    /// Without a watermark it records one at the hour of the oldest minute row,
+    /// or with none at all at the current hour, so that `prune` has a watermark
+    /// to respect. Hours before `keep_days` are skipped rather than folded, as
+    /// `prune` would drop them next.
     pub fn roll_up(&self, now: i64, keep_days: i64) -> Result<usize> {
-        let (mut hour, recorded) = {
+        {
             let conn = self.conn();
-            match rolled(&conn)? {
-                Some(hour) => (hour, true),
-                None => {
-                    let from = oldest(&conn, &["metric", "ping_record"])?.unwrap_or(now);
-                    (from.max(now - keep_days * 86_400).div_euclid(3_600) * 3_600, false)
-                }
+            if rolled(&conn)?.is_none() {
+                let from = oldest(&conn, &["metric", "ping_record"])?.unwrap_or(now);
+                conn.execute(
+                    "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
+                    params![ROLLED, (from.div_euclid(3_600) * 3_600).to_string()],
+                )?;
             }
-        };
-        let mut folded = 0;
-        while hour + 3_600 + LATE <= now {
-            self.fold_hour(hour)?;
-            let_waiters_in();
-            hour += 3_600;
-            folded += 1;
         }
-        if folded == 0 && !recorded {
-            self.set(ROLLED, &hour.to_string())?;
+        let floor = (now - keep_days * 86_400).div_euclid(3_600) * 3_600;
+        let mut folded = 0;
+        while !halted() && self.fold_next(floor, now - 3_600 - LATE)? {
+            let_waiters_in();
+            folded += 1;
         }
         Ok(folded)
     }
 
-    /// One hour of every node into `metric_hour` and `ping_hour`, and the
-    /// watermark past it, in one transaction: a failure leaves the hour to be
-    /// folded again rather than half folded. `INSERT OR REPLACE` makes a second
-    /// fold of the same hour a rewrite.
+    /// Folds the hour at the watermark, or at `floor` when the watermark is
+    /// older, into `metric_hour` and `ping_hour` and moves the watermark past
+    /// it, in one transaction: a failure leaves the hour to be folded again
+    /// rather than half folded. `INSERT OR REPLACE` makes a second fold of the
+    /// same hour a rewrite. False, folding nothing, once the hour is past `last`
+    /// or when there is no watermark.
+    ///
+    /// The watermark is read here rather than carried between hours: a restore
+    /// replaces it along with the rows it describes, and a stale one would skip
+    /// the restored hours.
     ///
     /// By node, as the keys begin with it; `ts` alone would scan each table.
     /// The probe results are held one node's hour at a time.
-    fn fold_hour(&self, hour: i64) -> Result<()> {
+    fn fold_next(&self, floor: i64, last: i64) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let Some(hour) = rolled(&tx)?.map(|h| h.max(floor)).filter(|&h| h <= last) else {
+            return Ok(false);
+        };
         tx.prepare_cached(
             "INSERT OR REPLACE INTO metric_hour
                (node_id, ts, minutes, cpu, mem_used, disk_used, net_rx, net_tx, net_rx_max, net_tx_max)
@@ -1612,7 +1651,7 @@ impl Db {
             params![ROLLED, (hour + 3_600).to_string()],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Drops history beyond the retention window: minute rows past
@@ -1632,27 +1671,35 @@ impl Db {
     /// At most a day of one node's rows per statement, with the lock the agents
     /// write through released in between. An hourly pass deletes an hour and is
     /// one statement per table; the first pass after an upgrade deletes
-    /// everything past the week, which in one statement held the lock for
-    /// 37.8 s at 90 days of 100 nodes, and node by node still for 0.9 s each.
+    /// everything past the week, which in one statement would hold the lock for
+    /// 37.8 s at 90 days of 100 nodes, and a node at a time 0.9 s each.
+    ///
+    /// The watermark is read with each statement: a restore can replace it,
+    /// and the minute rows it guards, between two of them.
     pub fn prune(&self, keep_days: i64) -> Result<usize> {
         let now = Utc::now().timestamp();
-        let (nodes, rolled): (Vec<i64>, _) = {
-            let conn = self.conn();
-            let nodes = conn
-                .prepare_cached("SELECT id FROM node")?
-                .query_map([], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
-            (nodes, rolled(&conn)?)
-        };
-        let minutes = (now - keep_days.min(DETAIL_DAYS) * 86_400).min(rolled.unwrap_or(i64::MIN));
+        let nodes: Vec<i64> = self
+            .conn()
+            .prepare_cached("SELECT id FROM node")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let minutes = now - keep_days.min(DETAIL_DAYS) * 86_400;
         let hours = now - keep_days * 86_400;
         let mut pruned = 0;
         for id in nodes {
-            for (table, before) in
-                [("metric", minutes), ("ping_record", minutes), ("metric_hour", hours), ("ping_hour", hours)]
-            {
+            for (table, cutoff, guarded) in [
+                ("metric", minutes, true),
+                ("ping_record", minutes, true),
+                ("metric_hour", hours, false),
+                ("ping_hour", hours, false),
+            ] {
                 loop {
+                    if halted() {
+                        return Ok(pruned);
+                    }
                     let conn = self.conn();
+                    let before =
+                        if guarded { cutoff.min(rolled(&conn)?.unwrap_or(i64::MIN)) } else { cutoff };
                     let first: Option<i64> = conn
                         .prepare_cached(&format!("SELECT MIN(ts) FROM {table} WHERE node_id=?1"))?
                         .query_row([id], |r| r.get(0))?;
@@ -1930,7 +1977,8 @@ impl Db {
     /// An hourly window reads [`PING_HOURS`] up to the watermark and
     /// [`PING_ROWS`] after it. Each hourly row enters the fold as its hour's
     /// answers and losses, so the loss figures and the range stay exact and the
-    /// median is weighted as [`Tally::median`] describes.
+    /// median is weighted as [`Tally::median`] describes. The minute rows are
+    /// bounded as in [`Db::metrics`].
     pub fn ping_records(
         &self,
         node_id: i64,
@@ -1969,7 +2017,10 @@ impl Db {
         let mut minutes_from = span.since;
         if span.hourly {
             let rolled = rolled(&conn)?.unwrap_or(i64::MIN);
-            minutes_from = minutes_from.max(rolled);
+            let newest: Option<i64> = conn
+                .prepare_cached("SELECT MAX(ts) FROM ping_record WHERE node_id=?1")?
+                .query_row([node_id], |r| r.get(0))?;
+            minutes_from = minutes_from.max(rolled).max(newest.unwrap_or(0) - DETAIL_DAYS * 86_400);
             let mut stmt = conn.prepare_cached(PING_HOURS)?;
             let mut rows = stmt.query(params![node_id, span.since, step, rolled])?;
             while let Some(r) = rows.next()? {
