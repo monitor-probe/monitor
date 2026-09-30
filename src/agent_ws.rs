@@ -150,24 +150,26 @@ struct Mark {
 const MEAN_FLOAT: [&str; 1] = ["cpu"];
 const MEAN_INT: [&str; 6] = ["mem_used", "swap_used", "disk_used", "tcp", "udp", "procs"];
 
-/// Rates a history row also carries at their highest over the minute, each as
-/// the agent measured it across one report interval, under the column it is
-/// stored in. The row's own rate is the minute's mean, which integrates to the
-/// traffic totals and therefore stores a 15-second burst at 286 Mbps as 72 Mbps
-/// (measured).
+/// Figures a history row also carries at their highest over the minute, each
+/// as the agent measured it across one report interval, under the column it is
+/// stored in. The row's own figure is the minute's mean, which for a rate
+/// integrates to the traffic totals and therefore stores a 15-second burst at
+/// 286 Mbps as 72 Mbps (measured); a 15-second CPU spike to 100% is likewise a
+/// minute at 25%.
 ///
 /// Taken from the agent rather than derived here from the arrival of two
 /// frames: the network bunches frames, and a second of bytes divided by the
 /// half second between two arrivals would record twice the rate that ran.
-const PEAK: [(&str, &str); 2] = [("net_rx", "net_rx_max"), ("net_tx", "net_tx_max")];
+const PEAK_FLOAT: [(&str, &str); 1] = [("cpu", "cpu_max")];
+const PEAK_INT: [(&str, &str); 2] = [("net_rx", "net_rx_max"), ("net_tx", "net_tx_max")];
 
 /// Running sums for the minute in progress, one slot per averaged field, and
-/// the highest of each [`PEAK`] rate.
+/// the highest of each peak figure.
 #[derive(Debug, Default)]
 struct Minute {
     sums: [f64; MEAN_FLOAT.len() + MEAN_INT.len()],
     reports: f64,
-    peaks: [i64; PEAK.len()],
+    peaks: [f64; PEAK_FLOAT.len() + PEAK_INT.len()],
 }
 
 impl Minute {
@@ -175,8 +177,8 @@ impl Minute {
         for (slot, key) in MEAN_FLOAT.iter().chain(&MEAN_INT).enumerate() {
             self.sums[slot] += metrics.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
         }
-        for (peak, (key, _)) in self.peaks.iter_mut().zip(PEAK) {
-            *peak = (*peak).max(metrics.get(key).and_then(|v| v.as_i64()).unwrap_or(0));
+        for (peak, (key, _)) in self.peaks.iter_mut().zip(PEAK_FLOAT.iter().chain(&PEAK_INT)) {
+            *peak = peak.max(metrics.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0));
         }
         self.reports += 1.0;
     }
@@ -199,8 +201,11 @@ impl Minute {
         }
         // Written whatever the report carried, so an agent sending these keys
         // itself cannot choose the stored value.
-        for (peak, (_, column)) in self.peaks.iter().zip(PEAK) {
-            obj.insert(column.to_owned(), json!(peak));
+        for (slot, (peak, (_, column))) in
+            self.peaks.iter().zip(PEAK_FLOAT.iter().chain(&PEAK_INT)).enumerate()
+        {
+            let peak = if slot < PEAK_FLOAT.len() { json!(peak) } else { json!(*peak as i64) };
+            obj.insert((*column).to_owned(), peak);
         }
     }
 }
@@ -1116,6 +1121,7 @@ mod tests {
         );
         assert_eq!(row["net_rx_max"], 3_000_000, "the busiest second survives the mean");
         assert_eq!(row["cpu"], 50.0, "the mean of the minute, not the idle second it ended on");
+        assert_eq!(row["cpu_max"], 100.0, "and its busiest second of CPU survives it too");
         // Integers remain integral: the column is read with as_i64, which returns
         // nothing for the 150.67 the raw mean would produce.
         assert_eq!(row["mem_used"], 151);

@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS metric (
   net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
   tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
   net_rx_max INTEGER NOT NULL DEFAULT 0, net_tx_max INTEGER NOT NULL DEFAULT 0,
+  cpu_max REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (node_id, ts)
 ) WITHOUT ROWID;
 
@@ -148,15 +149,18 @@ CREATE TABLE IF NOT EXISTS ping_record (
 -- row covers the minute rows stamped within it. Keyed like the tables above.
 --
 -- `minutes` counts the rows folded in and weights each average when buckets
--- spanning several hours merge them.
+-- spanning several hours merge them. Every column of `metric` is kept, whether
+-- or not the chart returns it yet: a minute row is gone after DETAIL_DAYS, and
+-- a column added here later would start empty.
 CREATE TABLE IF NOT EXISTS metric_hour (
   node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
   ts      INTEGER NOT NULL,
   minutes INTEGER NOT NULL,
-  cpu REAL NOT NULL,
-  mem_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
+  cpu REAL NOT NULL, cpu_max REAL NOT NULL,
+  mem_used INTEGER NOT NULL, swap_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
   net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
   net_rx_max INTEGER NOT NULL, net_tx_max INTEGER NOT NULL,
+  tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
   PRIMARY KEY (node_id, ts)
 ) WITHOUT ROWID;
 
@@ -328,24 +332,27 @@ fn migrate_to_10(conn: &Connection) -> Result<()> {
     add_column(conn, "metric", "net_tx_max INTEGER NOT NULL DEFAULT 0")
 }
 
-/// The hourly tier. A file in service already has both tables, since `open`
-/// runs `SCHEMA` first; a backup from an earlier release does not, and restoring
-/// one would leave every rollup failing until the next restart.
+/// The hourly tier, and the peak CPU the minute rows begin to carry. A file in
+/// service already has both tables, since `open` runs `SCHEMA` first; a backup
+/// from an earlier release does not, and restoring one would leave every rollup
+/// failing until the next restart.
 ///
 /// This runs again after an earlier build has opened the file, and that build
 /// deletes nodes and probes without clearing `ping_hour`, which has no foreign
 /// key. Its rows for those ids are dropped here, or they would be drawn under
 /// whichever node or probe SQLite gives the id to next.
 fn migrate_to_11(conn: &Connection) -> Result<()> {
+    add_column(conn, "metric", "cpu_max REAL NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metric_hour (
            node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
            ts      INTEGER NOT NULL,
            minutes INTEGER NOT NULL,
-           cpu REAL NOT NULL,
-           mem_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
+           cpu REAL NOT NULL, cpu_max REAL NOT NULL,
+           mem_used INTEGER NOT NULL, swap_used INTEGER NOT NULL, disk_used INTEGER NOT NULL,
            net_rx INTEGER NOT NULL, net_tx INTEGER NOT NULL,
            net_rx_max INTEGER NOT NULL, net_tx_max INTEGER NOT NULL,
+           tcp INTEGER NOT NULL, udp INTEGER NOT NULL, procs INTEGER NOT NULL,
            PRIMARY KEY (node_id, ts)
          ) WITHOUT ROWID;
          CREATE TABLE IF NOT EXISTS ping_hour (
@@ -1462,8 +1469,8 @@ impl Db {
             .prepare_cached(
                 "INSERT OR REPLACE INTO metric
                (node_id, ts, cpu, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs,
-                net_rx_max, net_tx_max)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                net_rx_max, net_tx_max, cpu_max)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             )?
             .execute(params![
                 node_id,
@@ -1478,7 +1485,8 @@ impl Db {
                 n("udp"),
                 n("procs"),
                 n("net_rx_max"),
-                n("net_tx_max")
+                n("net_tx_max"),
+                f("cpu_max")
             ])?;
         Ok(())
     }
@@ -1495,18 +1503,24 @@ impl Db {
     /// minutes hold, while averaging gives 28.02 GB, matching the accumulator.
     ///
     /// `swap_used`, `tcp`, `udp` and `procs` are stored but not returned, as
-    /// nothing draws them from history. The columns are retained deliberately;
-    /// `load1` was the fifth and has been removed, see `migrate_to_2`.
+    /// nothing draws them from history. The columns are retained deliberately,
+    /// in the hourly tier as well; `load1` was the fifth and has been removed,
+    /// see `migrate_to_2`.
     ///
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
     ///
-    /// `net_rx_max` and `net_tx_max` are the bucket's highest rather than its
-    /// mean, since a maximum of maxima loses nothing: a week's window peaks at
-    /// the same rate as the minute that reached it. Each row counts as at least
-    /// its own mean: rows predating the column hold 0, and the mean, timed by
-    /// the hub's arrivals rather than the agent's clock, can edge past the
-    /// agent's own rates by the network's jitter.
+    /// `net_rx_max`, `net_tx_max` and `cpu_max` are the bucket's highest rather
+    /// than its mean, since a maximum of maxima loses nothing: a week's window
+    /// peaks at the same rate as the minute that reached it. Each row counts as
+    /// at least its own mean: rows predating the columns hold 0, and the mean,
+    /// timed by the hub's arrivals rather than the agent's clock, can edge past
+    /// the agent's own rates by the network's jitter.
+    ///
+    /// `minutes` is how many minute rows the bucket holds, against the
+    /// `step / 60` it spans: a node offline for part of a bucket has its means
+    /// taken over the minutes it reported, and a caller integrating the rates
+    /// or showing availability needs the difference.
     ///
     /// An hourly window reads the folded hours before the watermark and the
     /// minute rows after it, each hour weighted by the minutes it holds, so a
@@ -1528,6 +1542,7 @@ impl Db {
                 "mem_used": r.get::<_, i64>(2)?, "disk_used": r.get::<_, i64>(3)?,
                 "net_rx": r.get::<_, i64>(4)?, "net_tx": r.get::<_, i64>(5)?,
                 "net_rx_max": r.get::<_, i64>(6)?, "net_tx_max": r.get::<_, i64>(7)?,
+                "cpu_max": r.get::<_, f64>(8)?, "minutes": r.get::<_, i64>(9)?,
             }))
         };
         if !span.hourly {
@@ -1535,7 +1550,8 @@ impl Db {
                 "SELECT (MIN(ts)/?3)*?3, AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
                         CAST(AVG(disk_used) AS INTEGER),
                         CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
-                        MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max))
+                        MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max)),
+                        MAX(MAX(cpu, cpu_max)), COUNT(*)
                  FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
             )?;
             let rows = stmt.query_map(params![node_id, span.since, span.step], row)?;
@@ -1544,13 +1560,13 @@ impl Db {
         let rolled = rolled(&conn)?.unwrap_or(i64::MIN);
         let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, SUM(cpu*w)/SUM(w), SUM(mem_used*w)/SUM(w), SUM(disk_used*w)/SUM(w),
-                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max)
+                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max), MAX(cpu_top), SUM(w)
              FROM (SELECT ts, minutes AS w, cpu, mem_used, disk_used, net_rx, net_tx,
-                          net_rx_max AS rx_max, net_tx_max AS tx_max
+                          net_rx_max AS rx_max, net_tx_max AS tx_max, cpu_max AS cpu_top
                    FROM metric_hour WHERE node_id=?1 AND ts>=?2 AND ts<?4
                    UNION ALL
                    SELECT ts, 1, cpu, mem_used, disk_used, net_rx, net_tx,
-                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max)
+                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max), MAX(cpu, cpu_max)
                    FROM metric WHERE node_id=?1
                         AND ts>=MAX(?2, ?4, (SELECT MAX(ts) FROM metric WHERE node_id=?1) - ?5))
              GROUP BY ts/?3 ORDER BY ts/?3",
@@ -1607,6 +1623,10 @@ impl Db {
     ///
     /// By node, as the keys begin with it; `ts` alone would scan each table.
     /// The probe results are held one node's hour at a time.
+    ///
+    /// The byte columns truncate their means, a loss under one byte; the counts
+    /// round theirs, as truncating would drop a UDP socket held for half the
+    /// hour.
     fn fold_next(&self, floor: i64, last: i64) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1615,11 +1635,14 @@ impl Db {
         };
         tx.prepare_cached(
             "INSERT OR REPLACE INTO metric_hour
-               (node_id, ts, minutes, cpu, mem_used, disk_used, net_rx, net_tx, net_rx_max, net_tx_max)
-             SELECT node_id, ?1, COUNT(*), AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
-                    CAST(AVG(disk_used) AS INTEGER), CAST(AVG(net_rx) AS INTEGER),
-                    CAST(AVG(net_tx) AS INTEGER),
-                    MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max))
+               (node_id, ts, minutes, cpu, cpu_max, mem_used, swap_used, disk_used, net_rx, net_tx,
+                net_rx_max, net_tx_max, tcp, udp, procs)
+             SELECT node_id, ?1, COUNT(*), AVG(cpu), MAX(MAX(cpu, cpu_max)), CAST(AVG(mem_used) AS INTEGER),
+                    CAST(AVG(swap_used) AS INTEGER), CAST(AVG(disk_used) AS INTEGER),
+                    CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
+                    MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max)),
+                    CAST(ROUND(AVG(tcp)) AS INTEGER), CAST(ROUND(AVG(udp)) AS INTEGER),
+                    CAST(ROUND(AVG(procs)) AS INTEGER)
              FROM metric WHERE node_id IN (SELECT id FROM node) AND ts>=?1 AND ts<?1+3600
              GROUP BY node_id",
         )?
@@ -3230,11 +3253,18 @@ mod tests {
         // Six hours whose values vary within each hour, with minutes missing so
         // the hours carry different weights, and a probe that loses rounds.
         let start = 472_224 * 3_600;
+        // Per hour, the columns the chart does not return, to check the tier
+        // keeps them.
+        let mut kept: [Vec<[i64; 4]>; 6] = Default::default();
         for m in (0..6 * 60).filter(|m| m % 17 != 3 && !(100..130).contains(m)) {
             let ts = start + m * 60;
+            let unreturned = [2_000_000 + m * 331, 10 + m % 4, m % 3, 120 + m % 9];
+            kept[(m / 60) as usize].push(unreturned);
+            let [swap_used, tcp, udp, procs] = unreturned;
             let sample = serde_json::json!({"cpu": (m % 7) as f64 * 1.5, "mem_used": 1_000_000 + m * 997,
                 "disk_used": 5_000_000 + m, "net_rx": 1_000 + m * 13, "net_tx": 500 + m * 7,
-                "net_rx_max": 3_000 + m % 50 * 40});
+                "net_rx_max": 3_000 + m % 50 * 40, "cpu_max": (m % 7) as f64 * 1.5 + (m % 11) as f64,
+                "swap_used": swap_used, "tcp": tcp, "udp": udp, "procs": procs});
             db.insert_metric(id, ts, &sample).unwrap();
             db.insert_pings(
                 id,
@@ -3251,8 +3281,8 @@ mod tests {
             assert_eq!(got.len(), want.len());
             for (g, w) in got.iter().zip(&want) {
                 assert_eq!(
-                    (&g["ts"], &g["net_rx_max"], &g["net_tx_max"]),
-                    (&w["ts"], &w["net_rx_max"], &w["net_tx_max"])
+                    (&g["ts"], &g["net_rx_max"], &g["net_tx_max"], &g["cpu_max"], &g["minutes"]),
+                    (&w["ts"], &w["net_rx_max"], &w["net_tx_max"], &w["cpu_max"], &w["minutes"])
                 );
                 assert!((g["cpu"].as_f64().unwrap() - w["cpu"].as_f64().unwrap()).abs() < 1e-9, "{g} {w}");
                 let slack = if step == 3_600 { 0 } else { 1 };
@@ -3292,6 +3322,32 @@ mod tests {
         assert_eq!(db.roll_up(end + LATE, 365).unwrap(), 1);
         compare(3_600);
         compare(7_200);
+
+        // Against the fixture itself, as the comparison above would pass two
+        // tiers wrong in the same way: every minute counted once, the peak the
+        // busiest minute reached.
+        let points = db.metrics(id, Span { since: start, step: 7_200, hourly: true }).unwrap();
+        let held: usize = kept.iter().map(Vec::len).sum();
+        assert_eq!(points.iter().map(|p| p["minutes"].as_i64().unwrap()).sum::<i64>(), held as i64);
+        assert_eq!(points.iter().map(|p| p["cpu_max"].as_f64().unwrap()).fold(0.0, f64::max), 9.0 + 10.0);
+        // The columns the chart does not return are kept as each hour's mean,
+        // swap truncated like the other bytes and the counts rounded.
+        let stored: Vec<[i64; 4]> = db
+            .conn()
+            .prepare("SELECT swap_used, tcp, udp, procs FROM metric_hour WHERE node_id=?1 ORDER BY ts")
+            .unwrap()
+            .query_map([id], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let means: Vec<[i64; 4]> = kept
+            .iter()
+            .map(|hour| {
+                let mean = |i: usize| hour.iter().map(|v| v[i]).sum::<i64>() as f64 / hour.len() as f64;
+                [mean(0) as i64, mean(1).round() as i64, mean(2).round() as i64, mean(3).round() as i64]
+            })
+            .collect();
+        assert_eq!(stored, means);
     }
 
     /// A backup from before the hourly tier lacks its tables. It must still pass
