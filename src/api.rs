@@ -410,7 +410,12 @@ pub async fn metrics(
         // gone by the time the rows are built. Additive, so a theme unaware of it
         // continues to work.
         let (ping, loss) = if want_ping { app.db.ping_records(id, span)? } else { (vec![], json!({})) };
-        anyhow::Ok(json!({"metrics": metrics, "ping": ping, "probes": probes, "loss": loss}))
+        // `step` is the seconds each point spans, which a row's `minutes` is read
+        // against. Inferred from the stamps instead, it is missing for a window
+        // holding a single point.
+        anyhow::Ok(json!({
+            "metrics": metrics, "ping": ping, "probes": probes, "loss": loss, "step": span.step,
+        }))
     })
     .await;
     match built.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
@@ -3430,6 +3435,7 @@ mod tests {
         };
         let rows =
             |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
+        let step = |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap()["step"].clone();
 
         // Before the first rollup nothing is folded, and a window past the week
         // reads the newest week of minute rows rather than every one.
@@ -3440,11 +3446,14 @@ mod tests {
         app.db.set("retention_days", "7").unwrap();
         let week = ask(168).await;
         assert_eq!(rows(&week), 8, "a week reaches back seven days");
+        assert_eq!(step(&week), 420, "in seven-minute points, a week of minutes at the 1,440-point budget");
         assert_eq!(ask(2_160).await, week, "a window past the retention window is narrowed to it");
 
         // Past the week, from the hourly tier and the minute rows after it.
         app.db.set("retention_days", "30").unwrap();
-        assert_eq!(rows(&ask(2_160).await), 30, "a month reaches back thirty days");
+        let month = ask(2_160).await;
+        assert_eq!(rows(&month), 30, "a month reaches back thirty days");
+        assert_eq!(step(&month), 3_600, "in whole hours, as no hourly row may straddle two points");
     }
 
     #[tokio::test]
