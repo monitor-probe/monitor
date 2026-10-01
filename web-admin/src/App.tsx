@@ -131,8 +131,6 @@ export default function App() {
     )
   }
 
-  const sorted = [...(nodes ?? [])].sort((a, b) => a.sort - b.sort || a.id - b.id)
-
   async function signOut() {
     await api("/auth/logout", { method: "POST" }).catch(() => {})
     location.href = "/"
@@ -175,7 +173,7 @@ export default function App() {
             <Admin
               path={path}
               go={go}
-              nodes={sorted}
+              nodes={nodes}
               refresh={refresh}
               // The hub's own public URL rather than this browser's address: the
               // panel is frequently reached over a loopback port behind a proxy,

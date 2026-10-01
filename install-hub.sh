@@ -501,9 +501,8 @@ done
 check_port "$PORT"
 # The same form `api::https_domain` measures --site against on the hub, checked
 # here because this is where the value is entered. A hub started with a value it
-# refuses starts normally and then declines to add or install any node, while the
-# message the panel prints names the browser and the reverse proxy, neither of
-# which is at fault.
+# refuses starts normally and then declines to add or install any node, which
+# surfaces only in the journal and the panel, long after the value was typed.
 SITE="${SITE%/}"
 if [ -n "$SITE" ]; then
 	case "$SITE" in

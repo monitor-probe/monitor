@@ -182,7 +182,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     // the agent runs -- the agent re-reads its mount table every sample so that
     // it appears -- by up to a minute. Using the report while a node is connected
     // keeps every consumer of this view on one number: the card reads the live
-    // metrics and the detail page reads these, and they previously showed the
+    // metrics and the detail page reads these, which would otherwise show the
     // same machine two different capacities. Offline, the stored figure is the
     // last one reported. No floor is applied: a host whose swap has just been
     // disabled reports zero and means it. A node connected but not yet reporting
@@ -316,7 +316,7 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
     // connection the agents write through.
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], live_snapshot(&app, full).as_str().to_owned())
+    ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
         .into_response()
 }
 
@@ -649,10 +649,8 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
 }
 
 /// Range and sign limits every stored node must satisfy, or the reason it does
-/// not. Shared because both writers must enforce them: the create path formerly
-/// accepted a whole `Node` unchecked, leaving the values the update path refuses
-/// reachable by another route, and an out-of-range reset day remained harmless
-/// only because `period_start` clamps what it reads.
+/// not. Shared because both writers must enforce them: a value one refuses must
+/// not be reachable through the other.
 fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -> Option<&'static str> {
     if reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
         return Some("流量重置日要在 1 到 31 之间");
@@ -1347,8 +1345,8 @@ pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
 /// outlives the download.
 pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
     let path = scratch_path(&app, "backup");
-    // Off the runtime: this reads the entire database while holding the
-    // connection the agents write through.
+    // Off the runtime: this reads the entire database, through a connection of
+    // its own, so the agents' writes continue meanwhile.
     let copied = {
         let (app, path) = (app.clone(), path.clone());
         tokio::task::spawn_blocking(move || app.db.backup_into(&path)).await
@@ -1953,8 +1951,8 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     }
     // The one readable key with a default that also rejects the empty string:
     // `setting_error` below refuses "" and `save_settings` writes nothing when any
-    // key fails, so a hub where this was never set returned "" here and then
-    // rejected the entire settings form, naming a field that was never edited.
+    // key fails, so answering "" for a hub where this was never set would have
+    // the entire settings form rejected, naming a field that was never edited.
     // `retention_days()` already holds the default `prune` and the data page read,
     // so it answers here as well.
     out.insert("retention_days".into(), json!(app.db.retention_days().to_string()));
@@ -1981,9 +1979,8 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
 /// the UI reported as rejected.
 fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
     // Settings are stored as text. A caller sending the natural JSON type --
-    // `{"public_page": false}`, `{"retention_days": 7}` -- was formerly skipped by
-    // a bare `continue`, so nothing was written while the response reported
-    // success.
+    // `{"public_page": false}`, `{"retention_days": 7}` -- is refused rather than
+    // skipped, which would write nothing while the response reported success.
     let Some(value) = value.as_str() else { return Some(format!("设置 {key} 的值格式不对")) };
     match key {
         "theme" if !crate::frontend::selectable(app, value) => Some("主题没有安装".into()),
@@ -2026,13 +2023,11 @@ pub async fn save_settings(
             return bad(&message);
         }
     }
-    // Set when the password changed, so the caller receives a fresh session rather
-    // than being logged out by their own change.
+    // Set when the password changed: the change signs every session out, and the
+    // caller receives a replacement rather than being logged out by it.
     let mut reissued = String::new();
     for (key, value) in map {
         let value = value.as_str().unwrap_or_default();
-        // Changing the password logs out every existing session; the caller
-        // receives a replacement.
         if key == "admin_password" {
             match hash_password(value).and_then(|h| {
                 app.db.replace_password(&h)?;
@@ -2478,8 +2473,8 @@ mod tests {
     }
 
     /// What a thinned bucket may return. Keeping one row and discarding the rest
-    /// made the seven-day chart integrate to twice the traffic the minutes hold,
-    /// and drew a probe losing half its packets as an unbroken line.
+    /// would integrate the seven-day chart to twice the traffic the minutes hold,
+    /// and draw a probe losing half its packets as an unbroken line.
     #[test]
     fn a_thinned_bucket_answers_with_its_mean_and_says_what_it_lost() {
         let app = app();
@@ -2967,9 +2962,8 @@ mod tests {
         );
     }
 
-    /// Both writers enforce the same limits. The create path formerly accepted a
-    /// whole `Node` unchecked, leaving everything the update path refuses
-    /// reachable by another route.
+    /// Both writers enforce the same limits, so nothing the update path refuses
+    /// is reachable through the create path, which takes a whole `Node`.
     #[tokio::test]
     async fn both_write_paths_refuse_the_same_out_of_range_values() {
         let app = std::sync::Arc::new(app());
@@ -3262,7 +3256,7 @@ mod tests {
     /// again in every report -- and the two diverge as soon as a disk is mounted
     /// on a running machine, which the agent detects by re-reading its mount table
     /// every sample. Drawn from the stored copy, the card and the detail page
-    /// showed the same host two different sizes until it reconnected.
+    /// would show the same host two different sizes until it reconnected.
     #[test]
     fn a_capacity_that_changed_since_the_handshake_is_the_reported_one() {
         let app = app();

@@ -200,7 +200,9 @@ fn manifest(root: &Path, short: &str) -> Option<Theme> {
         return None;
     }
     let theme: Theme = serde_json::from_slice(&data)
-        .inspect_err(|e| tracing::warn!("{short}/theme.json 不是有效的 manifest，主题不会出现在列表里：{e}"))
+        .inspect_err(|e| {
+            tracing::warn!("{short}/theme.json is not a valid manifest; the theme is left out: {e}")
+        })
         .ok()?;
     (theme.short == short).then_some(theme)
 }

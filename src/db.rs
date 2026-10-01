@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS ping_node (
 
 -- Key order follows the only query there is: one node, one time window,
 -- every probe. With task_id ahead of ts SQLite can seek to the node and no
--- further, then scans every record it ever kept -- see the migration in open().
+-- further, then scans every record it ever kept -- see migrate_to_1.
 CREATE TABLE IF NOT EXISTS ping_record (
   node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
   ts INTEGER NOT NULL, latency INTEGER NOT NULL,
@@ -534,10 +534,11 @@ fn yes() -> bool {
 }
 
 /// Omitted settings stay unchanged. An explicit null clears the expiry date.
+/// The position in the list is not among them: it changes only through
+/// `reorder_nodes`, which takes the whole order at once.
 #[derive(Deserialize, Default)]
 pub struct NodePatch {
     pub name: Option<String>,
-    pub sort: Option<i64>,
     pub public: Option<bool>,
     pub price: Option<f64>,
     pub currency: Option<String>,
@@ -1022,23 +1023,22 @@ impl Db {
         let tx = conn.transaction()?;
         {
             let mut update = tx.prepare(
-                "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
-                                 price=COALESCE(?5,price), currency=COALESCE(?6,currency),
-                                 billing_cycle=COALESCE(?7,billing_cycle),
-                                 expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
-                                 remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
-                                 traffic_mode=COALESCE(?12,traffic_mode),
-                                 traffic_reset_day=COALESCE(?13,traffic_reset_day),
-                                 notify=COALESCE(?14,notify), country_pin=COALESCE(?15,country_pin),
-                                 ipv4_pin=COALESCE(?16,ipv4_pin), ipv6_pin=COALESCE(?17,ipv6_pin),
-                                 group_name=COALESCE(?18,group_name)
+                "UPDATE node SET name=COALESCE(?2,name), public=COALESCE(?3,public),
+                                 price=COALESCE(?4,price), currency=COALESCE(?5,currency),
+                                 billing_cycle=COALESCE(?6,billing_cycle),
+                                 expires_at=CASE WHEN ?7 THEN ?8 ELSE expires_at END,
+                                 remark=COALESCE(?9,remark), traffic_limit=COALESCE(?10,traffic_limit),
+                                 traffic_mode=COALESCE(?11,traffic_mode),
+                                 traffic_reset_day=COALESCE(?12,traffic_reset_day),
+                                 notify=COALESCE(?13,notify), country_pin=COALESCE(?14,country_pin),
+                                 ipv4_pin=COALESCE(?15,ipv4_pin), ipv6_pin=COALESCE(?16,ipv6_pin),
+                                 group_name=COALESCE(?17,group_name)
                  WHERE id=?1",
             )?;
             for id in ids {
                 let found = update.execute(params![
                     id,
                     n.name,
-                    n.sort,
                     n.public,
                     n.price,
                     n.currency,
@@ -2498,8 +2498,8 @@ mod tests {
         assert_eq!(read("busy_timeout"), 5_000);
     }
 
-    /// A real file, since these three tests exist to exercise what happens to
-    /// one. Removed by the test that created it.
+    /// A real file, for the tests that exercise what happens to one. Removed with
+    /// its companions when dropped.
     struct Scratch(String);
 
     impl Scratch {
@@ -3397,10 +3397,10 @@ mod tests {
         assert_eq!(db.all_traffic()[&id].total_rx, 800);
     }
 
-    /// The rekeying in `open()`: rows must survive it, and the chart's query must
-    /// emerge able to seek. A migration that leaves every row on the old key fails
-    /// silently, and stays silent while the query it exists for scans a node's
-    /// entire history.
+    /// The rekeying in `migrate_to_1`: rows must survive it, and the chart's
+    /// query must emerge able to seek. A migration that leaves every row on the
+    /// old key fails silently, and stays silent while the query it exists for
+    /// scans a node's entire history.
     #[test]
     fn rekeying_ping_record_keeps_the_rows_and_lets_the_chart_query_seek() {
         let file = std::env::temp_dir().join(format!("monitor-rekey-{}.db", std::process::id()));

@@ -72,7 +72,8 @@ fn verify_password(password: &str, stored: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Per-address failure counter for the password endpoint.
+/// Per-address failure counter. The hub keeps two: one for the sign-in page,
+/// one for agent registration (`App::registrations`).
 pub struct Throttle {
     seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     /// How long a failure is remembered. A field rather than the constant so

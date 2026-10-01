@@ -66,10 +66,9 @@ impl Arrival {
 /// interval of a hub restart.
 ///
 /// A single map, because "the node is online" and "the node has current figures"
-/// are the same fact. Split across two, they required manual synchronisation at
-/// every call site and diverged: the connection was recorded at the handshake
-/// and the metrics at the first report, so a node that had connected but not yet
-/// reported appeared offline for a whole `--interval`.
+/// are the same fact. Split across two, they would need synchronising at every
+/// call site, and a node connected but not yet reporting would read offline for
+/// a whole `--interval`.
 #[derive(Debug)]
 pub struct Agent {
     /// Distinguishes one session on a node from the next; see [`release`].
@@ -606,8 +605,8 @@ pub(crate) const INJECTED: [&str; 4] = ["total_rx", "total_tx", "month_rx", "mon
 /// `mem_total`, `swap_total` and `disk_total` never reach the `metric` table but
 /// go straight to the browser, and the default theme blanks a node's entire live
 /// view when one is absent. Derived from the stored columns instead, this list
-/// left those four uncovered, so an agent renaming one blanked every card on the
-/// page with nothing in any log to explain it.
+/// would leave those four uncovered, and an agent renaming one would blank every
+/// card on the page with nothing in any log to explain it.
 ///
 /// Hub and agent ship as two binaries from two repositories, and every reader
 /// here ends in `unwrap_or(0)`: a field the agent renames does not fail, it
@@ -1013,10 +1012,10 @@ mod tests {
     }
 
     /// The contract check is what makes a cross-repository rename visible.
-    /// Derived from the columns the hub stores, it missed four fields that never
-    /// reach the `metric` table but do reach the browser; the default theme
-    /// blanks a node's entire live view if one is absent, so the drift surfaced
-    /// as empty cards and no log output.
+    /// Derived from the columns the hub stores, it would miss four fields that
+    /// never reach the `metric` table but do reach the browser; the default theme
+    /// blanks a node's entire live view if one is absent, so the drift would
+    /// surface as empty cards and no log output.
     #[test]
     fn the_contract_covers_every_field_the_browser_needs_not_just_the_stored_ones() {
         let fields: Vec<&str> = report_fields().collect();
@@ -1393,11 +1392,12 @@ mod tests {
         // The rejected results carry task ids of their own: a bare count would be
         // satisfied by the key collapsing them onto a valid row.
         send(&app, id, &mut session, 0, &result_json(two, 15)).unwrap();
-        send(&app, id, &mut session, 0, &result_json(0, 42)).unwrap(); // no such task
-        send(&app, id, &mut session, 0, &result_json(-1, 42)).unwrap(); // nor this one
-        send(&app, id, &mut session, 0, &result_json(99, 42)).unwrap(); // not this node's
-                                                                        // A frame carrying no reading. Defaulting to -1 would file it as a lost
-                                                                        // packet, rendering a malformed frame as an outage.
+        // Ids naming no probe this node runs.
+        for task in [0, -1, 99] {
+            send(&app, id, &mut session, 0, &result_json(task, 42)).unwrap();
+        }
+        // A frame carrying no reading. Defaulting to -1 would file it as a lost
+        // packet, rendering a malformed frame as an outage.
         let blind = json!({"jsonrpc": "2.0", "method": "ping.result", "params": {"task_id": one}});
         send(&app, id, &mut session, 0, &blind.to_string()).unwrap();
         assert!(results(&app, id).is_empty(), "gathered until the minute turns");
@@ -1445,8 +1445,7 @@ mod tests {
         connect(1);
         connect(2);
         assert!(release(&app, id, 1).is_none(), "a stale session must release nothing");
-        assert!(live(), "the reconnected agent stays online");
-        assert!(app.agents.read().unwrap().contains_key(&id), "and keeps receiving probe pushes");
+        assert!(live(), "the reconnected agent stays online and keeps receiving probe pushes");
     }
 
     #[test]

@@ -272,14 +272,11 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
 ///
 /// ponytail: these bytes are relayed unverified, and `install.sh` executes them
 /// as root on every node. Fetched directly from github.com that is TLS's
-/// concern; through the panel's `github_proxy` it rests on the mirror alone.
-/// Currently held by the setting accepting https:// only, and by stating so
-/// where it is entered. The upgrade path is a pinned digest -- `agent.pin`
-/// beside `web-theme.pin`, a fixed release tag, hashed after the fetch and
-/// before the relay (4 permits x 1.73 MiB against MemoryMax=256M, so buffering
-/// is free). Not a fetched checksum: whoever can replace the binary can replace
-/// that too. Deliberately deferred, as it couples agent releases to hub
-/// releases.
+/// concern; through the panel's `github_proxy` it rests on the mirror alone,
+/// which the setting holds to https:// and states where it is entered. A
+/// checksum fetched alongside proves nothing, as whoever can replace the binary
+/// can replace that too, and a digest pinned into the hub build was evaluated
+/// and not adopted: it would tie every agent release to a hub release.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
@@ -527,14 +524,15 @@ async fn main() -> Result<()> {
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
         .fallback(frontend::serve)
-        // A report is a few hundred bytes; anything larger is not a report.
+        // Every body above is a JSON form of a few KiB at most. The ceiling also
+        // bounds a theme's saved settings, which anonymous callers read back.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         // The two chunked uploads, merged after that layer rather than beneath
-        // it. They raise the ceiling on a single request -- one 4 MiB piece --
-        // not on the file behind it: a 256 MiB backup arrives as 64 such
-        // requests, so no reverse proxy needs to know the database size. The
-        // whole-file ceilings live on `total` and are checked before the first
-        // byte is sent.
+        // it. They raise the ceiling on a single request to `api::MAX_CHUNK`,
+        // not on the file behind it: a 256 MiB backup arrives as 64 of the
+        // panel's 4 MiB pieces, so no reverse proxy needs to know the database
+        // size. The whole-file ceilings live on `total` and are checked on the
+        // first request.
         .merge(
             Router::new()
                 .route("/api/db/restore", post(api::db_restore))
@@ -554,9 +552,9 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
-        // Excludes the agent binary and database backups: both are already
-        // compressed and both are megabytes, so deflating them would consume the
-        // cores argon2 and the SQLite writer share for no gain.
+        // Excludes the agent binary, already compressed, and database backups,
+        // hundreds of megabytes on a large fleet: deflating either would occupy
+        // the cores argon2 and the SQLite writer share for the whole transfer.
         .layer(
             tower_http::compression::CompressionLayer::new().compress_when(
                 tower_http::compression::predicate::DefaultPredicate::new()

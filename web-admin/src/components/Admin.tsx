@@ -1322,7 +1322,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const iface = useIfaceOption(currentIface(node))
   const interval = useIntervalOption(node.interval)
 
-  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
+  const command = iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
 
   async function rotate() {
     setRotating(true)
@@ -1356,10 +1356,8 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           </section>
           <section className="space-y-2 border-t pt-5">
             <h3 className="text-sm font-medium">安装命令</h3>
-            {/* A node added before the hub kept tokens has nothing to show
-                until one is reissued. */}
             <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
-              {command || (token ? "网卡名有误，改正后显示命令" : "旧版本创建的凭证不可读取，换发后显示")}
+              {command || "网卡名有误，改正后显示命令"}
             </Command>
           </section>
           <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
@@ -2419,9 +2417,8 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             onClick={() =>
               save({
                 site_name: String(s.site_name ?? ""),
-                // `||` rather than `??`: the hub returns "" for an unset key
-                // rather than null, and "" is the one value this key's write path
-                // refuses.
+                // `||` rather than `??`: an emptied box saves the default, ""
+                // being the one value this key's write path refuses.
                 retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
@@ -2686,7 +2683,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         <h3 className="text-sm font-medium">事件</h3>
         <div className="grid gap-4 sm:grid-cols-3">
           <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–30">
-            <Input type="number" min={1} max={30}value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
+            <Input type="number" min={1} max={30} value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
           </Field>
           <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
             <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
@@ -2719,8 +2716,6 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
   )
 }
 
-// The two ways into this panel, on their own page: the GitHub identity it trusts
-// and the password that works when GitHub does not.
 type Session = { id: string; current: boolean; created_at: number }
 
 function useSessions() {
@@ -2786,6 +2781,8 @@ function Sessions({ rows, reload }: { rows: Session[]; reload: () => void }) {
   )
 }
 
+// The ways into this panel, on their own page: the sessions signed in, the
+// GitHub identity it trusts and the password that works when GitHub does not.
 function Security({ site }: { site: string }) {
   const { s, set, save } = useSettings()
   const sessions = useSessions()
