@@ -15,9 +15,9 @@ pub struct Db {
     /// A read-only connection to the same file, for the history charts. A week
     /// of one node's probe results is a scan of 98 ms at four 60-second probes
     /// and 486 ms at eight 10-second ones. With four of the latter in flight on
-    /// `conn`, every agent report and panel request behind them waited 1.1 s at
-    /// the median, and 1.8 ms with the scans here: WAL lets this connection
-    /// read while `conn` commits. `None` for `:memory:`, which a second
+    /// `conn`, every agent report and panel request behind them would wait 1.1 s
+    /// at the median; with the scans here they wait 1.8 ms, as WAL lets this
+    /// connection read while `conn` commits. `None` for `:memory:`, which a second
     /// connection cannot open.
     ///
     /// Declared before `conn` so that it closes first. The last connection to
@@ -693,9 +693,11 @@ fn own_only(file: &str) {
     }
 }
 
-/// Opens [`Db`]'s reader. Read-only from the open, so no statement reaching it
-/// can write. It inherits none of the PRAGMAs in `SCHEMA`, so the busy timeout
-/// is set again, as in [`Db::backup_into`].
+/// Opens a read-only connection to the database: [`Db`]'s reader, and the one
+/// [`Db::backup_into`] exports through. Read-only from the open, so no statement
+/// reaching it can write. It inherits none of the PRAGMAs in `SCHEMA`, so the
+/// busy timeout is set again; without it, a checkpoint racing a read would
+/// return SQLITE_BUSY immediately.
 fn read_only(file: &str) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         file,
@@ -939,8 +941,31 @@ impl Db {
 
     /// The connection the history charts read through: the read-only one, or
     /// the writer for `:memory:`.
+    ///
+    /// A scan holds its snapshot throughout, and with chart requests queued the
+    /// next begins as the last ends, so no commit's checkpoint would find the
+    /// reader idle and the WAL would keep every commit for as long as anyone
+    /// sent them: 20 MB in 20 s at 100 commits a second, from four requests kept
+    /// in flight. Before the scan the reader is idle, and a checkpoint taken
+    /// here resets the WAL itself. Past 4 MiB only, as without readers the WAL
+    /// stays within the 1 MiB `journal_size_limit` plus one transaction.
+    ///
+    /// Without waiting: an export is the one other reader, and waiting on it
+    /// would hold the writer, and every agent report behind it, for the busy
+    /// timeout.
+    ///
+    /// The writer is taken after the reader here and must never be held while
+    /// taking the reader.
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.reader.as_ref().unwrap_or(&self.conn).lock().unwrap_or_else(|e| e.into_inner())
+        let Some(reader) = &self.reader else { return self.conn() };
+        let reader = reader.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes_of(&format!("{}-wal", reader.path().unwrap_or_default())) > 4 << 20 {
+            let conn = self.conn();
+            let _ = conn.busy_timeout(std::time::Duration::ZERO);
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        }
+        reader
     }
 
     // ---- settings ----
@@ -2209,15 +2234,11 @@ impl Db {
     /// reads the whole file, so the caller runs it off the runtime -- every other
     /// statement here is sub-millisecond, this one is not.
     pub fn backup_into(&self, dest: &str) -> Result<()> {
-        // A second connection to the same file. `VACUUM INTO` only reads, and WAL
-        // allows it to read a consistent snapshot while the agents continue
-        // writing through the first -- exporting is the one heavy operation here
-        // that need not block them. A fresh connection inherits none of the
-        // PRAGMAs in SCHEMA, so the busy timeout must be set again or a
-        // checkpoint racing this read returns SQLITE_BUSY immediately.
-        let reader = Connection::open(self.file())?;
-        reader.busy_timeout(std::time::Duration::from_secs(5))?;
-        reader.execute("VACUUM INTO ?1", [dest])?;
+        // A connection of its own. `VACUUM INTO` only reads, and WAL allows it to
+        // read a consistent snapshot while the agents continue writing through
+        // the first -- exporting is the one heavy operation here that need not
+        // block them. Not the charts' reader, which it would hold throughout.
+        read_only(&self.file())?.execute("VACUUM INTO ?1", [dest])?;
         // The copy is the credential store in one portable file: node tokens in
         // the clear, the GitHub secret, the password hash. SQLite creates it
         // under the umask, which at the usual 022 is world-readable.
@@ -2604,6 +2625,46 @@ mod tests {
         let (metrics, pings, names) = read.expect("history is read while the writer is held");
         assert_eq!((metrics.len(), pings.len()), (1, 1), "and it sees what the writer committed");
         assert_eq!(names[&task.to_string()], "probe");
+    }
+
+    /// Chart reads kept back to back leave no commit an idle reader to
+    /// checkpoint past, so the reader checkpoints for them and the WAL stays
+    /// bounded however long they continue. Without that, these writes would
+    /// grow it to 85 MB.
+    #[test]
+    fn chart_reads_back_to_back_do_not_grow_the_wal() {
+        let scratch = Scratch::new();
+        let db = std::sync::Arc::new(Db::open(&scratch.0).unwrap());
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        let task = db
+            .save_ping_task(&PingTask {
+                name: "probe".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 10,
+                nodes: vec![id],
+                ..Default::default()
+            })
+            .unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (db, stop) = (db.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        db.ping_records(id, Span::minutes(0, 60)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let wal = format!("{}-wal", scratch.0);
+        let mut largest = 0;
+        for ts in 0..20_000 {
+            db.insert_pings(id, &[(task, ts * 10, 40)]).unwrap();
+            largest = largest.max(bytes_of(&wal));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        readers.into_iter().for_each(|r| r.join().unwrap());
+        assert!(largest < 16 << 20, "the WAL reached {largest} bytes");
     }
 
     /// A closed database is one file again, as before the reader existed, so a
