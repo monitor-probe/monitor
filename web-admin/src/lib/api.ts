@@ -26,7 +26,6 @@ export type Metrics = {
 export type Node = {
   id: number
   name: string
-  sort: number
   public: boolean
   online: boolean
   last_seen: number
