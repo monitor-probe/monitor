@@ -1,18 +1,34 @@
 //! SQLite storage. A single writer connection behind a mutex: at a handful of
-//! nodes reporting every few seconds, every statement here is sub-millisecond.
-// ponytail: single global connection; move to a read pool if the dashboard ever
-// blocks behind ingest.
+//! nodes reporting every few seconds, every statement on it is sub-millisecond.
+//! The history charts, whose scans are not, read through a second connection.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-pub struct Db(Mutex<Connection>);
+pub struct Db {
+    /// A read-only connection to the same file, for the history charts. A week
+    /// of one node's probe results is a scan of 98 ms at four 60-second probes
+    /// and 486 ms at eight 10-second ones. With four of the latter in flight on
+    /// `conn`, every agent report and panel request behind them waited 1.1 s at
+    /// the median, and 1.8 ms with the scans here: WAL lets this connection
+    /// read while `conn` commits. `None` for `:memory:`, which a second
+    /// connection cannot open.
+    ///
+    /// Declared before `conn` so that it closes first. The last connection to
+    /// close folds the WAL into the database file and deletes it, which a
+    /// read-only one cannot do, and a stopped hub would otherwise leave rows in
+    /// a -wal that a copy of the database file alone misses.
+    // ponytail: one reader, so chart requests queue behind one another, at most
+    // `api::HISTORY_SLOTS` deep; a pool if that wait becomes visible.
+    reader: Option<Mutex<Connection>>,
+    conn: Mutex<Connection>,
+}
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -677,6 +693,18 @@ fn own_only(file: &str) {
     }
 }
 
+/// Opens [`Db`]'s reader. Read-only from the open, so no statement reaching it
+/// can write. It inherits none of the PRAGMAs in `SCHEMA`, so the busy timeout
+/// is set again, as in [`Db::backup_into`].
+fn read_only(file: &str) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 /// The `main` database's path as SQLite reports it, empty for `:memory:`.
 /// Queried rather than cached so there is a single answer to which file is
 /// open.
@@ -898,11 +926,21 @@ impl Db {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
-        Ok(Self(Mutex::new(conn)))
+        let reader = match main_file(&conn) {
+            file if file.is_empty() => None,
+            file => Some(Mutex::new(read_only(&file)?)),
+        };
+        Ok(Self { reader, conn: Mutex::new(conn) })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The connection the history charts read through: the read-only one, or
+    /// the writer for `:memory:`.
+    fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.reader.as_ref().unwrap_or(&self.conn).lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ---- settings ----
@@ -1539,7 +1577,11 @@ impl Db {
     /// hours between the watermark and that week are missing from the chart
     /// until they are folded.
     pub fn metrics(&self, node_id: i64, span: Span) -> Result<Vec<serde_json::Value>> {
-        let conn = self.conn();
+        let mut reader = self.reader();
+        // One snapshot for every statement below. On the reader, a rollup can
+        // otherwise commit between reading the watermark and reading the rows
+        // on either side of it.
+        let conn = reader.transaction()?;
         let row = |r: &rusqlite::Row<'_>| {
             Ok(serde_json::json!({
                 "ts": r.get::<_, i64>(0)?, "cpu": r.get::<_, f64>(1)?,
@@ -1937,7 +1979,7 @@ impl Db {
     /// routinely carries a hostname or a customer, and the rest of the table
     /// belongs to nodes this caller may not be able to see.
     pub fn ping_task_names(&self, node_id: i64) -> Result<serde_json::Value> {
-        let conn = self.conn();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT id, name FROM ping_task WHERE id IN (SELECT task_id FROM ping_node WHERE node_id=?1)",
         )?;
@@ -2018,7 +2060,9 @@ impl Db {
         node_id: i64,
         span: Span,
     ) -> Result<(Vec<serde_json::Value>, serde_json::Value)> {
-        let conn = self.conn();
+        let mut reader = self.reader();
+        // One snapshot for every statement below, as in `metrics`.
+        let conn = reader.transaction()?;
         let step = span.step;
         let mut out = Vec::new();
         // Per probe in the bucket being filled.
@@ -2084,13 +2128,14 @@ impl Db {
             .enumerate()
             .map(|(i, id)| id.map(|id| (id, i)))
             .collect::<Result<_, _>>()?;
-        // Sorted after releasing the connection the agents write through. A
-        // probe missing from the rank, which the assignment filter in
+        // Sorted after releasing the reader, which the next chart request waits
+        // on. A probe missing from the rank, which the assignment filter in
         // `PING_ROWS` rules out today, goes last rather than taking the first
         // colour.
         drop(rows);
         drop(stmt);
         drop(conn);
+        drop(reader);
         out.sort_by_cached_key(|row| {
             row["task_id"].as_i64().and_then(|id| rank.get(&id).copied()).unwrap_or(usize::MAX)
         });
@@ -2519,6 +2564,60 @@ mod tests {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
             }
         }
+    }
+
+    /// The history charts read through their own connection, so a scan never
+    /// holds up the writer: a week of eight 10-second probes is 486 ms, which
+    /// every agent report would otherwise wait out.
+    #[test]
+    fn history_is_read_while_the_writer_is_held() {
+        let scratch = Scratch::new();
+        let db = std::sync::Arc::new(Db::open(&scratch.0).unwrap());
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        let task = db
+            .save_ping_task(&PingTask {
+                name: "probe".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![id],
+                ..Default::default()
+            })
+            .unwrap();
+        db.insert_metric(id, 60, &serde_json::json!({"cpu": 1.0})).unwrap();
+        db.insert_pings(id, &[(task, 60, 42)]).unwrap();
+
+        let writer = db.conn();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn({
+            let db = db.clone();
+            move || {
+                let span = Span::minutes(0, 60);
+                let (metrics, pings) = (db.metrics(id, span).unwrap(), db.ping_records(id, span).unwrap().0);
+                send.send((metrics, pings, db.ping_task_names(id).unwrap())).unwrap();
+            }
+        });
+        // Bounded, so a read that does wait fails here rather than hanging the
+        // test; released below, it then finishes.
+        let read = receive.recv_timeout(std::time::Duration::from_secs(5));
+        drop(writer);
+        reading.join().unwrap();
+        let (metrics, pings, names) = read.expect("history is read while the writer is held");
+        assert_eq!((metrics.len(), pings.len()), (1, 1), "and it sees what the writer committed");
+        assert_eq!(names[&task.to_string()], "probe");
+    }
+
+    /// A closed database is one file again, as before the reader existed, so a
+    /// copy of the file taken with the hub stopped holds every row.
+    #[test]
+    fn a_closed_database_leaves_no_wal_behind() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        db.insert_metric(id, 60, &serde_json::json!({"cpu": 1.0})).unwrap();
+        // The reader joins the WAL on its first read, not when it opens.
+        db.metrics(id, Span::minutes(0, 60)).unwrap();
+        drop(db);
+        assert!(!std::path::Path::new(&format!("{}-wal", scratch.0)).exists());
     }
 
     /// Backup and restore are the two operations that can lose every row in the

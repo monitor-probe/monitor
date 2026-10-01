@@ -341,19 +341,19 @@ fn default_hours() -> i64 {
 /// `span` bounds what one request costs; this bounds how many may run,
 /// closing the same gap `main::RELAY_GATE` and `auth::PASSWORD_GATE` close on
 /// the other two paths an anonymous caller can make expensive. This is the most
-/// expensive of the three: every request holds the single connection the agents
-/// report through for its entire scan, measured at 118 ms for a week of four
-/// probes, the most minute rows any window reads. Without a gate, 120 requests
-/// from one machine took the panel's own node list from 1 ms to 2.8 s.
+/// expensive of the three: a week of probe results is a scan of 98 ms at four
+/// 60-second probes and 486 ms at eight 10-second ones, growing with the probes
+/// the admin configured rather than with anything the caller sends.
 ///
-/// Four, because the requests serialise on that one connection regardless: a
-/// fifth in flight buys no throughput and merely places another scan ahead of
-/// the next agent report. What the number actually sets is how long that wait
-/// can become -- four at roughly 120 ms is half a second -- while leaving room
-/// for several people opening charts simultaneously.
+/// The scans run on the database's read-only connection, so the agents' writes
+/// do not wait on them, and they serialise on that one connection instead. Four,
+/// because a fifth in flight buys no throughput and only lengthens the wait
+/// behind the others: what the number sets is how long a chart can wait, four
+/// scans of the slower kind being 2 s, while leaving room for several people
+/// opening charts simultaneously.
 ///
 /// Refused rather than queued, as in `auth`: a queue admits the same flood,
-/// merely later.
+/// merely later, and each request waiting in it holds a blocking thread.
 ///
 /// **This gate is ineffective without the `spawn_blocking` below.** The body of
 /// this handler never awaits, so a permit taken and dropped within it is held
@@ -387,10 +387,9 @@ pub async fn metrics(
     let span = span(hours, w.points, Utc::now().timestamp());
     let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
     let (want_metrics, want_ping) = (wants("metrics"), wants("ping"));
-    // Off the runtime, for the reason given in `db_stats` below: this reads every
-    // probe result the node has retained within the window and holds the
-    // connection the agents report through throughout. That route is behind
-    // `Admin` and cheaper than this one, which anyone can reach.
+    // Off the runtime: this reads every probe result the node has retained
+    // within the window, and a worker thread blocked on that scan, or on the
+    // reader while another request holds it, serves nothing else.
     //
     // It is also what makes the gate above effective: the permit is held across
     // an await, so exactly four callers are inside it at once rather than however
@@ -399,7 +398,7 @@ pub async fn metrics(
         // Probe names accompany the samples they label, so the page needs no
         // second request. Names only: targets and assignments remain behind
         // `Admin`. Skipped when probes were not requested, since the resources tab
-        // has nothing to label and this costs a turn at the write connection.
+        // has nothing to label and this costs a turn at the reader.
         let probes =
             if want_ping { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
         let metrics = if want_metrics { app.db.metrics(id, span)? } else { vec![] };
@@ -2406,8 +2405,7 @@ mod tests {
 
     /// A chart request costs roughly the same whatever it spans. This path
     /// requires no session, so an unbounded window would be megabytes of JSON any
-    /// caller could have the hub build on the connection the agents report
-    /// through.
+    /// caller could have the hub build.
     #[test]
     fn a_history_window_costs_the_same_however_wide_it_is() {
         let app = app();
@@ -3298,11 +3296,10 @@ mod tests {
         assert_eq!(app.db.node(id).unwrap().unwrap().disk_total, 30i64 << 30, "and no extra write to get it");
     }
 
-    /// `span` bounds one window; this bounds how many are built
-    /// concurrently. Each holds the connection the agents report through for its
-    /// entire scan, and the path takes no credentials. `PASSWORD_GATE` refuses the
-    /// same way; `RELAY_GATE` queues briefly instead, as a batch install is one
-    /// burst of legitimate requests.
+    /// `span` bounds one window; this bounds how many are built concurrently.
+    /// Each holds the reader for its entire scan, and the path takes no
+    /// credentials. `PASSWORD_GATE` refuses the same way; `RELAY_GATE` queues
+    /// briefly instead, as a batch install is one burst of legitimate requests.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
         let _serial = HISTORY_TESTS.lock().await;
