@@ -2883,11 +2883,13 @@ type DbInfo = {
   rows: Record<string, number>
 }
 
-// The only two tables whose row count indicates anything about size. Every other
-// holds one row per node or per key.
+// The only tables whose row count indicates anything about size, each kind of
+// history in both tiers. Every other holds one row per node or per key.
 const DB_ROWS: [string, string][] = [
   ["metric", "历史明细"],
+  ["metric_hour", "历史小时汇总"],
   ["ping_record", "延迟记录"],
+  ["ping_hour", "延迟小时汇总"],
 ]
 
 function Data() {
@@ -2941,8 +2943,8 @@ function Data() {
   }
 
   if (!info) return null
-  const stat = (label: string, value: string) => (
-    <div key={label}>
+  const stat = (label: string, value: string, className = "") => (
+    <div key={label} className={className}>
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="tnum mt-0.5 text-sm">{value}</div>
     </div>
@@ -2952,10 +2954,13 @@ function Data() {
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <h3 className="text-sm font-medium">数据库</h3>
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        {/* Five columns: the file and the window on one row, the four row counts
+            on the next. On two columns the free space takes a row of its own, so
+            the window and each kind's two tiers still pair up. */}
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
           {stat("文件大小", bytes(info.size))}
           {stat("预写日志", bytes(info.wal))}
-          {stat("可回收空间", bytes(info.free))}
+          {stat("可回收空间", bytes(info.free), "col-span-2 sm:col-span-1")}
           {stat("保留天数", `${info.retention} 天`)}
           {/* 和保留天数并排：跨度小于保留期是还没攒够，大于保留期就是每小时
               那次 prune 没在跑。 */}

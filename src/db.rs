@@ -1520,7 +1520,11 @@ impl Db {
     /// `minutes` is how many minute rows the bucket holds, against the
     /// `step / 60` it spans: a node offline for part of a bucket has its means
     /// taken over the minutes it reported, and a caller integrating the rates
-    /// or showing availability needs the difference.
+    /// or showing availability needs the difference. That holds while the
+    /// agent reports at least once a minute. A row is written only in a minute
+    /// a report arrives, so past a 60-second `--interval` each row covers one
+    /// interval and `minutes` falls in proportion: a fifth of the full count at
+    /// 300 seconds.
     ///
     /// An hourly window reads the folded hours before the watermark and the
     /// minute rows after it, each hour weighted by the minutes it holds, so a
@@ -1691,11 +1695,18 @@ impl Db {
     /// `delete_node` clears the two probe tables, and `insert_pings` writes only
     /// for probes assigned to an existing node.
     ///
-    /// At most a day of one node's rows per statement, with the lock the agents
-    /// write through released in between. An hourly pass deletes an hour and is
-    /// one statement per table; the first pass after an upgrade deletes
-    /// everything past the week, which in one statement would hold the lock for
-    /// 37.8 s at 90 days of 100 nodes, and a node at a time 0.9 s each.
+    /// Minute rows are deleted at most one node's day per statement, with the
+    /// lock the agents write through released in between. An hourly pass
+    /// deletes an hour and is one statement per table; the first pass after an
+    /// upgrade deletes everything past the week, which in one statement would
+    /// hold the lock for 37.8 s at 90 days of 100 nodes, and a node at a time
+    /// 0.9 s each.
+    ///
+    /// Hourly rows are deleted a node at a time, one statement per table:
+    /// lowering the window from a year to a month deletes 8,040 and 32,160 rows
+    /// of a node with four probes, 24 ms each. A day per statement would spend
+    /// 0.96 s per node on the lookups and pauses in between, 4.8 minutes at 300
+    /// nodes ahead of the `VACUUM` that usually follows.
     ///
     /// The watermark is read with each statement: a restore can replace it,
     /// and the minute rows it guards, between two of them.
@@ -1729,7 +1740,7 @@ impl Db {
                     let Some(first) = first.filter(|&ts| ts < before) else { break };
                     pruned += conn
                         .prepare_cached(&format!("DELETE FROM {table} WHERE node_id=?1 AND ts<?2"))?
-                        .execute(params![id, before.min(first + 86_400)])?;
+                        .execute(params![id, if guarded { before.min(first + 86_400) } else { before }])?;
                     drop(conn);
                     let_waiters_in();
                 }

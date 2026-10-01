@@ -1327,8 +1327,8 @@ fn scratch_path(app: &App, kind: &str) -> String {
 /// The data page's figures.
 ///
 /// Off the runtime, like the three routes below: `stats` counts every row of
-/// `metric` and `ping_record` -- both WITHOUT ROWID, so each count is a full
-/// index scan -- holding the connection the agents report through throughout. At
+/// both tiers of history -- all WITHOUT ROWID, so each count is a full index
+/// scan -- holding the connection the agents report through throughout. At
 /// 2.2M rows that is 127 ms during which the public page and every agent report
 /// also wait, growing with `retention_days`.
 pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
