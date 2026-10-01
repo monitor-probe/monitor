@@ -409,9 +409,10 @@ pub async fn metrics(
         // gone by the time the rows are built. Additive, so a theme unaware of it
         // continues to work.
         let (ping, loss) = if want_ping { app.db.ping_records(id, span)? } else { (vec![], json!({})) };
-        // `step` is the seconds each point spans, which a row's `minutes` is read
-        // against. Inferred from the stamps instead, it is missing for a window
-        // holding a single point.
+        // `step` is the seconds each point spans, against which a row's `minutes`
+        // is read; inferred from the stamps instead, it would be missing for a
+        // window holding a single point. The last point is the bucket still in
+        // progress and holds only the minutes elapsed.
         anyhow::Ok(json!({
             "metrics": metrics, "ping": ping, "probes": probes, "loss": loss, "step": span.step,
         }))
@@ -423,7 +424,8 @@ pub async fn metrics(
     }
 }
 
-/// The window a chart request is answered with, `hours` wide.
+/// The window a chart request is answered with: `hours` back from `now`,
+/// widened to the point boundary at or before that.
 ///
 /// The width is capped by the retention window alone, the same for every
 /// caller, because no width costs more than the week: up to `DETAIL_DAYS` a
@@ -455,7 +457,10 @@ fn span(hours: i64, points: Option<i64>, now: i64) -> db::Span {
     // evenly would keep the finer step and exceed it. `i64::div_ceil` is still
     // unstable, and both operands are positive here.
     let step = unit * ((hours * 3_600 / unit + budget - 1) / budget).max(1);
-    db::Span { since: now - hours * 3_600, step, hourly }
+    // Rows are bucketed by `ts / step` from the epoch, and a window opening
+    // partway through a bucket would leave its first point short of the
+    // `step / 60` minutes a whole one holds.
+    db::Span { since: (now - hours * 3_600).div_euclid(step) * step, step, hourly }
 }
 
 /// Guards a per-node read: the panel sees everything, while the public page sees
@@ -2453,11 +2458,15 @@ mod tests {
             );
             // Thinned, but neither empty nor reaching outside the window.
             assert!(!metrics.is_empty() && !ping.is_empty(), "{hours}h returned nothing");
-            // A bucket the window opens partway through begins before it.
             assert!(
-                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= span.since - span.step),
+                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= span.since),
                 "{hours}h reached back too far"
             );
+            // Begun on a point boundary, so the first point is a whole one where
+            // the history reaches past it: this node reported every minute.
+            if hours < 720 {
+                assert_eq!(metrics[0]["minutes"], span.step / 60, "{hours}h opened partway through a point");
+            }
         }
 
         // A day returns every minute it holds: thinning exists only for what the
