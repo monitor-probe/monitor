@@ -686,9 +686,9 @@ fn group_error(group: &mut String) -> Option<&'static str> {
 
 /// Normalizes the currency and billing cycle, or names the one that cannot be
 /// stored. The currency is held to the ISO 4217 form of three letters, the only
-/// one `Intl.NumberFormat` accepts, so a theme may pass it on without guarding
-/// against a throw. Each cycle length is stored in a single spelling, see
-/// `cycle_name`.
+/// one `Intl.NumberFormat` accepts. Hubs before 1.3.1 stored it unchecked, so a
+/// theme still guards the call against a throw. Each cycle length is stored in a
+/// single spelling, see `cycle_name`.
 fn billing_error(currency: Option<&mut String>, cycle: Option<&mut String>) -> Option<&'static str> {
     if let Some(code) = currency {
         *code = code.trim().to_ascii_uppercase();

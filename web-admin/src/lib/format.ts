@@ -31,10 +31,28 @@ export function uptime(seconds: number): string {
  */
 export const FOREVER = "∞"
 
-const SYMBOLS: Record<string, string> = { USD: "$", CNY: "¥", EUR: "€", GBP: "£", JPY: "¥" }
+const MONEY = new Map<string, Intl.NumberFormat>()
 
+/**
+ * A price as zh-CN writes it: ¥12.00, US$12.00, HK$12.00, JP¥1,200, and the code
+ * ahead of the amount where the locale has no symbol, as in SGD 12.00. The
+ * locale is fixed so the figure does not vary with the browser's language, and
+ * so JPY reads JP¥, apart from CNY. A formatter costs about 100 µs to build,
+ * hence one per currency.
+ */
 export function money(amount: number, currency: string): string {
-  return `${SYMBOLS[currency] ?? ""}${amount.toFixed(2)}${SYMBOLS[currency] ? "" : ` ${currency}`}`
+  try {
+    let format = MONEY.get(currency)
+    if (!format) {
+      format = new Intl.NumberFormat("zh-CN", { style: "currency", currency })
+      MONEY.set(currency, format)
+    }
+    return format.format(amount)
+  } catch {
+    // Intl throws on anything but three letters, which hubs before 1.3.1 stored
+    // unchecked when written through the API.
+    return `${currency} ${amount.toFixed(2)}`.trim()
+  }
 }
 
 // The hub stores these lengths under a name and any other as `<n>m`.
