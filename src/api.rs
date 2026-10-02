@@ -247,7 +247,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     // from its own repository, so a field added there would otherwise reach
     // anonymous visitors the day it is released, and a node token in the wrong
     // hands could fill the panel's frame with whatever it sends. No address,
-    // hostname or note may ever reach a visitor.
+    // hostname or private note may ever reach a visitor.
     if let Some(m) = view["metrics"].as_object_mut() {
         m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()) || (full && k == "iface"));
         // The same figures as the top-level ones, from the same row. Both official
