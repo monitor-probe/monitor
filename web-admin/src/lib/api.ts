@@ -78,6 +78,8 @@ export type Node = {
   /** Panel only. The agent's reporting interval in seconds, read from its reports; null until two have arrived. */
   interval?: number | null
   remark?: string
+  /** Set by hand and public. Absent from a hub predating it. */
+  public_remark?: string
   /** Panel only. */
   token?: string
   /** Panel only. Whether going offline and returning are announced. */

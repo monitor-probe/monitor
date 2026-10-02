@@ -93,6 +93,9 @@ CREATE TABLE IF NOT EXISTS node (
   -- Set in the panel and shown on the status page, where a theme may divide the
   -- node list by it. Empty is ungrouped. Not `group`, a reserved word.
   group_name TEXT NOT NULL DEFAULT '',
+  -- Set in the panel and shown on the status page, unlike `remark`. Empty is
+  -- none.
+  public_remark TEXT NOT NULL DEFAULT '',
   -- Set in the panel, each replacing the address shown for its family. Empty
   -- means automatic. Panel only, like the reported addresses.
   ipv4_pin TEXT NOT NULL DEFAULT '', ipv6_pin TEXT NOT NULL DEFAULT '',
@@ -209,7 +212,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -383,6 +386,10 @@ fn migrate_to_11(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_12(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "public_remark TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -429,6 +436,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 11 {
         migrate_to_11(&tx)?;
     }
+    if from < 12 {
+        migrate_to_12(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -472,6 +482,10 @@ pub struct Node {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub remark: String,
+    /// Set in the panel for visitors to read, beside `remark`, which they never
+    /// see. Empty is none.
+    #[serde(default)]
+    pub public_remark: String,
     /// Monthly allowance in bytes; 0 means unmetered.
     #[serde(default)]
     pub traffic_limit: i64,
@@ -562,6 +576,7 @@ pub struct NodePatch {
     #[serde(default, deserialize_with = "expiry_patch")]
     pub expires_at: Option<Option<String>>,
     pub remark: Option<String>,
+    pub public_remark: Option<String>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
@@ -1095,7 +1110,8 @@ impl Db {
                                  traffic_reset_day=COALESCE(?12,traffic_reset_day),
                                  notify=COALESCE(?13,notify), country_pin=COALESCE(?14,country_pin),
                                  ipv4_pin=COALESCE(?15,ipv4_pin), ipv6_pin=COALESCE(?16,ipv6_pin),
-                                 group_name=COALESCE(?17,group_name)
+                                 group_name=COALESCE(?17,group_name),
+                                 public_remark=COALESCE(?18,public_remark)
                  WHERE id=?1",
             )?;
             for id in ids {
@@ -1116,7 +1132,8 @@ impl Db {
                     n.country_pin,
                     n.ipv4_pin,
                     n.ipv6_pin,
-                    n.group
+                    n.group,
+                    n.public_remark
                 ])?;
                 // Dropping the transaction uncommitted rolls back the nodes
                 // already updated.
@@ -2491,6 +2508,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         billing_cycle: s("billing_cycle"),
         expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
         remark: s("remark"),
+        public_remark: s("public_remark"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
         traffic_reset_day: n("traffic_reset_day") as u32,
@@ -3301,13 +3319,14 @@ mod tests {
         let patch = |v| serde_json::from_value::<NodePatch>(v).unwrap();
         db.update_node(
             id,
-            &patch(serde_json::json!({"public":false,"remark":"private","expires_at":"2030-01-01"})),
+            &patch(serde_json::json!({"public":false,"remark":"private","public_remark":"CN2 GIA","expires_at":"2030-01-01"})),
         )
         .unwrap();
         db.update_node(id, &patch(serde_json::json!({"price":20}))).unwrap();
         let n = db.node(id).unwrap().unwrap();
         assert!(!n.public);
         assert_eq!(n.remark, "private");
+        assert_eq!(n.public_remark, "CN2 GIA");
         assert_eq!(n.expires_at.as_deref(), Some("2030-01-01"));
         db.update_node(id, &patch(serde_json::json!({"price":0,"expires_at":null}))).unwrap();
         let n = db.node(id).unwrap().unwrap();

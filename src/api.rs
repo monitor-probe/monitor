@@ -200,6 +200,8 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // Named by the operator for the status page to divide the list by, so
         // public like the node's name. Empty is ungrouped.
         "group": node.group,
+        // Written by the operator for visitors, unlike `remark` below.
+        "public_remark": node.public_remark,
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
@@ -684,6 +686,10 @@ fn group_error(group: &mut String) -> Option<&'static str> {
     None
 }
 
+/// A public remark goes to every visitor in every frame, every two seconds, where
+/// a node's public view is about 1 KB; a hundred CJK characters add 300 bytes.
+const MAX_PUBLIC_REMARK: usize = 100;
+
 /// Normalizes the currency and billing cycle, or names the one that cannot be
 /// stored. The currency is held to the ISO 4217 form of three letters, the only
 /// one `Intl.NumberFormat` accepts. Hubs before 1.3.1 stored it unchecked, so a
@@ -718,6 +724,13 @@ fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
     if let Some(group) = &mut node.group {
         if let Some(message) = group_error(group) {
             return Some(message);
+        }
+    }
+    // Refused rather than truncated, as a group name is.
+    if let Some(text) = &mut node.public_remark {
+        *text = text.trim().to_owned();
+        if text.chars().count() > MAX_PUBLIC_REMARK || text.chars().any(char::is_control) {
+            return Some("公开备注最多 100 个字，不能含控制字符");
         }
     }
     node_limits(node.traffic_reset_day, node.price, node.traffic_limit)
@@ -2805,7 +2818,12 @@ mod tests {
         assert_eq!(group(a), "香港", "a refused batch leaves every node as it was");
 
         // Only the listed fields deserialize, so the extractor refuses the rest.
-        for refused in [json!({"name": "x"}), json!({"ipv4_pin": "1.2.3.4"}), json!({"public": false})] {
+        for refused in [
+            json!({"name": "x"}),
+            json!({"ipv4_pin": "1.2.3.4"}),
+            json!({"public": false}),
+            json!({"public_remark": "x"}),
+        ] {
             assert!(serde_json::from_value::<BatchPatch>(refused.clone()).is_err(), "{refused}");
         }
         // Counted in characters, not bytes: thirteen of them take 39 bytes.
@@ -2820,6 +2838,26 @@ mod tests {
         );
 
         assert!(live_snapshot(&app, false).as_str().contains(r#""group":"香港""#), "the group is public");
+    }
+
+    /// The public note reaches visitors trimmed, and one too long for every
+    /// frame, or one carrying a line break, is refused rather than cut.
+    #[tokio::test]
+    async fn a_public_remark_is_bounded_and_reaches_visitors() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        let put = |text: String| {
+            let patch = serde_json::from_value(json!({ "public_remark": text })).unwrap();
+            update_node(Admin, axum::extract::State(app.clone()), Path(id), Ok(Json(patch)))
+        };
+
+        assert_eq!(put("港".repeat(MAX_PUBLIC_REMARK + 1)).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(put("一行\n两行".into()).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(put(" CN2 GIA ".into()).await.status(), StatusCode::OK);
+        let public = &visible_nodes(&app, false).unwrap()[0];
+        assert_eq!((&public["public_remark"], &public["remark"]), (&json!("CN2 GIA"), &Value::Null));
+        // Counted in characters, not bytes.
+        assert_eq!(put("港".repeat(MAX_PUBLIC_REMARK)).await.status(), StatusCode::OK);
     }
 
     /// What the panel saves is what an anonymous visitor reads, under the same
