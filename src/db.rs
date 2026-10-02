@@ -185,8 +185,15 @@ CREATE TABLE IF NOT EXISTS metric_hour (
 
 -- `latency` is the median of the hour's answers and NULL when none arrived;
 -- `lo` and `hi` bound them. `answered` weights the median when buckets merge.
+--
+-- Foreign keys, unlike `ping_record`: an earlier build run against this file
+-- deletes nodes and probes knowing nothing of this table, and SQLite gives a
+-- deleted id to the next one created, which would draw the deleted one's
+-- hourly latency. The cascade clears the rows whichever build deletes.
 CREATE TABLE IF NOT EXISTS ping_hour (
-  node_id INTEGER NOT NULL, task_id INTEGER NOT NULL, ts INTEGER NOT NULL,
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  task_id INTEGER NOT NULL REFERENCES ping_task(id) ON DELETE CASCADE,
+  ts INTEGER NOT NULL,
   answered INTEGER NOT NULL, lost INTEGER NOT NULL,
   latency INTEGER, lo INTEGER, hi INTEGER,
   PRIMARY KEY (node_id, ts, task_id)
@@ -355,11 +362,6 @@ fn migrate_to_10(conn: &Connection) -> Result<()> {
 /// service already has both tables, since `open` runs `SCHEMA` first; a backup
 /// from an earlier release does not, and restoring one would leave every rollup
 /// failing until the next restart.
-///
-/// This runs again after an earlier build has opened the file, and that build
-/// deletes nodes and probes without clearing `ping_hour`, which has no foreign
-/// key. Its rows for those ids are dropped here, or they would be drawn under
-/// whichever node or probe SQLite gives the id to next.
 fn migrate_to_11(conn: &Connection) -> Result<()> {
     add_column(conn, "metric", "cpu_max REAL NOT NULL DEFAULT 0")?;
     conn.execute_batch(
@@ -375,13 +377,13 @@ fn migrate_to_11(conn: &Connection) -> Result<()> {
            PRIMARY KEY (node_id, ts)
          ) WITHOUT ROWID;
          CREATE TABLE IF NOT EXISTS ping_hour (
-           node_id INTEGER NOT NULL, task_id INTEGER NOT NULL, ts INTEGER NOT NULL,
+           node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+           task_id INTEGER NOT NULL REFERENCES ping_task(id) ON DELETE CASCADE,
+           ts INTEGER NOT NULL,
            answered INTEGER NOT NULL, lost INTEGER NOT NULL,
            latency INTEGER, lo INTEGER, hi INTEGER,
            PRIMARY KEY (node_id, ts, task_id)
-         ) WITHOUT ROWID;
-         DELETE FROM ping_hour
-          WHERE node_id NOT IN (SELECT id FROM node) OR task_id NOT IN (SELECT id FROM ping_task);",
+         ) WITHOUT ROWID;",
     )?;
     Ok(())
 }
@@ -1190,12 +1192,12 @@ impl Db {
     /// False when no node has this id.
     pub fn delete_node(&self, id: i64) -> Result<bool> {
         let conn = self.conn();
-        // The probe tables carry no foreign key -- they are WITHOUT ROWID and
-        // keyed for the chart query -- so they are cleared explicitly. SQLite
-        // reassigns a deleted node's id to the next node created, which would
-        // otherwise inherit the removed machine's latency chart.
+        // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
+        // for the chart query -- so it is cleared explicitly; the other history
+        // tables cascade. SQLite reassigns a deleted node's id to the next node
+        // created, which would otherwise inherit the removed machine's latency
+        // chart.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
-        conn.execute("DELETE FROM ping_hour WHERE node_id = ?1", [id])?;
         Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
 
@@ -1710,7 +1712,10 @@ impl Db {
     /// the restored hours.
     ///
     /// By node, as the keys begin with it; `ts` alone would scan each table.
-    /// The probe results are held one node's hour at a time.
+    /// The probe results are held one node's hour at a time, and only for
+    /// probes that still exist: `ping_hour` refers to `ping_task`, and one row
+    /// left behind by a deleted probe would otherwise fail the hour on every
+    /// pass, keeping its minute rows from ever being pruned.
     ///
     /// The byte columns truncate their means, a loss under one byte; the counts
     /// round theirs, as truncating would drop a UDP socket held for half the
@@ -1742,7 +1747,8 @@ impl Db {
         for node in nodes {
             let mut probes: std::collections::BTreeMap<i64, Tally> = Default::default();
             let mut read = tx.prepare_cached(
-                "SELECT task_id, latency FROM ping_record WHERE node_id=?1 AND ts>=?2 AND ts<?2+3600",
+                "SELECT task_id, latency FROM ping_record
+                 WHERE node_id=?1 AND ts>=?2 AND ts<?2+3600 AND task_id IN (SELECT id FROM ping_task)",
             )?;
             let mut rows = read.query(params![node, hour])?;
             while let Some(r) = rows.next()? {
@@ -1775,9 +1781,9 @@ impl Db {
     ///
     /// Per node, as the keys begin with `node_id`: `ts < ?` alone scans the whole
     /// table, 25 s at 90 days of 100 nodes against 86 ms by seek. The node table
-    /// lists every node with rows: `metric` and `metric_hour` cascade from it,
-    /// `delete_node` clears the two probe tables, and `insert_pings` writes only
-    /// for probes assigned to an existing node.
+    /// lists every node with rows: `metric` and the hourly tables cascade from
+    /// it, `delete_node` clears `ping_record`, and `insert_pings` writes only for
+    /// probes assigned to an existing node.
     ///
     /// Minute rows are deleted at most one node's day per statement, with the
     /// lock the agents write through released in between. An hourly pass
@@ -1969,12 +1975,12 @@ impl Db {
 
     /// Deletes a probe and the results filed under it.
     ///
-    /// The probe tables carry no foreign key -- they are WITHOUT ROWID and keyed
-    /// for the chart query -- so they are cleared explicitly, as in `delete_node`.
-    /// SQLite reassigns a deleted probe's id to the next one created, and the
-    /// chart selects on `task_id IN (assignments for this node)`: without this
-    /// the new probe would draw the removed one's latency under its own name,
-    /// with its timeouts folded into the loss figure.
+    /// `ping_record` carries no foreign key, so it is cleared explicitly, as in
+    /// `delete_node`; `ping_hour` cascades. SQLite reassigns a deleted probe's
+    /// id to the next one created, and the chart selects on `task_id IN
+    /// (assignments for this node)`: without this the new probe would draw the
+    /// removed one's latency under its own name, with its timeouts folded into
+    /// the loss figure.
     ///
     /// Each delete is a scan -- the keys begin at `node_id` -- bounded by the
     /// week of minute rows and the hourly tier, for an action taken manually a
@@ -1982,7 +1988,6 @@ impl Db {
     pub fn delete_ping_task(&self, id: i64) -> Result<()> {
         let conn = self.conn();
         conn.execute("DELETE FROM ping_record WHERE task_id = ?1", [id])?;
-        conn.execute("DELETE FROM ping_hour WHERE task_id = ?1", [id])?;
         conn.execute("DELETE FROM ping_task WHERE id=?1", [id])?;
         Ok(())
     }
@@ -3224,6 +3229,61 @@ mod tests {
             db.ping_records(id, Span::minutes(0, 60)).unwrap().0.is_empty(),
             "and it starts with no history"
         );
+    }
+
+    /// An earlier build deleting a node or a probe runs only its own statements,
+    /// those of v1.3.1 below, and knows nothing of `ping_hour`. Rows it leaves
+    /// would be drawn under the next node or probe given the id, once the newer
+    /// build is back.
+    #[test]
+    fn an_earlier_builds_deletes_clear_the_hourly_probe_rows() {
+        let db = db();
+        let (kept_node, gone_node) = (node(&db, 1), node(&db, 1));
+        let probe = || PingTask {
+            id: 0,
+            name: "p".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![kept_node, gone_node],
+            ..Default::default()
+        };
+        let (kept_task, gone_task) =
+            (db.save_ping_task(&probe()).unwrap(), db.save_ping_task(&probe()).unwrap());
+        let conn = db.conn();
+        for n in [kept_node, gone_node] {
+            for t in [kept_task, gone_task] {
+                conn.execute("INSERT INTO ping_hour VALUES (?1, ?2, 3600, 60, 0, 42, 40, 44)", params![n, t])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch(&format!(
+            "DELETE FROM ping_record WHERE node_id = {gone_node}; DELETE FROM node WHERE id = {gone_node};
+             DELETE FROM ping_record WHERE task_id = {gone_task}; DELETE FROM ping_task WHERE id = {gone_task};"
+        ))
+        .unwrap();
+        let left: Vec<(i64, i64)> = conn
+            .prepare("SELECT node_id, task_id FROM ping_hour")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, [(kept_node, kept_task)]);
+    }
+
+    /// `ping_hour` refers to `ping_task`, so a result filed under a probe that
+    /// no longer exists would fail the fold of its hour on every pass.
+    #[test]
+    fn a_result_left_by_a_deleted_probe_does_not_stop_the_rollup() {
+        let db = db();
+        let id = node(&db, 1);
+        let now = Utc::now().timestamp();
+        let hour = (now - 3 * 3_600).div_euclid(3_600) * 3_600;
+        db.conn().execute("INSERT INTO ping_record VALUES (?1, 999, ?2, 42)", params![id, hour]).unwrap();
+        db.insert_metric(id, hour, &serde_json::json!({"cpu": 1.0})).unwrap();
+        assert!(db.roll_up(now, 1).unwrap() > 0);
+        let span = Span { since: hour, step: 3_600, hourly: true };
+        assert_eq!(db.metrics(id, span).unwrap().len(), 1, "the hour is folded");
     }
 
     /// Counted directly from the table rather than read back through
