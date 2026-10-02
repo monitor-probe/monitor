@@ -817,14 +817,14 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
                 <Field label="分组" hint="公开页可见，留空为未分组">
                   <GroupInput nodes={nodes} value={form.group ?? ""} onChange={(v) => set("group", v)} />
                 </Field>
-                <Field label="公开备注" className="sm:col-span-2">
+                <Field label="公开备注">
                   <Input
                     value={form.public_remark ?? ""}
                     onChange={(e) => set("public_remark", e.target.value)}
                     placeholder="公开页可见，最多 100 字"
                   />
                 </Field>
-                <Field label="备注" className="sm:col-span-2">
+                <Field label="私有备注">
                   <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="仅管理员可见" />
                 </Field>
               </div>
