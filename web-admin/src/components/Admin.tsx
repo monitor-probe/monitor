@@ -1782,12 +1782,183 @@ function PingForm({ task, nodes, onClose, onSaved }: {
   )
 }
 
+// One node's probes, ticked from the node's side. Saves only what changed from
+// the list it opened with, as PingForm does for a probe's nodes.
+function NodeProbesForm({ node, tasks, onClose, onSaved }: {
+  node: Node
+  tasks: PingTask[]
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [base] = useState(() => tasks.filter((t) => t.nodes.includes(node.id)).map((t) => t.id))
+  const [chosen, setChosen] = useState(() => new Set(base))
+  const [query, setQuery] = useState("")
+  const [saving, setSaving] = useState(false)
+  // As in NodePicker: the unfiltered height is the floor, so the search box
+  // stays under the cursor while the list narrows.
+  const [listHeight, setListHeight] = useState(0)
+  const needle = query.trim().toLowerCase()
+  const visible = needle ? tasks.filter((t) => `${t.name} ${t.target}`.toLowerCase().includes(needle)) : tasks
+  const visibleChosen = visible.filter((t) => chosen.has(t.id)).length
+
+  const pick = (list: PingTask[], on: boolean) =>
+    setChosen((c) => {
+      const next = new Set(c)
+      for (const t of list) {
+        if (on) next.add(t.id)
+        else next.delete(t.id)
+      }
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
+    try {
+      await api(`/nodes/${node.id}/ping-tasks`, { method: "PUT", body: JSON.stringify({ tasks: [...chosen], base }) })
+      toast.success("已保存，正在下发")
+      onClose()
+      onSaved()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle className="break-all">「{node.name}」的延迟监控</DialogTitle>
+        </DialogHeader>
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+          {/* min-w-0: as a grid item the list would otherwise grow to its
+              widest target and push the dialog past a phone's edge. */}
+          <section className="min-w-0 space-y-3">
+            <div className="flex items-baseline justify-between gap-2">
+              <h3 className="text-sm font-medium">运行的监控</h3>
+              <span className="tnum text-xs text-muted-foreground">已选 {chosen.size} / {tasks.length}</span>
+            </div>
+            <div className="rounded-lg border">
+              <div className="flex flex-wrap items-center gap-1 border-b p-2">
+                <div className="relative min-w-0 flex-1 basis-32">
+                  <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    className="pl-8"
+                    placeholder="名称/目标"
+                    aria-label="搜索监控"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && e.preventDefault()}
+                  />
+                </div>
+                <Button type="button" size="sm" variant="ghost" className="px-2.5" disabled={visibleChosen === visible.length} onClick={() => pick(visible, true)}>全选</Button>
+                <Button type="button" size="sm" variant="ghost" className="px-2.5" disabled={visibleChosen === 0} onClick={() => pick(visible, false)}>全不选</Button>
+              </div>
+              <div
+                ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
+                style={{ minHeight: listHeight ? `min(${listHeight}px, 20rem, 50dvh)` : undefined }}
+                className="max-h-[min(20rem,50dvh)] space-y-0.5 overflow-y-auto p-1.5"
+              >
+                {visible.map((t) => (
+                  <label key={t.id} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+                    <input type="checkbox" checked={chosen.has(t.id)} onChange={(e) => pick([t], e.target.checked)} className="shrink-0 accent-primary" />
+                    <span className="min-w-0 flex-1 truncate" title={t.name}>{t.name}</span>
+                    <span className="tnum max-w-[45%] shrink-0 truncate text-xs text-muted-foreground" title={t.target}>{t.target}</span>
+                    <span className="tnum w-12 shrink-0 text-right text-xs text-muted-foreground">{t.interval}s</span>
+                  </label>
+                ))}
+                {!visible.length && (
+                  <p className="p-2 text-xs text-muted-foreground">{tasks.length ? "没有匹配的监控" : "还没有延迟监控，先在「按监控」里添加"}</p>
+                )}
+              </div>
+            </div>
+          </section>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>保存</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// The probes seen from the nodes: one row per node, so a machine's whole set is
+// read and edited in one place.
+function PingByNode({ nodes, tasks, reload }: { nodes: Node[]; tasks: PingTask[]; reload: () => void }) {
+  const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
+  const [editing, setEditing] = useState<Node | null>(null)
+  const visible = inGroup(searchNodes(nodes, query), group)
+  const owned = new Map(nodes.map((n) => [n.id, [] as PingTask[]]))
+  for (const t of tasks) for (const id of t.nodes) owned.get(id)?.push(t)
+
+  return (
+    <>
+      <div className="flex gap-2">
+        <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
+        <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+      </div>
+      <Card className="overflow-x-auto p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[30%]">节点</TableHead>
+              <TableHead>监控</TableHead>
+              <TableHead className="w-0 text-right">操作</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {visible.map((n) => {
+              const mine = owned.get(n.id) ?? []
+              const names = mine.map((t) => t.name).join("、")
+              return (
+                <TableRow key={n.id}>
+                  <TableCell className="whitespace-normal">
+                    <div className="font-medium text-balance break-keep">{nameText(n.name)}</div>
+                    {n.group && <div className="text-xs text-balance text-muted-foreground">{n.group}</div>}
+                  </TableCell>
+                  {/* max-w-0 lets the cell take what is left and no more, so a
+                      long list truncates instead of widening the table. */}
+                  <TableCell className="max-w-0 text-sm">
+                    {mine.length ? (
+                      <div className="truncate" title={names}>
+                        <span className="tnum">{mine.length} 个</span>
+                        <span className="text-muted-foreground"> · {names}</span>
+                      </div>
+                    ) : (
+                      <span className="text-muted-foreground">未配置</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="选择监控" aria-label="选择监控"><Pencil /></Button>
+                  </TableCell>
+                </TableRow>
+              )
+            })}
+            {!visible.length && (
+              <TableRow>
+                <TableCell colSpan={3} className="py-10 text-center text-sm text-muted-foreground">
+                  {nodes.length ? "没有匹配的节点" : "还没有节点"}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+      {editing && <NodeProbesForm node={editing} tasks={tasks} onClose={() => setEditing(null)} onSaved={reload} />}
+    </>
+  )
+}
+
 function Ping({ nodes }: { nodes: Node[] }) {
   // null until loaded, so the empty state does not flash before the list.
   const [tasks, setTasks] = useState<PingTask[] | null>(null)
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
   const [deleting, setDeleting] = useState<PingTask | null>(null)
   const [removing, setRemoving] = useState(false)
+  const [view, setView] = useState<"task" | "node">("task")
 
   // A failed first load draws the page empty, keeping 添加监控 in reach.
   const load = () =>
@@ -1821,13 +1992,26 @@ function Ping({ nodes }: { nodes: Node[] }) {
   if (!tasks) return null
   return (
     <div className="space-y-4">
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-2">
+        <div role="tablist" aria-label="视图" className="inline-flex rounded-lg bg-muted p-0.5">
+          {(["task", "node"] as const).map((v) => (
+            <button
+              key={v}
+              role="tab"
+              aria-selected={view === v}
+              onClick={() => setView(v)}
+              className={`rounded-md px-3 py-1 text-sm transition-colors ${view === v ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+            >
+              {v === "task" ? "按监控" : "按节点"}
+            </button>
+          ))}
+        </div>
         <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: nodes.map((n) => n.id), auto_join: true })}>
           <Plus /> 添加监控
         </Button>
       </div>
 
-      <Card className="overflow-x-auto p-0">
+      {view === "node" ? <PingByNode nodes={nodes} tasks={tasks} reload={load} /> : <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
             <TableRow>
@@ -1870,7 +2054,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
             )}
           </TableBody>
         </Table>
-      </Card>
+      </Card>}
 
       {editing && <PingForm task={editing} nodes={nodes} onClose={() => setEditing(null)} onSaved={load} />}
       {deleting && (

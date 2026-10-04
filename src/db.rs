@@ -1943,12 +1943,25 @@ impl Db {
                 _ => e.into(),
             })?;
         }
-        // Queried from the table after the rows are in rather than counted from
-        // the request: an update changes this task's own assignments, so
-        // arithmetic on the way in would have to subtract them again. The
-        // transaction makes this atomic with the write, and bailing here rolls it
-        // back.
-        // By name: the panel identifies nodes by name and never shows an id.
+        Self::refuse_crowded(&tx)?;
+        // The next node created receives every auto-joining probe at once.
+        let joining: i64 =
+            tx.query_row("SELECT COUNT(*) FROM ping_task WHERE auto_join", [], |r| r.get(0))?;
+        if joining > Self::MAX_PROBES_PER_NODE {
+            refuse!("新节点会自动加入 {joining} 个探测任务，agent 最多只跑 {} 个", Self::MAX_PROBES_PER_NODE);
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Refuses a write that leaves some node over [`Self::MAX_PROBES_PER_NODE`].
+    ///
+    /// Queried from the table after the rows are in rather than counted from the
+    /// request: an update changes the caller's own assignments, so arithmetic on
+    /// the way in would have to subtract them again. Run inside the write's
+    /// transaction, so refusing rolls it back. By name: the panel identifies
+    /// nodes by name and never shows an id.
+    fn refuse_crowded(tx: &rusqlite::Transaction) -> Result<()> {
         let crowded: Option<String> = tx
             .query_row(
                 "SELECT n.name FROM ping_node p JOIN node n ON n.id = p.node_id
@@ -1963,14 +1976,38 @@ impl Db {
                 Self::MAX_PROBES_PER_NODE
             );
         }
-        // The next node created receives every auto-joining probe at once.
-        let joining: i64 =
-            tx.query_row("SELECT COUNT(*) FROM ping_task WHERE auto_join", [], |r| r.get(0))?;
-        if joining > Self::MAX_PROBES_PER_NODE {
-            refuse!("新节点会自动加入 {joining} 个探测任务，agent 最多只跑 {} 个", Self::MAX_PROBES_PER_NODE);
+        Ok(())
+    }
+
+    /// One node's probes, edited from the node's side: `save_ping_task` with
+    /// the roles swapped. Only the change from `base` is applied, as there, so a
+    /// probe assigned to this node elsewhere while the editor was open keeps the
+    /// assignment. `false` when the node does not exist.
+    pub fn set_node_ping_tasks(&self, node: i64, tasks: &[i64], base: &[i64]) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if tx.query_row("SELECT 1 FROM node WHERE id=?1", [node], |_| Ok(())).optional()?.is_none() {
+            return Ok(false);
         }
+        for task in base.iter().filter(|t| !tasks.contains(t)) {
+            tx.execute("DELETE FROM ping_node WHERE task_id=?1 AND node_id=?2", params![task, node])?;
+        }
+        for task in tasks.iter().filter(|t| !base.contains(t)) {
+            // The node was checked above, so a key failing here is the probe.
+            tx.execute(
+                "INSERT OR IGNORE INTO ping_node (task_id, node_id) VALUES (?1,?2)",
+                params![task, node],
+            )
+            .map_err(|e| match e.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::ConstraintViolation) => {
+                    anyhow::Error::from(e).context(crate::Shown("有监控已被删除，刷新后重试".into()))
+                }
+                _ => e.into(),
+            })?;
+        }
+        Self::refuse_crowded(&tx)?;
         tx.commit()?;
-        Ok(id)
+        Ok(true)
     }
 
     /// Deletes a probe and the results filed under it.
@@ -3983,6 +4020,50 @@ mod tests {
         db.delete_ping_task(id).unwrap();
         assert!(save(id, vec![], vec![]).is_err(), "a deleted probe is not reported as saved");
         assert!(db.ping_tasks().unwrap().is_empty());
+    }
+
+    /// The node-side editor sends its ticks and what it opened with; only the
+    /// difference is written.
+    #[test]
+    fn a_node_edit_applies_only_the_probes_it_changed() {
+        let db = db();
+        let (a, other) = (node(&db, 1), node(&db, 1));
+        let probe = |db: &Db, nodes| {
+            db.save_ping_task(&PingTask {
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let (kept, dropped, added, elsewhere) =
+            (probe(&db, vec![a]), probe(&db, vec![a, other]), probe(&db, vec![]), probe(&db, vec![]));
+        // Assigned from the probe's side while this node's editor was open.
+        db.save_ping_task(&PingTask {
+            id: elsewhere,
+            name: "p".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![a],
+            base: Some(vec![]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(db.set_node_ping_tasks(a, &[kept, added], &[kept, dropped]).unwrap());
+        let ids =
+            |n| db.ping_tasks_for(n).unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(ids(a), [kept, added, elsewhere]);
+        assert_eq!(ids(other), [dropped], "another node's assignment is not this editor's to touch");
+
+        assert!(!db.set_node_ping_tasks(a + 100, &[kept], &[]).unwrap());
+        db.delete_ping_task(added).unwrap();
+        assert!(db.set_node_ping_tasks(other, &[added], &[]).is_err(), "a deleted probe is refused");
+        let many: Vec<i64> = (0..Db::MAX_PROBES_PER_NODE).map(|_| probe(&db, vec![])).collect();
+        assert!(db.set_node_ping_tasks(other, &many, &[]).is_err(), "65 probes on one node");
+        assert_eq!(ids(other), [dropped], "a refusal writes nothing");
     }
 
     /// The agent caps the probe list it will run and drops the remainder with

@@ -504,6 +504,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
+        .route("/api/nodes/{id}/ping-tasks", put(api::set_node_ping_tasks))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
