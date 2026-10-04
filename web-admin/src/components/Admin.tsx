@@ -2172,6 +2172,11 @@ function Themes() {
                 主题的 url 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 检查更新，版本没变就不下载。
               </p>
             </Help>
+            <Button size="sm" variant="ghost" className="-my-1 -mr-2.5 ml-auto h-7" asChild>
+              <a href="https://monitor-themes.pages.dev" target="_blank" rel="noreferrer">
+                <Palette /> 浏览主题
+              </a>
+            </Button>
           </div>
           {/* Stays in view: it is the one line about what installing permits. */}
           <p className="mt-1 text-xs text-muted-foreground">主题代码在访客浏览器中执行，请只安装可信来源。</p>
