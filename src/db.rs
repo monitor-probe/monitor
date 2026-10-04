@@ -2034,7 +2034,7 @@ impl Db {
     /// Ordered, because the agent keeps the first [`Self::MAX_PROBES_PER_NODE`]
     /// as its backstop against a hub requesting hundreds. Unordered, a list at
     /// that boundary could yield a different subset on each push, restarting half
-    /// the timers each time; `save_ping_task` prevents reaching that boundary,
+    /// the timers each time; `refuse_crowded` prevents reaching that boundary,
     /// and this makes the backstop deterministic should a database arrive there
     /// by another route.
     ///
@@ -4056,7 +4056,7 @@ mod tests {
         let ids =
             |n| db.ping_tasks_for(n).unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect::<Vec<_>>();
         assert_eq!(ids(a), [kept, added, elsewhere]);
-        assert_eq!(ids(other), [dropped], "another node's assignment is not this editor's to touch");
+        assert_eq!(ids(other), [dropped], "an assignment on another node is unchanged");
 
         assert!(!db.set_node_ping_tasks(a + 100, &[kept], &[]).unwrap());
         db.delete_ping_task(added).unwrap();

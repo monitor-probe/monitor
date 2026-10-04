@@ -816,14 +816,17 @@ fn ping_tasks_message(app: &App, node_id: i64) -> String {
     json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string()
 }
 
-/// Pushes the current probe list to every connected agent, so a panel edit takes
-/// effect without waiting for a reconnect.
-pub fn push_ping_tasks(app: &App) {
+/// Pushes the current probe list to the connected agents, so a panel edit takes
+/// effect without waiting for a reconnect. `only` limits it to one node, for an
+/// edit that changed that node alone: every push is a query and a message per
+/// agent.
+pub fn push_ping_tasks(app: &App, only: Option<i64>) {
     let connected: Vec<(i64, mpsc::Sender<String>)> = app
         .agents
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
+        .filter(|(id, _)| only.is_none_or(|only| only == **id))
         .map(|(id, agent)| (*id, agent.tx.clone()))
         .collect();
     for (node_id, sender) in connected {
