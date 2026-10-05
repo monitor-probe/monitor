@@ -2614,6 +2614,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           </Field>
           <Field label="站点图标" hint="浏览器标签页上的图标，换主题也保留。PNG、ICO、SVG、WebP 等，32 KiB 以内">
             <div className="flex items-center gap-2">
+              {!s.favicon && <span className="text-sm text-muted-foreground">默认</span>}
               <div className="flex size-9 shrink-0 items-center justify-center rounded-md border">
                 <img src={String(s.favicon || "/favicon.svg?theme")} alt="站点图标" className="size-6 object-contain" />
               </div>
