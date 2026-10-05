@@ -69,10 +69,9 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     }
     // `?theme` asks past the site icon for the theme's own, which the panel
     // shows as what clearing the setting returns to.
-    if ICON_PATHS.contains(&path) && uri.query() != Some("theme") {
-        if let Some(Ok((mime, data))) =
-            app.db.get("favicon").filter(|v| !v.is_empty()).as_deref().map(site_icon)
-        {
+    let setting = ICON_PATHS.iter().find(|(icon, _)| *icon == path).map(|&(_, key)| key);
+    if let Some(key) = setting.filter(|_| uri.query() != Some("theme")) {
+        if let Some(Ok((mime, data))) = app.db.get(key).filter(|v| !v.is_empty()).as_deref().map(site_icon) {
             return icon(path, mime, data, known);
         }
     }
@@ -91,17 +90,27 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known)
 }
 
-/// Where the panel and the themes name their icon, plus the one browsers ask
-/// for unprompted. With a site icon set, all of them answer with it, so the
-/// icon follows the site across theme switches.
-const ICON_PATHS: &[&str] = &["favicon.svg", "favicon.ico", "admin/favicon.svg"];
+/// Where the panel and the themes name their icons, plus the ones browsers ask
+/// for unprompted, each with the setting that replaces it. With a site icon
+/// set, all of them answer with it, so the icon follows the site across theme
+/// switches. iOS takes neither SVG nor the tab icon for a bookmark or the home
+/// screen, only `apple-touch-icon`, which the panel renders as a separate image.
+const ICON_PATHS: &[(&str, &str)] = &[
+    ("favicon.svg", "favicon"),
+    ("favicon.ico", "favicon"),
+    ("admin/favicon.svg", "favicon"),
+    ("apple-touch-icon.png", "touch_icon"),
+    ("apple-touch-icon-precomposed.png", "touch_icon"),
+    ("admin/apple-touch-icon.png", "touch_icon"),
+];
 
-/// The largest site icon accepted. Stored as a data URL in the settings row,
-/// and saved through the settings route's 64 KiB body limit, which its base64
-/// form (a third larger) fits beneath with room for the rest of the form.
-pub const MAX_ICON: usize = 32 * 1024;
+/// The largest of either icon. Both are stored as data URLs in the settings
+/// rows and saved together through the settings route's 64 KiB body limit,
+/// which their base64 forms (a third larger) fit beneath with room for the
+/// rest of the form. The panel scales whatever it is given down to fit.
+pub const MAX_ICON: usize = 20 * 1024;
 
-/// Decodes the `favicon` setting, a `data:image/...;base64,` URL, into the
+/// Decodes the `favicon` or `touch_icon` setting, a `data:image/...;base64,` URL, into the
 /// bytes and the type they actually are. The declared type is not trusted: the
 /// browser takes it from the file name, and the response's type comes from the
 /// bytes.
@@ -115,7 +124,7 @@ pub fn site_icon(value: &str) -> Result<(&'static str, Vec<u8>), &'static str> {
         .ok_or(NOT_IMAGE)?;
     let data = base64::engine::general_purpose::STANDARD.decode(payload).map_err(|_| NOT_IMAGE)?;
     if data.len() > MAX_ICON {
-        return Err("站点图标不能超过 32 KiB");
+        return Err("站点图标不能超过 20 KiB");
     }
     let mime = match data.as_slice() {
         [0x89, b'P', b'N', b'G', ..] => "image/png",

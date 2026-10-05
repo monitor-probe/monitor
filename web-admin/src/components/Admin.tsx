@@ -2573,6 +2573,60 @@ function useSettings() {
   }
 }
 
+// The hub's limit on each icon, which keeps both under its 64 KiB body limit.
+const ICON_BYTES = 20 * 1024
+
+const decodedBytes = (url: string) => Math.floor(((url.length - url.indexOf(",") - 1) * 3) / 4)
+
+// `img` contained in a `side`-pixel square, centred.
+function drawIcon(img: HTMLImageElement, side: number, background: string | null, type: string, quality?: number) {
+  const canvas = document.createElement("canvas")
+  canvas.width = canvas.height = side
+  const context = canvas.getContext("2d")!
+  if (background) {
+    context.fillStyle = background
+    context.fillRect(0, 0, side, side)
+  }
+  // An SVG without width and height has no intrinsic size; drawn square.
+  const w = img.naturalWidth || side
+  const h = img.naturalHeight || side
+  const scale = side / Math.max(w, h)
+  context.drawImage(img, (side - w * scale) / 2, (side - h * scale) / 2, w * scale, h * scale)
+  return canvas.toDataURL(type, quality)
+}
+
+// The two icons the hub serves from one picked image: the tab icon, an SVG kept
+// as it is or anything else scaled to 64 px (32 px at 2x), and the 180 px
+// apple-touch-icon iOS puts on the home screen. iOS fills a transparent one
+// with black, so it is drawn on white; a photo too detailed for a 20 KiB PNG
+// falls back to JPEG.
+async function siteIcons(file: File) {
+  const url = URL.createObjectURL(file)
+  try {
+    const img = new Image()
+    img.src = url
+    await img.decode().catch(() => {
+      throw new Error("这张图片打不开，换一张 PNG、SVG 或 ICO 试试")
+    })
+    const favicon =
+      file.type === "image/svg+xml" && file.size <= ICON_BYTES
+        ? await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () => resolve(String(reader.result))
+            reader.onerror = () => reject(new Error("读取图片失败，请重新选择"))
+            reader.readAsDataURL(file)
+          })
+        : drawIcon(img, 64, null, "image/png")
+    let touch = drawIcon(img, 180, "#fff", "image/png")
+    for (let quality = 0.9; decodedBytes(touch) > ICON_BYTES && quality > 0.3; quality -= 0.15) {
+      touch = drawIcon(img, 180, "#fff", "image/jpeg", quality)
+    }
+    return { favicon, touch_icon: touch }
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
 // `onSaved` refreshes what the header shows, the site name among it.
 function SettingsTab({ onSaved }: { onSaved: () => void }) {
   const { s, set, save } = useSettings()
@@ -2612,7 +2666,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               placeholder="30"
             />
           </Field>
-          <Field label="站点图标" hint="浏览器标签页上的图标，换主题也保留。PNG、ICO、SVG、WebP 等，32 KiB 以内">
+          <Field label="站点图标" hint="浏览器标签页、书签和手机主屏幕上的图标，换主题也保留。PNG、SVG、ICO、WebP 等">
             <div className="flex items-center gap-2">
               {!s.favicon && <span className="text-sm text-muted-foreground">默认</span>}
               <div className="flex size-9 shrink-0 items-center justify-center rounded-md border">
@@ -2622,7 +2676,14 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 <Upload /> 选择图标
               </Button>
               {s.favicon && (
-                <Button size="sm" variant="ghost" onClick={() => set("favicon", "")}>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    set("favicon", "")
+                    set("touch_icon", "")
+                  }}
+                >
                   用主题自带的
                 </Button>
               )}
@@ -2635,13 +2696,13 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                   const file = e.target.files?.[0]
                   e.target.value = ""
                   if (!file) return
-                  if (file.size > 32 * 1024) {
-                    toast.error(`图标不能超过 32 KiB，这张有 ${Math.ceil(file.size / 1024)} KiB`)
-                    return
-                  }
-                  const reader = new FileReader()
-                  reader.onload = () => set("favicon", String(reader.result))
-                  reader.readAsDataURL(file)
+                  siteIcons(file).then(
+                    (icons) => {
+                      set("favicon", icons.favicon)
+                      set("touch_icon", icons.touch_icon)
+                    },
+                    (e: Error) => toast.error(e.message),
+                  )
                 }}
               />
             </div>
@@ -2685,6 +2746,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
                 favicon: String(s.favicon ?? ""),
+                touch_icon: String(s.touch_icon ?? ""),
               }).then((ok) => {
                 if (!ok) return
                 onSaved()
