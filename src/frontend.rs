@@ -67,7 +67,9 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     if is_api_path(path) {
         return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
-    if ICON_PATHS.contains(&path) {
+    // `?theme` asks past the site icon for the theme's own, which the panel
+    // shows as what clearing the setting returns to.
+    if ICON_PATHS.contains(&path) && uri.query() != Some("theme") {
         if let Some(Ok((mime, data))) =
             app.db.get("favicon").filter(|v| !v.is_empty()).as_deref().map(site_icon)
         {
