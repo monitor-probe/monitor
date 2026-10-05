@@ -2612,22 +2612,6 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               placeholder="30"
             />
           </Field>
-          <Field
-            label="GitHub 代理"
-            helpWidth="max-w-58 min-[376px]:max-w-86 min-[432px]:max-w-100"
-            help={
-              <>
-                <p>留空直连。仅在 hub 自己拉不到 GitHub Release 时填。</p>
-                <p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>
-              </>
-            }
-          >
-            <Input
-              value={String(s.github_proxy ?? "")}
-              onChange={(e) => set("github_proxy", e.target.value)}
-              placeholder="https://ghfast.top"
-            />
-          </Field>
           <Field label="站点图标" hint="浏览器标签页上的图标，换主题也保留。PNG、ICO、SVG、WebP 等，32 KiB 以内">
             <div className="flex items-center gap-2">
               <div className="flex size-9 shrink-0 items-center justify-center rounded-md border">
@@ -2638,7 +2622,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 )}
               </div>
               <Button size="sm" variant="outline" onClick={() => iconPicker.current?.click()}>
-                <Upload /> 选择图片
+                <Upload /> 选择图标
               </Button>
               {s.favicon && (
                 <Button size="sm" variant="ghost" onClick={() => set("favicon", "")}>
@@ -2664,6 +2648,22 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 }}
               />
             </div>
+          </Field>
+          <Field
+            label="GitHub 代理"
+            helpWidth="max-w-58 min-[376px]:max-w-86 min-[432px]:max-w-100"
+            help={
+              <>
+                <p>留空直连。仅在 hub 自己拉不到 GitHub Release 时填。</p>
+                <p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>
+              </>
+            }
+          >
+            <Input
+              value={String(s.github_proxy ?? "")}
+              onChange={(e) => set("github_proxy", e.target.value)}
+              placeholder="https://ghfast.top"
+            />
           </Field>
         </div>
         {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
