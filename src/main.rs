@@ -891,7 +891,11 @@ mod tests {
         assert_eq!(spa("/api").await.status(), StatusCode::NOT_FOUND);
 
         // Client-side routes still fall through to the app.
-        assert_eq!(spa("/admin").await.status(), StatusCode::OK);
+        assert_eq!(spa("/admin/nodes").await.status(), StatusCode::OK);
+        // The panel's entry is a redirect to its first page, keeping the query
+        // the OAuth callback reports a failed sign-in with.
+        let entry = spa("/admin?login_error=x").await;
+        assert_eq!(entry.headers()[axum::http::header::LOCATION], "/admin/nodes?login_error=x");
         assert_eq!(spa("/").await.status(), StatusCode::OK);
         // A path merely beginning with "api" is not an API path.
         assert_eq!(spa("/apiary").await.status(), StatusCode::OK);

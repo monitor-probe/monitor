@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -83,8 +83,17 @@ fn respond(app: &App, path: &str, query: Option<&str>, known: Option<&str>, shel
         }
     }
 
-    if path == "admin" || path.starts_with("admin/") {
-        let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
+    // The panel's entry is an alias for its first page, and said so here rather
+    // than by the panel renaming its address once loaded: Chrome files a tab's
+    // icon under the URL the page had when the icon arrived, and shows what it
+    // filed the moment a navigation starts. Renamed first, the entry kept the
+    // icon it last had and flashed it on every visit.
+    if path == "admin" || path == "admin/" {
+        let first = "/admin/nodes";
+        return Redirect::to(&query.map_or(first.to_owned(), |q| format!("{first}?{q}"))).into_response();
+    }
+    if path.starts_with("admin/") {
+        let path = path.trim_start_matches("admin/");
         return embedded::<AdminAssets>(
             path,
             "面板没有构建，在 web-admin/ 下运行 npm run build",
