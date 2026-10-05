@@ -62,66 +62,67 @@ pub struct Theme {
 }
 
 pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
     let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+    respond(&app, uri.path().trim_start_matches('/'), uri.query(), known, &|html| stamp_icons(&app, html))
+}
+
+/// What `serve` answers for `path`. `shell` rewrites the HTML shell on its way
+/// out; [`stamp_icons`] resolves each icon through here with the shell left
+/// as it is, which also keeps an icon a theme lacks, answered with the shell,
+/// from recursing.
+fn respond(app: &App, path: &str, query: Option<&str>, known: Option<&str>, shell: Shell) -> Response {
     if is_api_path(path) {
         return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
     // `?theme` asks past the site icon for the theme's own, which the panel
     // shows as what clearing the setting returns to.
     let setting = ICON_PATHS.iter().find(|(icon, _)| *icon == path).map(|&(_, key)| key);
-    if let Some(key) = setting.filter(|_| uri.query() != Some("theme")) {
+    if let Some(key) = setting.filter(|_| query != Some("theme")) {
         if let Some(Ok((mime, data))) = app.db.get(key).filter(|v| !v.is_empty()).as_deref().map(site_icon) {
             return icon(path, mime, data, known);
         }
     }
 
-    let theme = app.db.get("theme").unwrap_or_default();
-    let shell = |html| stamp_icons(&app, &theme, html);
     if path == "admin" || path.starts_with("admin/") {
         let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
         return embedded::<AdminAssets>(
             path,
             "面板没有构建，在 web-admin/ 下运行 npm run build",
             known,
-            &shell,
+            shell,
         );
     }
 
+    let theme = app.db.get("theme").unwrap_or_default();
     if let Some(root) = external_theme(&app.themes, &theme) {
-        if let Some(response) = disk(&root, path, known, &shell) {
+        if let Some(response) = disk(&root, path, known, shell) {
             return response;
         }
     }
-    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known, &shell)
+    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known, shell)
 }
 
-/// Names each icon in an HTML shell with a stamp of what decides it, so a
-/// changed icon is a new URL. Chrome keeps a tab's icon by its URL and, on an
-/// ordinary navigation, shows the one it holds without asking again, whatever
-/// the cache headers say; only a reload fetches it anew. The theme is in the
-/// stamp because the theme's own icon is what an unset site icon serves.
-///
-/// ponytail: a theme update that changes its icon keeps the old stamp, so the
-/// tab shows the old icon until a reload; stamping the served bytes would cover
-/// it at the cost of reading the icon on every shell.
-fn stamp_icons(app: &App, theme: &str, html: Vec<u8>) -> Vec<u8> {
+/// Names each icon in an HTML shell after the bytes served for it -- the ETag,
+/// which is their digest -- as the build already names everything under
+/// `assets/`. The URL a theme writes is fixed while what it serves is not: a
+/// site icon set or cleared, a theme switched or updated. Chrome keeps a tab's
+/// icon by its URL and, on an ordinary navigation, shows the one it holds
+/// without asking again, whatever the cache headers say; only a reload fetches
+/// it anew.
+fn stamp_icons(app: &App, html: Vec<u8>) -> Vec<u8> {
     let mut text = match String::from_utf8(html) {
         Ok(text) => text,
         Err(e) => return e.into_bytes(),
     };
-    let stamp = |key| {
-        let value = app.db.get(key).unwrap_or_default();
-        hex::encode(Sha256::digest(format!("{theme}\0{value}")))[..8].to_owned()
-    };
-    let (icon, touch) = (stamp("favicon"), stamp("touch_icon"));
-    for (path, stamp) in [
-        ("/favicon.svg", &icon),
-        ("/admin/favicon.svg", &icon),
-        ("/apple-touch-icon.png", &touch),
-        ("/admin/apple-touch-icon.png", &touch),
-    ] {
-        text = text.replace(&format!("\"{path}\""), &format!("\"{path}?v={stamp}\""));
+    for path in ["favicon.svg", "admin/favicon.svg", "apple-touch-icon.png", "admin/apple-touch-icon.png"] {
+        let quoted = format!("\"/{path}\"");
+        if !text.contains(&quoted) {
+            continue;
+        }
+        let served = respond(app, path, None, None, &|html| html);
+        let Some(etag) = served.headers().get(header::ETAG).and_then(|v| v.to_str().ok()) else { continue };
+        text = text
+            .replace(&quoted, &format!("\"/{path}?v={}\"", etag.trim_matches('"').get(..8).unwrap_or(etag)));
     }
     text.into_bytes()
 }
@@ -868,23 +869,23 @@ mod tests {
         assert!(served.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("sandbox"));
     }
 
-    /// A changed icon, or a switched theme whose own icon then serves, must be a
-    /// new URL in the shell: Chrome does not refetch a tab icon it already holds
-    /// on an ordinary navigation.
+    /// The shell names each icon after the bytes served for it, so a changed
+    /// icon is a new URL: Chrome does not refetch a tab icon it already holds on
+    /// an ordinary navigation.
     #[test]
-    fn the_shell_names_each_icon_by_what_decides_it() {
+    fn the_shell_names_each_icon_after_what_it_serves() {
         let app = App::for_test(crate::db::Db::open(":memory:").unwrap());
         let html = br#"<link rel="icon" href="/favicon.svg" /><link rel="apple-touch-icon" href="/apple-touch-icon.png" />"#;
-        let shell = |theme: &str| String::from_utf8(stamp_icons(&app, theme, html.to_vec())).unwrap();
-        let before = shell("default");
+        let shell = || String::from_utf8(stamp_icons(&app, html.to_vec())).unwrap();
+        let before = shell();
         assert!(
             before.contains(r#"href="/favicon.svg?v="#)
                 && before.contains(r#"href="/apple-touch-icon.png?v="#)
         );
-        assert_ne!(shell("aurora"), before, "another theme's icon");
+        assert_eq!(shell(), before, "the same bytes, the same URL");
 
         app.db.set("favicon", "data:image/png;base64,iVBORw0KGgo=").unwrap();
-        let after = shell("default");
+        let after = shell();
         assert_ne!(after, before);
         // Only the icon that changed moves.
         let touch = |html: &str| html.split("apple-touch-icon.png").nth(1).unwrap().to_owned();
