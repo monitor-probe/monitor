@@ -1855,9 +1855,9 @@ function NodeProbesForm({ node, tasks, onClose, onSaved }: {
   const [base] = useState(() => tasks.filter((t) => t.nodes.includes(node.id)).map((t) => t.id))
   const [chosen, setChosen] = useState(() => new Set(base))
   const [saving, setSaving] = useState(false)
-  // Counted against the live list: `chosen` can still hold a probe deleted
-  // since the dialog opened.
-  const chosenCount = tasks.filter((t) => chosen.has(t.id)).length
+  // Taken from the live list: `chosen` can still hold a probe deleted since the
+  // dialog opened, which the list no longer shows to untick.
+  const ticked = tasks.filter((t) => chosen.has(t.id)).map((t) => t.id)
 
   const pick = (list: PingTask[], on: boolean) =>
     setChosen((c) => {
@@ -1872,7 +1872,7 @@ function NodeProbesForm({ node, tasks, onClose, onSaved }: {
   async function save() {
     setSaving(true)
     try {
-      await api(`/nodes/${node.id}/ping-tasks`, { method: "PUT", body: JSON.stringify({ tasks: [...chosen], base }) })
+      await api(`/nodes/${node.id}/ping-tasks`, { method: "PUT", body: JSON.stringify({ tasks: ticked, base }) })
       toast.success("已保存，正在下发")
       onClose()
       onSaved()
@@ -1895,7 +1895,7 @@ function NodeProbesForm({ node, tasks, onClose, onSaved }: {
           <section className="min-w-0 space-y-3">
             <div className="flex items-baseline justify-between gap-2">
               <h3 className="text-sm font-medium">运行的监控</h3>
-              <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {tasks.length}</span>
+              <span className="tnum text-xs text-muted-foreground">已选 {ticked.length} / {tasks.length}</span>
             </div>
             <ProbePicker tasks={tasks} chosen={chosen} onPick={pick} />
           </section>

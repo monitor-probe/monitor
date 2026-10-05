@@ -1943,7 +1943,7 @@ impl Db {
                 _ => e.into(),
             })?;
         }
-        Self::refuse_crowded(&tx)?;
+        Self::refuse_crowded(&tx, None)?;
         // The next node created receives every auto-joining probe at once.
         let joining: i64 =
             tx.query_row("SELECT COUNT(*) FROM ping_task WHERE auto_join", [], |r| r.get(0))?;
@@ -1954,19 +1954,22 @@ impl Db {
         Ok(id)
     }
 
-    /// Refuses a write that leaves some node over [`Self::MAX_PROBES_PER_NODE`].
+    /// Refuses a write that leaves some node over [`Self::MAX_PROBES_PER_NODE`],
+    /// or `node` alone when the write touched only that node's rows: another
+    /// node already over the limit is not this edit's to fix.
     ///
     /// Queried from the table after the rows are in rather than counted from the
     /// request: an update changes the caller's own assignments, so arithmetic on
     /// the way in would have to subtract them again. Run inside the write's
     /// transaction, so refusing rolls it back. By name: the panel identifies
     /// nodes by name and never shows an id.
-    fn refuse_crowded(tx: &rusqlite::Transaction) -> Result<()> {
+    fn refuse_crowded(tx: &rusqlite::Transaction, node: Option<i64>) -> Result<()> {
         let crowded: Option<String> = tx
             .query_row(
                 "SELECT n.name FROM ping_node p JOIN node n ON n.id = p.node_id
+                 WHERE ?2 IS NULL OR p.node_id = ?2
                  GROUP BY p.node_id HAVING COUNT(*) > ?1 LIMIT 1",
-                [Self::MAX_PROBES_PER_NODE],
+                params![Self::MAX_PROBES_PER_NODE, node],
                 |r| r.get(0),
             )
             .optional()?;
@@ -2005,7 +2008,7 @@ impl Db {
                 _ => e.into(),
             })?;
         }
-        Self::refuse_crowded(&tx)?;
+        Self::refuse_crowded(&tx, Some(node))?;
         tx.commit()?;
         Ok(true)
     }
@@ -4064,6 +4067,14 @@ mod tests {
         let many: Vec<i64> = (0..Db::MAX_PROBES_PER_NODE).map(|_| probe(&db, vec![])).collect();
         assert!(db.set_node_ping_tasks(other, &many, &[]).is_err(), "65 probes on one node");
         assert_eq!(ids(other), [dropped], "a refusal writes nothing");
+
+        // Over the limit by another route: editing a different node still saves.
+        for task in &many {
+            db.conn()
+                .execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![task, other])
+                .unwrap();
+        }
+        assert!(db.set_node_ping_tasks(a, &[kept], &[kept, added]).unwrap());
     }
 
     /// The agent caps the probe list it will run and drops the remainder with
