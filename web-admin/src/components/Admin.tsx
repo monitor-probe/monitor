@@ -452,7 +452,8 @@ function Field({ label, hint, help, helpWidth, className = "", children }: {
     <div className={`space-y-2 ${className}`}>
       {help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title}
       {children}
-      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
+      {/* Kept whole between punctuation, as in Help below. */}
+      {hint && <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">{hint}</p>}
     </div>
   )
 }
@@ -2632,6 +2633,15 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
   const { s, set, save } = useSettings()
   const iconPicker = useRef<HTMLInputElement>(null)
   if (!s) return null
+  // Applied on its own, as soon as a file is picked: a picked file is already a
+  // decision, and the form's save button below is easy to miss for it.
+  const saveIcons = (icons: { favicon: string; touch_icon: string }, done: string) =>
+    save(icons, done).then((ok) => {
+      // The tab's icon is cached under its fixed URL; a new query fetches the
+      // one just saved.
+      const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
+      if (ok && link) link.href = `/admin/favicon.svg?${Date.now()}`
+    })
 
   return (
     <div className="space-y-4">
@@ -2666,7 +2676,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               placeholder="30"
             />
           </Field>
-          <Field label="站点图标" hint="浏览器标签页、书签和手机主屏幕上的图标，换主题也保留。PNG、SVG、ICO、WebP 等">
+          <Field label="站点图标" hint="标签页、书签和手机主屏幕上的图标，选好即生效，换主题也保留">
             <div className="flex items-center gap-2">
               {!s.favicon && <span className="text-sm text-muted-foreground">默认</span>}
               <div className="flex size-9 shrink-0 items-center justify-center rounded-md border">
@@ -2679,10 +2689,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => {
-                    set("favicon", "")
-                    set("touch_icon", "")
-                  }}
+                  onClick={() => saveIcons({ favicon: "", touch_icon: "" }, "已换回主题自带的图标")}
                 >
                   用主题自带的
                 </Button>
@@ -2697,10 +2704,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                   e.target.value = ""
                   if (!file) return
                   siteIcons(file).then(
-                    (icons) => {
-                      set("favicon", icons.favicon)
-                      set("touch_icon", icons.touch_icon)
-                    },
+                    (icons) => saveIcons(icons, "站点图标已更新"),
                     (e: Error) => toast.error(e.message),
                   )
                 }}
@@ -2745,16 +2749,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
-                favicon: String(s.favicon ?? ""),
-                touch_icon: String(s.touch_icon ?? ""),
-              }).then((ok) => {
-                if (!ok) return
-                onSaved()
-                // The tab's icon is cached under its fixed URL; a new query
-                // fetches the one just saved.
-                const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
-                if (link) link.href = `/admin/favicon.svg?${Date.now()}`
-              })
+              }).then((ok) => ok && onSaved())
             }
           >
             保存站点设置
