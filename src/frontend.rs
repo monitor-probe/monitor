@@ -76,18 +76,54 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
         }
     }
 
+    let theme = app.db.get("theme").unwrap_or_default();
+    let shell = |html| stamp_icons(&app, &theme, html);
     if path == "admin" || path.starts_with("admin/") {
         let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
-        return embedded::<AdminAssets>(path, "面板没有构建，在 web-admin/ 下运行 npm run build", known);
+        return embedded::<AdminAssets>(
+            path,
+            "面板没有构建，在 web-admin/ 下运行 npm run build",
+            known,
+            &shell,
+        );
     }
 
-    let theme = app.db.get("theme").unwrap_or_default();
     if let Some(root) = external_theme(&app.themes, &theme) {
-        if let Some(response) = disk(&root, path, known) {
+        if let Some(response) = disk(&root, path, known, &shell) {
             return response;
         }
     }
-    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known)
+    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known, &shell)
+}
+
+/// Names each icon in an HTML shell with a stamp of what decides it, so a
+/// changed icon is a new URL. Chrome keeps a tab's icon by its URL and, on an
+/// ordinary navigation, shows the one it holds without asking again, whatever
+/// the cache headers say; only a reload fetches it anew. The theme is in the
+/// stamp because the theme's own icon is what an unset site icon serves.
+///
+/// ponytail: a theme update that changes its icon keeps the old stamp, so the
+/// tab shows the old icon until a reload; stamping the served bytes would cover
+/// it at the cost of reading the icon on every shell.
+fn stamp_icons(app: &App, theme: &str, html: Vec<u8>) -> Vec<u8> {
+    let mut text = match String::from_utf8(html) {
+        Ok(text) => text,
+        Err(e) => return e.into_bytes(),
+    };
+    let stamp = |key| {
+        let value = app.db.get(key).unwrap_or_default();
+        hex::encode(Sha256::digest(format!("{theme}\0{value}")))[..8].to_owned()
+    };
+    let (icon, touch) = (stamp("favicon"), stamp("touch_icon"));
+    for (path, stamp) in [
+        ("/favicon.svg", &icon),
+        ("/admin/favicon.svg", &icon),
+        ("/apple-touch-icon.png", &touch),
+        ("/admin/apple-touch-icon.png", &touch),
+    ] {
+        text = text.replace(&format!("\"{path}\""), &format!("\"{path}?v={stamp}\""));
+    }
+    text.into_bytes()
 }
 
 /// Where the panel and the themes name their icons, plus the ones browsers ask
@@ -167,31 +203,38 @@ fn is_asset(path: &str) -> bool {
     path.starts_with("assets/")
 }
 
-fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) -> Response {
+/// Rewrites the shell, `index.html`, on its way out; see [`stamp_icons`].
+type Shell<'a> = &'a dyn Fn(Vec<u8>) -> Vec<u8>;
+
+fn page(path: &str, data: Vec<u8>, known: Option<&str>, shell: Shell) -> Response {
+    asset(path, if path == "index.html" { shell(data) } else { data }, known)
+}
+
+fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>, shell: Shell) -> Response {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(file) = T::get(path) {
-        return asset(path, file.data.into_owned(), known);
+        return page(path, file.data.into_owned(), known, shell);
     }
     if is_asset(path) {
         return answer(StatusCode::NOT_FOUND, format!("没有这个文件：/{path}"));
     }
     match T::get("index.html") {
-        Some(index) => asset("index.html", index.data.into_owned(), known),
+        Some(index) => page("index.html", index.data.into_owned(), known, shell),
         None => answer(StatusCode::NOT_FOUND, remedy),
     }
 }
 
-fn disk(root: &Path, requested: &str, known: Option<&str>) -> Option<Response> {
+fn disk(root: &Path, requested: &str, known: Option<&str>, shell: Shell) -> Option<Response> {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(data) = read_inside(root, path) {
-        return Some(asset(path, data, known));
+        return Some(page(path, data, known, shell));
     }
     // None rather than a 404: an external theme lacking the file defers to the
     // built-in one, which issues the refusal.
     if is_asset(path) {
         return None;
     }
-    read_inside(root, "index.html").map(|data| asset("index.html", data, known))
+    read_inside(root, "index.html").map(|data| page("index.html", data, known, shell))
 }
 
 /// Serves one file with the caching policy its path warrants.
@@ -823,6 +866,29 @@ mod tests {
         assert_eq!(served.headers()[header::CONTENT_TYPE], "image/png");
         assert!(served.headers().contains_key(header::ETAG));
         assert!(served.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("sandbox"));
+    }
+
+    /// A changed icon, or a switched theme whose own icon then serves, must be a
+    /// new URL in the shell: Chrome does not refetch a tab icon it already holds
+    /// on an ordinary navigation.
+    #[test]
+    fn the_shell_names_each_icon_by_what_decides_it() {
+        let app = App::for_test(crate::db::Db::open(":memory:").unwrap());
+        let html = br#"<link rel="icon" href="/favicon.svg" /><link rel="apple-touch-icon" href="/apple-touch-icon.png" />"#;
+        let shell = |theme: &str| String::from_utf8(stamp_icons(&app, theme, html.to_vec())).unwrap();
+        let before = shell("default");
+        assert!(
+            before.contains(r#"href="/favicon.svg?v="#)
+                && before.contains(r#"href="/apple-touch-icon.png?v="#)
+        );
+        assert_ne!(shell("aurora"), before, "another theme's icon");
+
+        app.db.set("favicon", "data:image/png;base64,iVBORw0KGgo=").unwrap();
+        let after = shell("default");
+        assert_ne!(after, before);
+        // Only the icon that changed moves.
+        let touch = |html: &str| html.split("apple-touch-icon.png").nth(1).unwrap().to_owned();
+        assert_eq!(touch(&after), touch(&before));
     }
 
     /// The two guards on a theme name, applied together by the settings page:
