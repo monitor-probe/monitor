@@ -67,6 +67,13 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     if is_api_path(path) {
         return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
+    if ICON_PATHS.contains(&path) {
+        if let Some(Ok((mime, data))) =
+            app.db.get("favicon").filter(|v| !v.is_empty()).as_deref().map(site_icon)
+        {
+            return icon(path, mime, data, known);
+        }
+    }
 
     if path == "admin" || path.starts_with("admin/") {
         let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
@@ -80,6 +87,60 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
         }
     }
     embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known)
+}
+
+/// Where the panel and the themes name their icon, plus the one browsers ask
+/// for unprompted. With a site icon set, all of them answer with it, so the
+/// icon follows the site across theme switches.
+const ICON_PATHS: &[&str] = &["favicon.svg", "favicon.ico", "admin/favicon.svg"];
+
+/// The largest site icon accepted. Stored as a data URL in the settings row,
+/// and saved through the settings route's 64 KiB body limit, which its base64
+/// form (a third larger) fits beneath with room for the rest of the form.
+pub const MAX_ICON: usize = 32 * 1024;
+
+/// Decodes the `favicon` setting, a `data:image/...;base64,` URL, into the
+/// bytes and the type they actually are. The declared type is not trusted: the
+/// browser takes it from the file name, and the response's type comes from the
+/// bytes.
+pub fn site_icon(value: &str) -> Result<(&'static str, Vec<u8>), &'static str> {
+    use base64::Engine;
+    const NOT_IMAGE: &str = "站点图标只支持 PNG、ICO、SVG、WebP、JPEG、GIF";
+    let payload = value
+        .strip_prefix("data:image/")
+        .and_then(|rest| rest.split_once(";base64,"))
+        .map(|(_, payload)| payload)
+        .ok_or(NOT_IMAGE)?;
+    let data = base64::engine::general_purpose::STANDARD.decode(payload).map_err(|_| NOT_IMAGE)?;
+    if data.len() > MAX_ICON {
+        return Err("站点图标不能超过 32 KiB");
+    }
+    let mime = match data.as_slice() {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0, 0, 1, 0, ..] => "image/x-icon",
+        [0xff, 0xd8, 0xff, ..] => "image/jpeg",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        _ if std::str::from_utf8(&data).is_ok_and(|text| text.contains("<svg")) => "image/svg+xml",
+        _ => return Err(NOT_IMAGE),
+    };
+    Ok((mime, data))
+}
+
+/// The site icon under the shell's caching policy: the URL stays while the
+/// bytes change. An SVG opened directly is a document at the hub's origin, so
+/// the sandbox keeps any script in it from running there; as an icon or `<img>`
+/// it never runs scripts anyway.
+fn icon(path: &str, mime: &'static str, data: Vec<u8>, known: Option<&str>) -> Response {
+    let mut response = asset(path, data, known);
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(mime));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+    );
+    response
 }
 
 fn is_api_path(path: &str) -> bool {
@@ -723,6 +784,34 @@ mod tests {
         let hashed = asset("assets/index-CSjcYfL9.js", b"console.log(1)".to_vec(), None);
         assert_eq!(hashed.status(), StatusCode::OK);
         assert_eq!(etag(&hashed), None);
+    }
+
+    /// The bytes decide the type, whatever the data URL declares, and anything
+    /// that is not one of the image formats is refused before it is stored.
+    #[test]
+    fn a_site_icon_is_typed_by_its_bytes() {
+        use base64::Engine;
+        let url = |declared: &str, data: &[u8]| {
+            format!("data:image/{declared};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))
+        };
+        let png = b"\x89PNG\r\n\x1a\n....";
+        assert_eq!(site_icon(&url("png", png)).unwrap(), ("image/png", png.to_vec()));
+        assert_eq!(site_icon(&url("x-icon", b"\0\0\x01\0rest")).unwrap().0, "image/x-icon");
+        assert_eq!(
+            site_icon(&url("png", b"<svg xmlns='http://www.w3.org/2000/svg'/>")).unwrap().0,
+            "image/svg+xml"
+        );
+        assert_eq!(site_icon(&url("webp", b"RIFF\0\0\0\0WEBPVP8 ")).unwrap().0, "image/webp");
+
+        assert!(site_icon(&url("png", b"<html><script>")).is_err());
+        assert!(site_icon("data:text/html;base64,PHN2Zz4=").is_err());
+        assert!(site_icon("data:image/png;base64,not base64!").is_err());
+        assert!(site_icon(&url("png", &[png.as_slice(), &[0; MAX_ICON]].concat())).is_err());
+
+        let served = icon("favicon.svg", "image/png", png.to_vec(), None);
+        assert_eq!(served.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(served.headers().contains_key(header::ETAG));
+        assert!(served.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("sandbox"));
     }
 
     /// The two guards on a theme name, applied together by the settings page:

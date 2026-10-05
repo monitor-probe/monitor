@@ -2576,6 +2576,7 @@ function useSettings() {
 // `onSaved` refreshes what the header shows, the site name among it.
 function SettingsTab({ onSaved }: { onSaved: () => void }) {
   const { s, set, save } = useSettings()
+  const iconPicker = useRef<HTMLInputElement>(null)
   if (!s) return null
 
   return (
@@ -2621,6 +2622,43 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               placeholder="https://ghfast.top"
             />
           </Field>
+          <Field label="站点图标" hint="浏览器标签页上的图标，换主题也保留。PNG、ICO、SVG、WebP 等，32 KiB 以内">
+            <div className="flex items-center gap-2">
+              <div className="flex size-9 shrink-0 items-center justify-center rounded-md border">
+                {s.favicon ? (
+                  <img src={String(s.favicon)} alt="站点图标" className="size-6 object-contain" />
+                ) : (
+                  <span className="text-[10px] text-muted-foreground">默认</span>
+                )}
+              </div>
+              <Button size="sm" variant="outline" onClick={() => iconPicker.current?.click()}>
+                <Upload /> 选择图片
+              </Button>
+              {s.favicon && (
+                <Button size="sm" variant="ghost" onClick={() => set("favicon", "")}>
+                  用主题自带的
+                </Button>
+              )}
+              <input
+                ref={iconPicker}
+                type="file"
+                accept="image/png,image/x-icon,image/svg+xml,image/webp,image/jpeg,image/gif,.ico"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  e.target.value = ""
+                  if (!file) return
+                  if (file.size > 32 * 1024) {
+                    toast.error(`图标不能超过 32 KiB，这张有 ${Math.ceil(file.size / 1024)} KiB`)
+                    return
+                  }
+                  const reader = new FileReader()
+                  reader.onload = () => set("favicon", String(reader.result))
+                  reader.readAsDataURL(file)
+                }}
+              />
+            </div>
+          </Field>
         </div>
         {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
             aria-labelledby 保住读屏软件那边的关联。 */}
@@ -2643,7 +2681,15 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
-              }).then((ok) => ok && onSaved())
+                favicon: String(s.favicon ?? ""),
+              }).then((ok) => {
+                if (!ok) return
+                onSaved()
+                // The tab's icon is cached under its fixed URL; a new query
+                // fetches the one just saved.
+                const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
+                if (link) link.href = `/admin/favicon.svg?${Date.now()}`
+              })
             }
           >
             保存站点设置
