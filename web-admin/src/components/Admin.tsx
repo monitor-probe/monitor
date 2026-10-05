@@ -2614,7 +2614,13 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           </Field>
           <Field
             label="GitHub 代理"
-            hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
+            helpWidth="max-w-58 min-[376px]:max-w-86 min-[432px]:max-w-100"
+            help={
+              <>
+                <p>留空直连。仅在 hub 自己拉不到 GitHub Release 时填。</p>
+                <p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>
+              </>
+            }
           >
             <Input
               value={String(s.github_proxy ?? "")}
