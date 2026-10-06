@@ -2329,7 +2329,7 @@ impl Db {
             "free": free_pages * page_size,
             "oldest": oldest,
             // What the panel shows, counted on the hub's clock: from the browser's,
-            // a clock eight hours off moves the span by a day.
+            // a clock eight hours off would shift the span by up to a day.
             "oldest_ago": oldest.map(|t| (Utc::now().timestamp() - t).max(0)),
             "retention": retention,
             "rows": rows,
@@ -2948,6 +2948,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         assert_eq!(db.stats().unwrap()["oldest"], serde_json::Value::Null, "no history, no start");
+        assert_eq!(db.stats().unwrap()["oldest_ago"], serde_json::Value::Null, "the panel shows a dash");
         assert_eq!(
             db.stats().unwrap()["retention"],
             DEFAULT_RETENTION_DAYS,
