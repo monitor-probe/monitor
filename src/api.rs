@@ -561,9 +561,9 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
     // The panel and both official themes treat 10 s without a frame as a lost
     // stream and reconnect, so the interval must stay well below that.
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-    // A tick held up -- by a vacuum holding the database, say -- is followed by
-    // one frame, not by every tick it missed: those would all be the same
-    // snapshot, 60 of them per tab after a two-minute wait.
+    // A delayed tick, for instance behind a vacuum holding the database, is
+    // followed by one frame rather than by every tick it missed: those would
+    // all carry the same snapshot, 60 of them per tab after a two-minute wait.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {

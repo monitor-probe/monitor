@@ -943,9 +943,11 @@ impl Tally {
 /// waiting in place would take a worker thread with it: on one core with a
 /// browser stream open, a 13 s vacuum would hold every other request for 12.5 s.
 ///
-/// ponytail: each waiter holds a blocking thread, at most 512 by default before
-/// the next waiter stalls a worker again; the same ceiling bounds agents
-/// already, whose frames are handled in `block_in_place`.
+/// ponytail: each waiter holds a blocking thread -- during a vacuum or a
+/// restore, every open browser stream and connected agent, plus each request
+/// arriving meanwhile. Past tokio's default of 512 the next waiter stalls a
+/// worker again; refuse waiters past a limit, as the history charts do, if
+/// hubs reach that.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.try_lock() {
         Ok(guard) => guard,
@@ -988,8 +990,8 @@ impl Db {
         lock(&self.conn)
     }
 
-    /// The connection the history charts and the data page's counts read
-    /// through: the read-only one, or the writer for `:memory:`.
+    /// The connection the history charts read through: the read-only one, or
+    /// the writer for `:memory:`.
     ///
     /// A scan holds its snapshot throughout, and with chart requests queued the
     /// next begins as the last ends, so no commit's checkpoint would find the
@@ -2293,20 +2295,28 @@ impl Db {
     /// `oldest` against `retention` is the one pair here that can indicate a
     /// fault: history older than the window means `prune` has not been running.
     pub fn stats(&self) -> Result<serde_json::Value> {
-        // Before acquiring the reader, which for `:memory:` is the writer that
-        // `retention_days` acquires as well.
+        // Before acquiring the connection, which for `:memory:` is the writer
+        // that `retention_days` acquires as well.
         let retention = self.retention_days();
-        // The reader rather than the writer: the counts scan every row of both
+        // A read-only connection of its own: the counts scan every row of both
         // tiers of history, which on a cold cache means reading most of the
-        // file -- 13 s for 52 MB at 4 MB/s -- and agent reports would wait out
-        // that read.
-        let conn = self.reader();
-        let file = main_file(&conn);
+        // file -- 13 s for 52 MB at 4 MB/s. Through the writer, agent reports
+        // would wait out that read; through the charts' reader, so would the
+        // public page's history charts.
+        let (own, writer);
+        let conn: &Connection = if self.reader.is_some() {
+            own = read_only(&self.file())?;
+            &own
+        } else {
+            writer = self.conn();
+            &writer
+        };
+        let file = main_file(conn);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
         // Across both tiers: history begins at whichever row is earliest, and
         // a minute row can predate the hourly tier while a rollup catches up.
-        let oldest = oldest(&conn, &["metric_hour", "ping_hour", "metric", "ping_record"])?;
+        let oldest = oldest(conn, &["metric_hour", "ping_hour", "metric", "ping_record"])?;
         let mut rows = serde_json::Map::new();
         for table in TABLES {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
@@ -2675,6 +2685,23 @@ mod tests {
             drop(release);
             assert!(outcome.is_ok(), "a timer must fire while a task waits for the writer");
         });
+    }
+
+    /// The data page's counts must not queue behind a history chart holding
+    /// the reader, nor hold it while the public page's charts wait.
+    #[test]
+    fn stats_do_not_take_the_charts_reader() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let chart = db.reader.as_ref().unwrap().lock().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let outcome = std::thread::scope(|s| {
+            s.spawn(|| done.send(db.stats().is_ok()).unwrap());
+            let outcome = finished.recv_timeout(std::time::Duration::from_secs(5));
+            drop(chart);
+            outcome
+        });
+        assert_eq!(outcome, Ok(true), "stats must not wait for the reader");
     }
 
     /// PRAGMA settings are per connection, so a value read through any other
