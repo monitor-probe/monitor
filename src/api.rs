@@ -556,9 +556,21 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
 }
 
 async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>) {
+    // The panel and both official themes treat 10 s without a frame as a lost
+    // stream and reconnect, so the interval must stay well below that.
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            // The browser sends nothing but its close frame, and that is seen only
+            // by reading. Unread, the close goes unanswered: the browser waits out
+            // its 60 s closing handshake while this loop keeps pushing a full frame
+            // every tick to a page that has already discarded the socket.
+            inbound = socket.recv() => match inbound {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => continue,
+            },
+        }
         // Closed rather than downgraded to the public frame, which would leave the
         // panel rendering a list with every admin field missing. The close allows
         // a client to re-query /api/me and determine its current state.

@@ -479,7 +479,6 @@ export function useNodes() {
     let poll: ReturnType<typeof setInterval> | null = null
     let retry: ReturnType<typeof setTimeout> | null = null
     let silent: ReturnType<typeof setTimeout> | null = null
-    let closed = false
 
     // Bumped by `pause`, which a refresh replacing this effect also runs. A
     // request started before then may fail or land after a newer one, and
@@ -548,7 +547,6 @@ export function useNodes() {
       opened.onerror = () => opened.close()
       opened.onclose = () => {
         if (silent) clearTimeout(silent)
-        if (closed) return
         poll ??= setInterval(fetchOnce, 5000)
         retry = setTimeout(connect, 5000)
       }
@@ -582,7 +580,6 @@ export function useNodes() {
     resume()
 
     return () => {
-      closed = true
       document.removeEventListener("visibilitychange", visibility)
       pause()
     }
