@@ -892,8 +892,7 @@ mod tests {
 
         // Client-side routes still fall through to the app.
         assert_eq!(spa("/admin/nodes").await.status(), StatusCode::OK);
-        // The panel's entry is a redirect to its first page, keeping the query
-        // the OAuth callback reports a failed sign-in with.
+        // The panel's entry is a redirect to its first page, keeping the query.
         let entry = spa("/admin?login_error=x").await;
         assert_eq!(entry.headers()[axum::http::header::LOCATION], "/admin/nodes?login_error=x");
         assert_eq!(spa("/").await.status(), StatusCode::OK);

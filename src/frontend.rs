@@ -92,8 +92,7 @@ fn respond(app: &App, path: &str, query: Option<&str>, known: Option<&str>, shel
         let first = "/admin/nodes";
         return Redirect::to(&query.map_or(first.to_owned(), |q| format!("{first}?{q}"))).into_response();
     }
-    if path.starts_with("admin/") {
-        let path = path.trim_start_matches("admin/");
+    if let Some(path) = path.strip_prefix("admin/") {
         return embedded::<AdminAssets>(
             path,
             "面板没有构建，在 web-admin/ 下运行 npm run build",
