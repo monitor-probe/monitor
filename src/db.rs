@@ -2328,6 +2328,9 @@ impl Db {
             "wal": bytes_of(&format!("{file}-wal")),
             "free": free_pages * page_size,
             "oldest": oldest,
+            // What the panel shows, counted on the hub's clock: from the browser's,
+            // a clock eight hours off moves the span by a day.
+            "oldest_ago": oldest.map(|t| (Utc::now().timestamp() - t).max(0)),
             "retention": retention,
             "rows": rows,
         }))
@@ -2953,6 +2956,8 @@ mod tests {
 
         db.insert_metric(id, now - 3 * 86_400, &serde_json::json!({"cpu": 1.0})).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 3 * 86_400);
+        let ago = db.stats().unwrap()["oldest_ago"].as_i64().unwrap();
+        assert!((ago - 3 * 86_400).abs() <= 1, "counted on the hub's clock");
 
         // Older, and in the other table: the earlier of the two prevails. The probe
         // must be assigned, or the result is not this node's to file.

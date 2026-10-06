@@ -3249,8 +3249,8 @@ type DbInfo = {
   size: number
   wal: number
   free: number
-  /** Timestamp of the earliest history row, null on a database with none. */
-  oldest: number | null
+  /** Seconds since the earliest history row on the hub's clock, null on a database with none. */
+  oldest_ago: number | null
   retention: number
   rows: Record<string, number>
 }
@@ -3336,7 +3336,7 @@ function Data() {
           {stat("保留天数", `${info.retention} 天`)}
           {/* 和保留天数并排：跨度小于保留期是还没攒够，大于保留期就是每小时
               那次 prune 没在跑。 */}
-          {stat("历史跨度", info.oldest ? `${Math.floor((Date.now() / 1000 - info.oldest) / 86400)} 天` : "—")}
+          {stat("历史跨度", info.oldest_ago !== null ? `${Math.floor(info.oldest_ago / 86400)} 天` : "—")}
           {DB_ROWS.map(([key, label]) => stat(label, (info.rows[key] ?? 0).toLocaleString()))}
         </div>
         <p className="truncate text-xs text-muted-foreground" title={info.path}>
