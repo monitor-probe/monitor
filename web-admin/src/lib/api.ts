@@ -517,9 +517,10 @@ export function useNodes() {
       }
       socket = opened
       // Re-armed by every frame. Five of the hub's two-second pushes without one
-      // mean the connection died without closing, as when a phone moves between
-      // networks; the browser sends nothing on it and would notice only when TCP
-      // keepalive gives up, 450 s later in Chrome. The stream is replaced rather
+      // mean the connection died without closing, as when a NAT on the path
+      // forgets it or the hub's machine drops off the network; the browser sends
+      // nothing on it and would notice only when TCP keepalive gives up, 450 s
+      // later in Chrome. The stream is replaced rather
       // than closed and awaited: on a dead connection the close event arrives
       // only after the 60 s closing handshake times out. The notice stays until
       // data arrives, since with no network the fetch started alongside may hang
