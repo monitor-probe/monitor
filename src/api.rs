@@ -487,36 +487,68 @@ pub const MAX_FRAME: usize = 64 * 1024;
 /// every tick rebuilds once and no viewer receives a stale frame twice.
 const SNAPSHOT_TTL_MS: i64 = 1_900;
 
-/// The payload every browser stream sends, built at most once per tick however
-/// many tabs are watching: the public page is anonymous, so a per-connection
-/// build would make viewer count a multiplier on database work. Two slots,
-/// because the admin view carries fields the public one must never expose.
-fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
+/// One audience's node list, as every browser stream and `/api/nodes` send it.
+#[derive(Default)]
+pub struct Frame {
+    /// The millisecond it was built.
+    at: i64,
+    json: Utf8Bytes,
+    /// `json` gzipped, made by the first stream that asks for it.
+    gzip: Option<axum::body::Bytes>,
+}
+
+/// Runs `read` on one audience's frame, rebuilt first once it has expired. A
+/// frame is built at most once per tick however many tabs are watching: the
+/// public page is anonymous, so a per-connection build would make viewer count
+/// a multiplier on database work. Two slots, because the admin view carries
+/// fields the public one must never expose.
+fn current<T>(app: &App, full: bool, read: impl FnOnce(&mut Frame) -> T) -> T {
     let now = Utc::now().timestamp_millis();
-    let slot = usize::from(full);
     // Held while the frame is built, so that tabs ticking together build it
     // once; the rest wait for it off the runtime, as for the database.
     let mut cache = db::lock(&app.snapshot);
+    let frame = &mut cache[usize::from(full)];
     // A cached frame's age must be non-negative. A wall clock can step backwards
     // -- NTP correcting a fresh boot -- and against a bare upper bound the
     // resulting negative reads as young, pinning the panel to a stale frame until
     // real time catches up.
-    if (0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(cache[slot].0)) {
-        return cache[slot].1.clone();
+    if !(0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(frame.at)) {
+        let nodes = visible_nodes(app, full).unwrap_or_default();
+        // `admin` is included so the panel's first fetch and its stream share one
+        // cached frame.
+        let json = json!({"nodes": nodes, "admin": full}).to_string().into();
+        *frame = Frame { at: now, json, gzip: None };
     }
-    let nodes = visible_nodes(app, full).unwrap_or_default();
-    // `admin` is included so the panel's first fetch and its stream share one
-    // cached frame.
-    let payload = Utf8Bytes::from(json!({"nodes": nodes, "admin": full}).to_string());
-    cache[slot] = (now, payload.clone());
-    payload
+    read(frame)
+}
+
+fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
+    current(app, full, |frame| frame.json.clone())
+}
+
+/// The frame gzipped, for streams opened with `?gzip`. A hundred reporting
+/// nodes are about 110 KB of JSON every two seconds, 15 KB compressed, for each
+/// page left open. Compressed once per frame, about a millisecond at that size,
+/// however many streams take it.
+fn live_gzip(app: &App, full: bool) -> axum::body::Bytes {
+    current(app, full, |frame| {
+        frame
+            .gzip
+            .get_or_insert_with(|| {
+                let mut packed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                // Into a Vec, which cannot fail.
+                let _ = std::io::Write::write_all(&mut packed, frame.json.as_bytes());
+                packed.finish().unwrap_or_default().into()
+            })
+            .clone()
+    })
 }
 
 /// Drops the cached frames so the next push rebuilds. Without it a node just
 /// added in the panel would disappear from the list until the frame expires.
 fn invalidate_snapshot(app: &App) {
-    for slot in db::lock(&app.snapshot).iter_mut() {
-        slot.0 = 0;
+    for frame in db::lock(&app.snapshot).iter_mut() {
+        frame.at = 0;
     }
 }
 
@@ -541,10 +573,22 @@ fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
     }
 }
 
+#[derive(Deserialize)]
+pub struct Stream {
+    /// Present for each frame gzipped, in a binary message. Without it frames
+    /// are text, which every theme written before it reads.
+    gzip: Option<String>,
+}
+
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
-pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+pub async fn live_ws(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Query(stream): Query<Stream>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
     let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
@@ -554,10 +598,10 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     upgrade
         .read_buffer_size(SOCKET_BUFFER)
         .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| stream_live(app, socket, session))
+        .on_upgrade(move |socket| stream_live(app, socket, session, stream.gzip.is_some()))
 }
 
-async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>) {
+async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>, gzip: bool) {
     // The panel and both official themes treat 10 s without a frame as a lost
     // stream and reconnect, so the interval must stay well below that.
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -581,7 +625,12 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
         // panel rendering a list with every admin field missing. The close allows
         // a client to re-query /api/me and determine its current state.
         let Some(full) = stream_audience(&app, session.as_deref()) else { break };
-        if socket.send(Message::Text(live_snapshot(&app, full))).await.is_err() {
+        let frame = if gzip {
+            Message::Binary(live_gzip(&app, full))
+        } else {
+            Message::Text(live_snapshot(&app, full))
+        };
+        if socket.send(frame).await.is_err() {
             break;
         }
     }
@@ -3164,6 +3213,14 @@ mod tests {
         // same bytes, so the data is modified first.
         node(&app, "late", true);
         assert_eq!(live_snapshot(&app, false), public, "the frame is reused, not rebuilt per viewer");
+
+        let mut unpacked = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(&live_gzip(&app, false)[..]),
+            &mut unpacked,
+        )
+        .unwrap();
+        assert_eq!(unpacked, public.as_str(), "the gzipped frame is the same frame");
     }
 
     #[test]
@@ -3174,7 +3231,7 @@ mod tests {
 
         // NTP correcting a fresh boot leaves the cached stamp in the future, which
         // does not constitute a young frame.
-        app.snapshot.lock().unwrap()[0].0 = Utc::now().timestamp_millis() + 60_000;
+        app.snapshot.lock().unwrap()[0].at = Utc::now().timestamp_millis() + 60_000;
         node(&app, "added-after", true);
         assert!(live_snapshot(&app, false).as_str().contains("added-after"));
     }

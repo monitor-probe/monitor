@@ -64,8 +64,8 @@ pub struct App {
     pub readings: Mutex<HashMap<i64, agent_ws::Reading>>,
     /// Last rendered node list per audience, `[public, admin]`, with the
     /// millisecond it was built. Shared by every browser stream so viewers do
-    /// not multiply the query load. See `api::live_snapshot`.
-    pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    /// not multiply the query load. See `api::current`.
+    pub snapshot: Mutex<[api::Frame; 2]>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
     /// two have different threat models, and a batch install run with a stale
@@ -103,7 +103,7 @@ impl App {
             db,
             agents: RwLock::default(),
             readings: Mutex::default(),
-            snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            snapshot: Mutex::default(),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             http: reqwest::Client::builder()
