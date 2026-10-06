@@ -329,6 +329,22 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
     // connection the agents write through.
+    //
+    // Compressed likewise, once per frame: left to the compression layer, every
+    // request deflates the whole list again, about 6 ms of CPU for a thousand
+    // nodes, and this route answers anyone. Already encoded, the layer passes
+    // it through without adding the Vary it adds to what it compresses.
+    if !full && accepts_gzip(&headers) {
+        return (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CONTENT_ENCODING, "gzip"),
+                (header::VARY, "accept-encoding"),
+            ],
+            live_gzip(&app),
+        )
+            .into_response();
+    }
     let mut res =
         ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
             .into_response();
@@ -545,10 +561,29 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     current(app, full, |frame| frame.json.clone())
 }
 
-/// The public frame gzipped, for streams opened with `?gzip`. A hundred
-/// reporting nodes are about 110 KB of JSON every two seconds, 15 KB compressed,
-/// for each page left open. Compressed once per frame, about a millisecond at
-/// that size, however many streams take it.
+/// Whether `Accept-Encoding` lists gzip with a nonzero weight. A wildcard is
+/// not read as gzip: browsers name gzip itself, and any other request is still
+/// compressed by the compression layer.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|coding| {
+            let mut parts = coding.split(';').map(str::trim);
+            let name = parts.next().unwrap_or_default();
+            let weight = parts
+                .find_map(|p| p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")))
+                .map_or(1.0, |q| q.parse::<f32>().unwrap_or(0.0));
+            (name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip")) && weight > 0.0
+        })
+}
+
+/// The public frame gzipped, for streams opened with `?gzip` and for
+/// `/api/nodes`. A hundred reporting nodes are about 110 KB of JSON every two
+/// seconds, 15 KB compressed, for each page left open. Compressed once per
+/// frame, about a millisecond at that size, however many streams take it.
 fn live_gzip(app: &App) -> axum::body::Bytes {
     current(app, false, |frame| {
         frame
@@ -3268,6 +3303,39 @@ mod tests {
         let cache = |res: Response| res.headers().get(header::CACHE_CONTROL).cloned();
         assert_eq!(cache(nodes(State(app.clone()), signed_in).await).unwrap(), "no-store, no-transform");
         assert_eq!(cache(nodes(State(app), HeaderMap::new()).await), None, "the public list compresses");
+    }
+
+    /// The public list a browser asks for gzipped is the stream's compressed
+    /// frame, the same bytes for every request until the frame expires.
+    #[tokio::test]
+    async fn the_public_node_list_reuses_the_compressed_frame() {
+        let app = std::sync::Arc::new(app());
+        node(&app, "listed", true);
+        let ask = |encoding: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT_ENCODING, encoding.parse().unwrap());
+            headers
+        };
+        let res = nodes(State(app.clone()), ask("br, gzip, deflate")).await;
+        assert_eq!(res.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(res.headers()[header::VARY], "accept-encoding");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(body, live_gzip(&app), "the frame the streams send");
+
+        for refused in ["identity", "gzip;q=0", "br", "*"] {
+            let res = nodes(State(app.clone()), ask(refused)).await;
+            assert!(res.headers().get(header::CONTENT_ENCODING).is_none(), "{refused}");
+        }
+        assert!(nodes(State(app.clone()), ask("GZIP; q=0.5"))
+            .await
+            .headers()
+            .contains_key(header::CONTENT_ENCODING));
+
+        // The admin list is never compressed, asked or not.
+        app.db.create_session(&sha256("live-token"), Utc::now().timestamp() + 3_600).unwrap();
+        let mut signed_in = ask("gzip");
+        signed_in.insert(header::COOKIE, format!("{}=live-token", crate::auth::COOKIE).parse().unwrap());
+        assert!(nodes(State(app), signed_in).await.headers().get(header::CONTENT_ENCODING).is_none());
     }
 
     #[test]
