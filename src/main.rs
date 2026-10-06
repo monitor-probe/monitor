@@ -504,6 +504,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
+        .route("/api/nodes/{id}/ping-tasks", put(api::set_node_ping_tasks))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
@@ -890,7 +891,10 @@ mod tests {
         assert_eq!(spa("/api").await.status(), StatusCode::NOT_FOUND);
 
         // Client-side routes still fall through to the app.
-        assert_eq!(spa("/admin").await.status(), StatusCode::OK);
+        assert_eq!(spa("/admin/nodes").await.status(), StatusCode::OK);
+        // The panel's entry is a redirect to its first page, keeping the query.
+        let entry = spa("/admin?login_error=x").await;
+        assert_eq!(entry.headers()[axum::http::header::LOCATION], "/admin/nodes?login_error=x");
         assert_eq!(spa("/").await.status(), StatusCode::OK);
         // A path merely beginning with "api" is not an API path.
         assert_eq!(spa("/apiary").await.status(), StatusCode::OK);
