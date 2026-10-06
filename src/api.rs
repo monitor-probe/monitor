@@ -9,7 +9,7 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{Local, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -175,7 +175,13 @@ fn addresses<'a>(
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
-fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool, today: NaiveDate) -> Value {
+fn node_view(
+    node: &Node,
+    current: Option<&Agent>,
+    traffic: &Traffic,
+    full: bool,
+    now: DateTime<Local>,
+) -> Value {
     // The three capacities arrive twice: once in `Facts`, sent at the handshake,
     // and again in every `Metrics`. The stored figure follows the reports a
     // minute at a time and as the session ends, so it lags a disk mounted while
@@ -190,6 +196,10 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
+    // The live entry while connected, the stored one afterwards. Zero means
+    // connected but not yet reporting, which is not a timestamp, so it falls
+    // back to the stored value and "offline since" survives the gap.
+    let last_seen = current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen);
     let mut view = json!({
         "id": node.id,
         "name": node.name,
@@ -205,10 +215,12 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
-        // The live entry while connected, the stored one afterwards. Zero means
-        // connected but not yet reporting, which is not a timestamp, so it falls
-        // back to the stored value and "offline since" survives the gap.
-        "last_seen": current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen),
+        "last_seen": last_seen,
+        // Counted on the hub's clock, for the same reason as `expires_in`: a page
+        // subtracting `last_seen` from its own clock is off by as much as that
+        // clock is, and one eight hours fast shows a node that dropped a minute
+        // ago as offline for eight hours. Null for a node never seen.
+        "last_seen_ago": (last_seen > 0).then(|| (now.timestamp() - last_seen).max(0)),
         "metrics": current.map(|a| a.metrics.clone()).unwrap_or(Value::Null),
         "os": node.os,
         "kernel": node.kernel,
@@ -228,7 +240,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // on the visitor's clock would, with the hub on UTC and the visitor on
         // UTC+8, show every online node expired for eight hours each cycle
         // before the hub rolls its date forward.
-        "expires_in": node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|d| (d - today).num_days()),
+        "expires_in": node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|d| (d - now.date_naive()).num_days()),
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
         "traffic_reset_day": node.traffic_reset_day,
@@ -302,11 +314,11 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     let traffic = app.db.all_traffic();
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
-    let today = Local::now().date_naive();
+    let now = Local::now();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, today))
+        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, now))
         .collect())
 }
 
@@ -3342,6 +3354,11 @@ mod tests {
         // The live entry went with the connection, so "offline since" must come
         // from the node row.
         assert_eq!(view["last_seen"], 1_700_000_000);
+        let ago = view["last_seen_ago"].as_i64().unwrap();
+        assert!((Utc::now().timestamp() - 1_700_000_000 - ago).abs() <= 1, "counted on the hub's clock");
+
+        node(&app, "never", true);
+        assert_eq!(visible_nodes(&app, true).unwrap()[1]["last_seen_ago"], Value::Null, "never seen");
     }
 
     /// A capacity arrives twice -- once in the facts stored at the handshake, and

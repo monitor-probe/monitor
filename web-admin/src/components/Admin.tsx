@@ -1674,10 +1674,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                         the pills' width that the text spills out of evenly, so a
                         long duration does not widen the slot and move the
                         pills off the axis the other rows share. */}
-                    {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
+                    {!n.online && (n.last_seen_ago ?? 0) >= 60 && (
                       <div className="flex w-14 justify-center">
                         <span className="tnum text-xs whitespace-nowrap text-muted-foreground">
-                          {uptime(Date.now() / 1000 - n.last_seen)}
+                          {uptime(n.last_seen_ago ?? 0)}
                         </span>
                       </div>
                     )}

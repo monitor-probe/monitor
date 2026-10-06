@@ -29,6 +29,8 @@ export type Node = {
   public: boolean
   online: boolean
   last_seen: number
+  // Seconds since `last_seen` on the hub's clock, null for a node never seen.
+  last_seen_ago: number | null
   metrics: Metrics | null
   os: string
   kernel: string
