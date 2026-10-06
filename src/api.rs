@@ -494,7 +494,9 @@ const SNAPSHOT_TTL_MS: i64 = 1_900;
 fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     let now = Utc::now().timestamp_millis();
     let slot = usize::from(full);
-    let mut cache = app.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+    // Held while the frame is built, so that tabs ticking together build it
+    // once; the rest wait for it off the runtime, as for the database.
+    let mut cache = db::lock(&app.snapshot);
     // A cached frame's age must be non-negative. A wall clock can step backwards
     // -- NTP correcting a fresh boot -- and against a bare upper bound the
     // resulting negative reads as young, pinning the panel to a stale frame until
@@ -513,7 +515,7 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
 /// Drops the cached frames so the next push rebuilds. Without it a node just
 /// added in the panel would disappear from the list until the frame expires.
 fn invalidate_snapshot(app: &App) {
-    for slot in app.snapshot.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+    for slot in db::lock(&app.snapshot).iter_mut() {
         slot.0 = 0;
     }
 }
@@ -559,6 +561,10 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
     // The panel and both official themes treat 10 s without a frame as a lost
     // stream and reconnect, so the interval must stay well below that.
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    // A tick held up -- by a vacuum holding the database, say -- is followed by
+    // one frame, not by every tick it missed: those would all be the same
+    // snapshot, 60 of them per tab after a two-minute wait.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -1387,9 +1393,8 @@ fn scratch_path(app: &App, kind: &str) -> String {
 ///
 /// Off the runtime, like the three routes below: `stats` counts every row of
 /// both tiers of history -- all WITHOUT ROWID, so each count is a full index
-/// scan -- holding the connection the agents report through throughout. At
-/// 2.2M rows that is 127 ms during which the public page and every agent report
-/// also wait, growing with `retention_days`.
+/// scan -- 127 ms at 2.2M rows with the file cached, growing with
+/// `retention_days`, and uncached, as long as reading the file takes.
 pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
     match tokio::task::spawn_blocking(move || app.db.stats()).await {
         Ok(Ok(stats)) => Json(stats).into_response(),
