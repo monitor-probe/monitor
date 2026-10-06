@@ -974,9 +974,20 @@ pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderM
     let key = random_token();
     let until = (Utc::now().timestamp() + REGISTER_WINDOW).to_string();
     match app.db.set("register_key", &key).and_then(|()| app.db.set("register_until", &until)) {
-        Ok(()) => Json(json!({"register_key": key, "register_until": until})).into_response(),
+        Ok(()) => Json(json!({"register_key": key, "register_left": REGISTER_WINDOW})).into_response(),
         Err(e) => fail(e),
     }
+}
+
+/// Seconds the registration window has left, 0 when none is open. What the
+/// panel counts down from, rather than the stored deadline: compared with the
+/// browser's clock, a deadline is off by as much as that clock is. A browser
+/// eight hours fast -- Windows and Linux sharing a machine in UTC+8 -- would hide
+/// the command of an open window, and one eight hours slow would show it for
+/// eight hours after the key stopped working.
+fn register_left(app: &App) -> i64 {
+    let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    (until - Utc::now().timestamp()).clamp(0, REGISTER_WINDOW)
 }
 
 /// Closes the window early, before the hour elapses.
@@ -2023,10 +2034,9 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     );
     // Read-only here. A window is opened and closed through its own route, so the
     // key is always one the hub generated, and `save_settings` continues to refuse
-    // both names.
-    for key in ["register_key", "register_until"] {
-        out.insert(key.into(), json!(app.db.get(key).unwrap_or_default()));
-    }
+    // both stored names.
+    out.insert("register_key".into(), json!(app.db.get("register_key").unwrap_or_default()));
+    out.insert("register_left".into(), json!(register_left(&app)));
     crate::notify::settings(&app, &mut out);
     Json(Value::Object(out))
 }
@@ -3226,6 +3236,7 @@ mod tests {
 
         assert_eq!(open_register(Admin, State(app.clone()), panel_headers()).await.status(), StatusCode::OK);
         let key = app.db.get("register_key").unwrap();
+        assert!(register_left(&app) > REGISTER_WINDOW - 5, "the panel counts down from the full hour");
         assert_eq!(register(Some("guess"), "a").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(register(None, "a").await.status(), StatusCode::FORBIDDEN);
         assert!(app.db.nodes().unwrap().is_empty());
@@ -3246,6 +3257,7 @@ mod tests {
         // An hour later the same key is worthless, which is what makes leaving the
         // window open harmless.
         app.db.set("register_until", &(Utc::now().timestamp() - 1).to_string()).unwrap();
+        assert_eq!(register_left(&app), 0);
         assert_eq!(register(Some(&key), "b").await.status(), StatusCode::FORBIDDEN);
 
         // Reopened, then closed manually: the key from the open window stops

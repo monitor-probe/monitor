@@ -1229,15 +1229,24 @@ function useVersions() {
 }
 
 // The window lives on the hub; this reads it back and counts down, which is also
-// what makes an expired one disappear from the panel without interaction.
+// what makes an expired one disappear from the panel without interaction. The hub
+// reports the seconds left rather than the deadline, so the countdown runs from
+// the moment its answer arrives and needs this browser's clock to keep time, not
+// to agree with the hub's.
 function useRegisterWindow() {
   const [key, setKey] = useState("")
   const [until, setUntil] = useState(0)
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
+  const begin = (key: string, left: number) => {
+    const at = Math.floor(Date.now() / 1000)
+    setKey(key)
+    setNow(at)
+    setUntil(at + left)
+  }
 
   useEffect(() => {
     api<Settings>("/settings")
-      .then((s) => { setKey(String(s.register_key ?? "")); setUntil(Number(s.register_until ?? 0)) })
+      .then((s) => begin(String(s.register_key ?? ""), Number(s.register_left ?? 0)))
       .catch(() => {})
     const timer = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000)
     return () => clearInterval(timer)
@@ -1248,9 +1257,8 @@ function useRegisterWindow() {
     left: key === "" ? 0 : Math.max(0, until - now),
     async open() {
       try {
-        const w = await api<{ register_key: string; register_until: string }>("/register-window", { method: "POST" })
-        setKey(w.register_key)
-        setUntil(Number(w.register_until))
+        const w = await api<{ register_key: string; register_left: number }>("/register-window", { method: "POST" })
+        begin(w.register_key, w.register_left)
       } catch (e) {
         toast.error((e as Error).message)
       }
