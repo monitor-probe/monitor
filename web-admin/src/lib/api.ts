@@ -28,8 +28,9 @@ export type Node = {
   name: string
   public: boolean
   online: boolean
-  last_seen: number
-  // Seconds since `last_seen` on the hub's clock, null for a node never seen.
+  // Seconds since the last report on the hub's clock, null for a node never
+  // seen. The hub also sends the timestamp, which the panel leaves alone:
+  // against this browser's clock it is off by as much as that clock is.
   last_seen_ago: number | null
   metrics: Metrics | null
   os: string
