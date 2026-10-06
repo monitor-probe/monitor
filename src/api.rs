@@ -526,12 +526,12 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     current(app, full, |frame| frame.json.clone())
 }
 
-/// The frame gzipped, for streams opened with `?gzip`. A hundred reporting
-/// nodes are about 110 KB of JSON every two seconds, 15 KB compressed, for each
-/// page left open. Compressed once per frame, about a millisecond at that size,
-/// however many streams take it.
-fn live_gzip(app: &App, full: bool) -> axum::body::Bytes {
-    current(app, full, |frame| {
+/// The public frame gzipped, for streams opened with `?gzip`. A hundred
+/// reporting nodes are about 110 KB of JSON every two seconds, 15 KB compressed,
+/// for each page left open. Compressed once per frame, about a millisecond at
+/// that size, however many streams take it.
+fn live_gzip(app: &App) -> axum::body::Bytes {
+    current(app, false, |frame| {
         frame
             .gzip
             .get_or_insert_with(|| {
@@ -575,8 +575,9 @@ fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
 
 #[derive(Deserialize)]
 pub struct Stream {
-    /// Present for each frame gzipped, in a binary message. Without it frames
-    /// are text, which every theme written before it reads.
+    /// Present for each public frame gzipped, in a binary message; the admin
+    /// frame stays text. Without it frames are text, which every theme written
+    /// before it reads.
     gzip: Option<String>,
 }
 
@@ -625,8 +626,12 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
         // panel rendering a list with every admin field missing. The close allows
         // a client to re-query /api/me and determine its current state.
         let Some(full) = stream_audience(&app, session.as_deref()) else { break };
-        let frame = if gzip {
-            Message::Binary(live_gzip(&app, full))
+        // The admin frame stays uncompressed, asked or not: it carries every
+        // node's token and address beside strings an agent reports, and the
+        // length of each compressed frame, every two seconds on the wire,
+        // would let one rogue agent guess the rest a character at a time.
+        let frame = if gzip && !full {
+            Message::Binary(live_gzip(&app))
         } else {
             Message::Text(live_snapshot(&app, full))
         };
@@ -3215,12 +3220,10 @@ mod tests {
         assert_eq!(live_snapshot(&app, false), public, "the frame is reused, not rebuilt per viewer");
 
         let mut unpacked = String::new();
-        std::io::Read::read_to_string(
-            &mut flate2::read::GzDecoder::new(&live_gzip(&app, false)[..]),
-            &mut unpacked,
-        )
-        .unwrap();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&live_gzip(&app)[..]), &mut unpacked)
+            .unwrap();
         assert_eq!(unpacked, public.as_str(), "the gzipped frame is the same frame");
+        assert_eq!(live_gzip(&app).as_ptr(), live_gzip(&app).as_ptr(), "compressed once per frame");
     }
 
     #[test]

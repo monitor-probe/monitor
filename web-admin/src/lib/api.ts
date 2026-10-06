@@ -28,7 +28,10 @@ export type Node = {
   name: string
   public: boolean
   online: boolean
-  last_seen: number
+  // Seconds since the last report on the hub's clock, null for a node never
+  // seen. The hub also sends the timestamp, which the panel leaves alone:
+  // against this browser's clock it is off by as much as that clock is.
+  last_seen_ago: number | null
   metrics: Metrics | null
   os: string
   kernel: string
@@ -462,18 +465,6 @@ export async function upload<T>(
 }
 
 /**
- * Asks the hub to gzip each pushed frame, sent then as a binary message: a
- * hundred reporting nodes are about 110 KB of JSON every two seconds, 15 KB
- * compressed. Only where the browser can decompress it; elsewhere frames stay
- * text.
- */
-const GZIP = typeof DecompressionStream === "function" ? "?gzip" : ""
-
-/** A pushed frame as text: a gzipped one arrives as binary. */
-const frameText = (data: string | Blob) =>
-  typeof data === "string" ? data : new Response(data.stream().pipeThrough(new DecompressionStream("gzip"))).text()
-
-/**
  * Live node list. Uses the WebSocket the hub pushes every two seconds, falling
  * back to polling if it cannot be established.
  */
@@ -515,7 +506,7 @@ export function useNodes() {
         })
     }
 
-    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws${GZIP}`
+    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`
     // A hub restart closes every stream. Without reconnecting, a page that
     // outlives a deploy would remain on the fallback poll for the rest of its
     // life, refreshing at a fifth of the live rate with no indication.
@@ -545,25 +536,17 @@ export function useNodes() {
         }, 10_000)
       }
       watch()
-      // In arrival order: a gzipped frame decodes asynchronously, and one that
-      // finishes after this stream was replaced describes nothing current.
-      let decoded = Promise.resolve()
       opened.onmessage = (event) => {
         watch()
-        decoded = decoded
-          .then(async () => {
-            const frame = JSON.parse(await frameText(event.data))
-            if (socket !== opened) return
-            setNodes(frame.nodes)
-            setAdmin(frame.admin)
-            setError(null)
-            // The stream has returned; the poll was only covering for it.
-            if (poll) {
-              clearInterval(poll)
-              poll = null
-            }
-          })
-          .catch(() => {})
+        const frame = JSON.parse(event.data)
+        setNodes(frame.nodes)
+        setAdmin(frame.admin)
+        setError(null)
+        // The stream has returned; the poll was only covering for it.
+        if (poll) {
+          clearInterval(poll)
+          poll = null
+        }
       }
       opened.onerror = () => opened.close()
       opened.onclose = () => {
