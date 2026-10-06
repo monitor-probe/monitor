@@ -132,11 +132,9 @@
   [data-slot="switch"], input[type="checkbox"] { cursor: pointer; }
 }
 
-/* While a row is dragged, the grabbing cursor follows the pointer across the
-   page, and neither a slow press nor the drag itself starts a text selection.
-   Unlayered, so it outranks the utilities layer. */
-body[data-dragging] { user-select: none; -webkit-user-select: none; }
-body[data-dragging] * { cursor: grabbing; }
+/* A drag keeps the grabbing cursor wherever the pointer goes. Unlayered, so it
+   outranks the utilities. */
+:root:has(tr[data-dragging]) * { cursor: grabbing; }
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }

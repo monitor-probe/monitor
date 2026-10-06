@@ -51,24 +51,17 @@ function slide(rows: HTMLTableSectionElement | null, update: () => void) {
 // release, so a filtered table must disable its handles: the rows on screen are
 // then not `order`.
 //
-// Built on pointer events, not the HTML5 drag-and-drop API: that one only
-// starts from a mouse, so on a touch screen the handle did nothing at all --
-// and where a mobile browser does synthesize a drag from a touch, Android
-// reports a `dropEffect` of "none" on every release, which the API's own
-// save-or-cancel check reads as a failed drag. Pointer events serve mouse,
-// touch and pen through one path.
+// Pointer events, not HTML5 drag and drop: a touch never starts a native drag,
+// and where Android synthesizes one from a long press, `dropEffect` reads
+// "none" on every release, so each drop counted as cancelled.
 function useDragOrder<T extends { id: number }>(items: T[], path: string, reload: () => void) {
   const [manualOrder, setManualOrder] = useState<number[]>([])
   const [dragging, setDragging] = useState<number | null>(null)
-  const [announce, setAnnounce] = useState("")
   const orderBeforeDrag = useRef<number[]>([])
-  // The row the last `move` displaced, which the announcement is about.
-  const moved = useRef<number | null>(null)
   const body = useRef<HTMLTableSectionElement | null>(null)
-  // The pointer that owns the drag: its id, so a second finger is ignored, and
-  // its last position, which the auto-scroll loop replays when the page slides
-  // on under a finger that is holding still.
-  const pointer = useRef<{ id: number; x: number; y: number } | null>(null)
+  // The pointer that owns the drag and where it last was: a scroll moves rows
+  // under a pointer that holds still.
+  const pointer = useRef({ id: 0, x: 0, y: 0 })
   // One save in flight at a time, so two quick reorders reach the hub in order.
   const saving = useRef<Promise<unknown>>(Promise.resolve())
   const byId = new Map(items.map((item) => [item.id, item]))
@@ -85,103 +78,71 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     setManualOrder([])
   }
 
-  // Whether the point is over the table, header row included: a drag to the
-  // top readily overshoots onto it, and a release there would otherwise
-  // discard the drag.
-  function inside(clientX: number, clientY: number) {
-    const rows = body.current
-    if (!rows) return false
-    const table = rows.parentElement!.getBoundingClientRect()
-    return clientX >= table.left && clientX <= table.right && clientY >= table.top && clientY <= table.bottom
-  }
-
-  // Displaces the dragged row to the place the pointer would then rest on.
-  // Called for every pointer move, and again by the auto-scroll loop with the
-  // last position when the page slides. Positions come from layout, not from
-  // the row under the pointer: a sliding row is drawn away from its place, and
-  // the one under the pointer mid-slide is not the one it would displace.
-  function at(clientX: number, clientY: number) {
-    if (dragging === null || !inside(clientX, clientY)) return
-    const list = [...body.current!.rows]
-    // Offsets count from the rows' container, which does not slide.
-    const y = clientY - list[0].offsetParent!.getBoundingClientRect().top
-    const from = list.findIndex((row) => row.dataset.id === String(dragging))
-    const to = list.findIndex((row) => y >= row.offsetTop && y < row.offsetTop + row.offsetHeight)
-    if (from < 0 || to < 0 || from === to) return
-    // Moved only where the pointer would then rest on the dragged row. Rows
-    // differ in height: a short row moved past a tall one would leave the
-    // tall one under the pointer, and the two would swap back and forth.
-    const target = list[to]
-    const height = list[from].offsetHeight
-    if (to > from ? y < target.offsetTop + target.offsetHeight - height : y >= target.offsetTop + height) return
-    move(dragging, to)
-  }
-
-  // The drag itself: every move is measured against the table, and a release
-  // inside saves the order while one anywhere else restores it. Re-attached on
-  // every render, since `at` displaces rows through the order of the render it
-  // was built in.
+  // Handled on the document by layout position, not by the row under the
+  // pointer: a sliding row is drawn away from its place, and the one under the
+  // pointer mid-slide is not the one it would displace. Re-attached on every
+  // render, since `order` changes as rows are displaced.
   useEffect(() => {
     const rows = body.current
     if (dragging === null || !rows) return
-    const over = (e: PointerEvent) => {
-      const p = pointer.current
-      if (!p || e.pointerId !== p.id) return
-      if (e.type === "pointerup") return inside(e.clientX, e.clientY) ? save(ids()) : cancel()
-      if (e.type === "pointercancel") return cancel()
+    const p = pointer.current
+    // The header row counts as inside: a drag to the top readily overshoots
+    // onto it, and a release there would otherwise discard the drag.
+    const inside = () => {
+      const table = rows.parentElement!.getBoundingClientRect()
+      return p.x >= table.left && p.x <= table.right && p.y >= table.top && p.y <= table.bottom
+    }
+    const at = () => {
+      if (!inside()) return
+      const list = [...rows.rows]
+      // Offsets count from the rows' container, which does not slide.
+      const y = p.y - list[0].offsetParent!.getBoundingClientRect().top
+      const from = list.findIndex((row) => row.dataset.id === String(dragging))
+      const to = list.findIndex((row) => y >= row.offsetTop && y < row.offsetTop + row.offsetHeight)
+      if (from < 0 || to < 0 || from === to) return
+      // Moved only where the pointer would then rest on the dragged row. Rows
+      // differ in height: a short row moved past a tall one would leave the
+      // tall one under the pointer, and the two would swap back and forth.
+      const target = list[to]
+      const height = list[from].offsetHeight
+      if (to > from ? y < target.offsetTop + target.offsetHeight - height : y >= target.offsetTop + height) return
+      move(dragging, to)
+    }
+    const onPointer = (e: PointerEvent) => {
+      if (e.pointerId !== p.id) return
       p.x = e.clientX
       p.y = e.clientY
-      at(e.clientX, e.clientY)
+      if (e.type === "pointermove") at()
+      else if (e.type === "pointerup" && inside()) save(ids())
+      else cancel()
     }
-    // The browser turns a native drag's Escape into a cancel; this one is ours
-    // to take.
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") cancel()
-    }
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && cancel()
     const types = ["pointermove", "pointerup", "pointercancel"] as const
-    for (const type of types) document.addEventListener(type, over)
+    for (const type of types) document.addEventListener(type, onPointer)
     document.addEventListener("keydown", onKey)
+    addEventListener("scroll", at)
     return () => {
-      for (const type of types) document.removeEventListener(type, over)
+      for (const type of types) document.removeEventListener(type, onPointer)
       document.removeEventListener("keydown", onKey)
+      removeEventListener("scroll", at)
     }
   })
 
-  // A touch gesture captured by a handle never scrolls the page (`touch-action:
-  // none`), so a drag held near an edge scrolls it instead: the closer to the
-  // edge, the faster, up to a speed a quick reorder cannot outrun. Rows slide
-  // under a finger that holds still, so every scrolled frame re-runs the
-  // displacement at the last position.
+  // A touch on the handle never scrolls the page (`touch-none`), so a drag held
+  // near the top or bottom edge scrolls it, faster the closer it gets.
   useEffect(() => {
     if (dragging === null) return
-    let raf = 0
     let last = performance.now()
     const step = (now: number) => {
-      raf = requestAnimationFrame(step)
-      const dt = Math.min(32, now - last) / 1000
+      const edge = Math.min(120, innerHeight / 4)
+      const { y } = pointer.current
+      const depth = (Math.max(0, y - innerHeight + edge) - Math.max(0, edge - y)) / edge
+      scrollBy(0, (Math.max(-1, Math.min(1, depth)) * 900 * Math.min(32, now - last)) / 1000)
       last = now
-      const p = pointer.current
-      if (!p) return
-      const edge = Math.min(120, window.innerHeight / 4)
-      const depth = p.y < edge ? (edge - p.y) / edge : p.y > window.innerHeight - edge ? (p.y - window.innerHeight + edge) / edge : 0
-      if (depth <= 0) return
-      const before = window.scrollY
-      window.scrollBy(0, (p.y < edge ? -1 : 1) * 900 * Math.min(1, depth) * dt)
-      if (window.scrollY !== before) at(p.x, p.y)
+      frame = requestAnimationFrame(step)
     }
-    raf = requestAnimationFrame(step)
-    return () => cancelAnimationFrame(raf)
-  })
-
-  // Wherever the pointer goes, the cursor stays grabbing and neither a long
-  // press nor the drag itself starts a text selection. See the rule in
-  // index.css.
-  useEffect(() => {
-    if (dragging === null) return
-    document.body.dataset.dragging = ""
-    return () => {
-      delete document.body.dataset.dragging
-    }
+    let frame = requestAnimationFrame(step)
+    return () => cancelAnimationFrame(frame)
   }, [dragging])
 
   function move(id: number, to: number) {
@@ -189,7 +150,6 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     const from = next.indexOf(id)
     if (from < 0 || to < 0 || to >= next.length || from === to) return
     next.splice(to, 0, ...next.splice(from, 1))
-    moved.current = id
     slide(body.current, () => setManualOrder(next))
     return next
   }
@@ -197,22 +157,15 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
   // Dropped outside the table or cancelled with Escape: the order is restored.
   function cancel() {
     setDragging(null)
-    pointer.current = null
     const before = orderBeforeDrag.current
-    if (before.length) {
-      setAnnounce("已取消排序")
-      slide(body.current, () => setManualOrder(before))
-    }
+    if (before.length) slide(body.current, () => setManualOrder(before))
   }
 
   function save(next: number[]) {
     setDragging(null)
-    pointer.current = null
     const before = orderBeforeDrag.current
     if (!before.length || next.join() === before.join()) return
     orderBeforeDrag.current = next
-    const to = moved.current === null ? -1 : next.indexOf(moved.current)
-    if (to >= 0) setAnnounce(`已移动到第 ${to + 1} 位，共 ${next.length} 个`)
     const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
     // A refusal falls back to whatever the hub holds, which a save queued
     // behind it may still change.
@@ -225,12 +178,6 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
 
   return {
     order,
-    // The slide passes unnoticed by a keyboard, whose reorder is spoken here.
-    live: (
-      <div role="status" aria-live="polite" className="sr-only">
-        {announce}
-      </div>
-    ),
     row: (id: number) => ({
       "data-id": id,
       "data-dragging": dragging === id || undefined,
@@ -241,20 +188,14 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     }),
     handle: (id: number) => ({
       onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
-        if (e.currentTarget.disabled || dragging !== null) return
-        // A second finger, or any button but the left one, is not a drag.
-        if (!e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return
-        // Cancelled so the press starts no text selection -- the drag moves the
-        // row, not the highlight -- and the focus that costs is taken by hand,
-        // since the arrow keys work from it. The press starts the drag at once:
-        // the handle is already the "pick up" affordance, and a long-press wait
-        // would only be a second, undiscoverable gesture.
-        e.preventDefault()
-        e.currentTarget.focus({ preventScroll: true })
-        e.currentTarget.setPointerCapture(e.pointerId)
-        pointer.current = { id: e.pointerId, x: e.clientX, y: e.clientY }
+        if (e.currentTarget.disabled || dragging !== null || e.button !== 0) return
         orderBeforeDrag.current = ids()
-        body.current = e.currentTarget.closest("tbody")
+        body.current = e.currentTarget.closest("tbody")!
+        // Captured by the rows' container, which stays put: the handle's row
+        // is moved in the document as it is displaced, and that releases a
+        // capture it holds, so a release outside the window went unseen.
+        body.current.setPointerCapture(e.pointerId)
+        pointer.current = { id: e.pointerId, x: e.clientX, y: e.clientY }
         setDragging(id)
       },
       onKeyDown: (e: React.KeyboardEvent) => {
@@ -275,13 +216,10 @@ function DragHandle({ name, disabled, title = "拖动排序", ...events }: React
     <button
       type="button"
       disabled={disabled}
-      // touch-none keeps the page still for the whole of a gesture that starts
-      // here; select-none and the callout opt-out keep a slow press from being
-      // read as the start of a text selection. Fingers get a larger target.
-      className="cursor-grab touch-none rounded p-1 text-muted-foreground select-none [-webkit-touch-callout:none] hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent [@media(pointer:coarse)]:p-2"
+      // A larger target for a finger.
+      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent pointer-coarse:p-2"
       title={title}
       aria-label={`拖动 ${name} 排序`}
-      onContextMenu={(e) => e.preventDefault()}
       {...events}
     >
       <GripVertical className="size-4" />
@@ -1631,7 +1569,6 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
 
   return (
     <div className="space-y-4">
-      {drag.live}
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <div className="mr-auto flex w-full gap-2 sm:w-auto">
@@ -2116,7 +2053,6 @@ function Ping({ nodes }: { nodes: Node[] }) {
   if (!tasks) return null
   return (
     <div className="space-y-4">
-      {drag.live}
       <div className="flex items-center justify-between gap-2">
         <div role="group" aria-label="视图" className="inline-flex rounded-lg bg-muted p-0.5">
           {(["task", "node"] as const).map((v) => (
