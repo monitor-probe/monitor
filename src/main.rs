@@ -817,15 +817,19 @@ fn until_next_hour<Tz: TimeZone>(now: DateTime<Tz>) -> std::time::Duration {
 /// transfer. Nor an answer marked `no-transform`, which Cloudflare leaves
 /// uncompressed as well: the admin node list, whose secrets sit beside strings an
 /// agent reports, so that the length of a compressed copy would let one rogue
-/// agent guess them a character at a time.
+/// agent guess them a character at a time. nginx's gzip ignores the directive,
+/// so a proxy configured to compress JSON compresses this answer regardless.
 fn compressible() -> impl Predicate {
     tower_http::compression::predicate::DefaultPredicate::new()
         .and(tower_http::compression::predicate::NotForContentType::const_new("application/octet-stream"))
         .and(|status: StatusCode, _: Version, headers: &HeaderMap, _: &Extensions| {
+            // Directives are case-insensitive and comma-separated.
             let no_transform = headers
-                .get(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("no-transform"));
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .any(|d| d.trim().eq_ignore_ascii_case("no-transform"));
             status != StatusCode::SWITCHING_PROTOCOLS && !no_transform
         })
 }
@@ -866,6 +870,11 @@ mod tests {
         };
         assert!(compressible().should_compress(&json(None)));
         assert!(!compressible().should_compress(&json(Some("no-store, no-transform"))));
+        assert!(!compressible().should_compress(&json(Some("No-Transform"))), "directives ignore case");
+        assert!(
+            compressible().should_compress(&json(Some("x-no-transform-ext"))),
+            "only the directive itself"
+        );
     }
 
     /// Whichever wildcard this kernel supports must parse and carry the default
