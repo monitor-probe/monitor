@@ -1237,17 +1237,27 @@ function useRegisterWindow() {
   const [key, setKey] = useState("")
   const [until, setUntil] = useState(0)
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
+  // Advanced by every read sent and every change that lands, so an answer
+  // overtaken by either is dropped rather than restoring a replaced key.
+  const epoch = useRef(0)
   const begin = (key: string, left: number) => {
     const at = Math.floor(Date.now() / 1000)
     setKey(key)
     setNow(at)
     setUntil(at + left)
   }
+  // Also run as the dialog opens: the window may have been closed or reopened
+  // from another device since this page loaded, and the command shown must
+  // carry the key the hub holds now.
+  const sync = () => {
+    const at = ++epoch.current
+    api<Settings>("/settings")
+      .then((s) => at === epoch.current && begin(String(s.register_key ?? ""), Number(s.register_left ?? 0)))
+      .catch(() => {})
+  }
 
   useEffect(() => {
-    api<Settings>("/settings")
-      .then((s) => begin(String(s.register_key ?? ""), Number(s.register_left ?? 0)))
-      .catch(() => {})
+    sync()
     const timer = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000)
     return () => clearInterval(timer)
   }, [])
@@ -1255,9 +1265,11 @@ function useRegisterWindow() {
   return {
     key,
     left: key === "" ? 0 : Math.max(0, until - now),
+    sync,
     async open() {
       try {
         const w = await api<{ register_key: string; register_left: number }>("/register-window", { method: "POST" })
+        epoch.current++
         begin(w.register_key, w.register_left)
       } catch (e) {
         toast.error((e as Error).message)
@@ -1266,6 +1278,7 @@ function useRegisterWindow() {
     async close() {
       try {
         await api("/register-window", { method: "DELETE" })
+        epoch.current++
         setKey("")
         setUntil(0)
         toast.success("注册窗口已关闭")
@@ -1601,7 +1614,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
         </Button>
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
-        <Button variant="outline" disabled={!!refusal} onClick={() => setRegistering(true)}>
+        <Button variant="outline" disabled={!!refusal} onClick={() => { reg.sync(); setRegistering(true) }}>
           <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
         </Button>
         <Button disabled={!!refusal} onClick={() => setCreating(true)}>
@@ -2592,7 +2605,7 @@ function Themes() {
   )
 }
 
-type Settings = Record<string, string | boolean>
+type Settings = Record<string, string | boolean | number>
 
 // Two pages write settings, and each loads only what it displays.
 function useSettings() {

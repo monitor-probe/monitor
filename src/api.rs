@@ -912,7 +912,7 @@ pub async fn agent_register(
     let closed = || {
         answer(StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
     };
-    let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let until = register_until(&app);
     let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && Utc::now().timestamp() < until)
     else {
         return closed();
@@ -986,8 +986,13 @@ pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderM
 /// the command of an open window, and one eight hours slow would show it for
 /// eight hours after the key stopped working.
 fn register_left(app: &App) -> i64 {
-    let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
-    (until - Utc::now().timestamp()).clamp(0, REGISTER_WINDOW)
+    (register_until(app) - Utc::now().timestamp()).clamp(0, REGISTER_WINDOW)
+}
+
+/// The stored deadline, 0 when none was ever set. One reading for the gate in
+/// `agent_register` and the panel's countdown, so the two cannot disagree.
+fn register_until(app: &App) -> i64 {
+    app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)
 }
 
 /// Closes the window early, before the hour elapses.
