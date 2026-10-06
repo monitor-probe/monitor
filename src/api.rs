@@ -273,8 +273,8 @@ fn node_view(
             m.insert(key.into(), json!(value));
         }
     }
-    // Address, private notes and the token never leave the panel. The token is
-    // included so the install command can be displayed without reissuing it.
+    // Address and private notes never leave the panel. The token is not here at
+    // all: the panel reads it from `node_token` as it shows the install command.
     if full {
         let held = (node.ipv4.as_str(), node.ipv6.as_str());
         let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
@@ -301,7 +301,6 @@ fn node_view(
         view["country_pin"] = json!(node.country_pin);
         view["country_auto"] = json!(node.country);
         view["remark"] = json!(node.remark);
-        view["token"] = json!(node.token);
         view["notify"] = json!(node.notify);
     }
     view
@@ -334,7 +333,7 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
         ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
             .into_response();
     // Uncompressed by the hub and by Cloudflare, as the admin stream is: every
-    // node's token and address beside strings an agent reports.
+    // node's address and private notes beside strings an agent reports.
     if full {
         res.headers_mut()
             .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-transform"));
@@ -647,7 +646,7 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
         // a client to re-query /api/me and determine its current state.
         let Some(full) = stream_audience(&app, session.as_deref()) else { break };
         // The admin frame stays uncompressed, asked or not: it carries every
-        // node's token and address beside strings an agent reports, and the
+        // node's address and private notes beside strings an agent reports, and the
         // length of each compressed frame, every two seconds on the wire,
         // would let one rogue agent guess the rest a character at a time.
         let frame = if gzip && !full {
@@ -1202,12 +1201,25 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // agent reconnects and is refused. Its own teardown leaves the entry
     // untouched, because the session tag no longer matches.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    // The token is part of the admin frame, which would otherwise continue to
-    // display an install command for the credential just retired.
+    // The node shows offline at once rather than when the frame expires.
     invalidate_snapshot(&app);
     // The token alone: the panel builds the command, and one place needs to know
     // its form.
     Json(json!({"token": token})).into_response()
+}
+
+/// A node's token, for the install command the panel shows. Not part of the
+/// node list, where it would share an answer with strings agents report: a
+/// proxy compressing that answer would let one rogue agent guess it a character
+/// at a time from the compressed length.
+pub async fn node_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.node(id) {
+        Ok(Some(node)) => {
+            ([(header::CACHE_CONTROL, "no-store")], Json(json!({"token": node.token}))).into_response()
+        }
+        Ok(None) => no_such_node(),
+        Err(e) => fail(e),
+    }
 }
 
 pub async fn patch_traffic(
@@ -2803,6 +2815,10 @@ mod tests {
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
+        assert!(
+            !serde_json::to_string(&admin).unwrap().contains("token-of-open"),
+            "the token is read on its own, never beside what agents report"
+        );
         // The panel reads `iface` and nothing else the contract leaves out.
         assert_eq!(admin[0]["metrics"]["iface"], "eth1");
         for hidden in ["boot_id", "net_rx_total", "hostname", "ip"] {
@@ -2919,6 +2935,13 @@ mod tests {
 
         let response = reset_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
         assert_eq!(response.status(), StatusCode::OK);
+        let issued = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let read = node_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
+        assert_eq!(
+            axum::body::to_bytes(read.into_body(), 1024).await.unwrap(),
+            issued,
+            "the panel reads the new token"
+        );
         // The agent loop selects on this receiver, so a closed channel is how it
         // learns to stop. `try_recv`, because `recv().await` on a channel
         // incorrectly left open would hang the suite rather than fail it.
@@ -3049,6 +3072,7 @@ mod tests {
         assert_eq!(update_node(Admin, state(), Path(9), patch).await.status(), StatusCode::NOT_FOUND);
         assert_eq!(delete_node(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
         assert_eq!(reset_token(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(node_token(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
         let traffic = Json(TrafficPatch { total_rx: Some(1), ..Default::default() });
         assert_eq!(patch_traffic(Admin, state(), Path(9), traffic).await.status(), StatusCode::NOT_FOUND);
     }

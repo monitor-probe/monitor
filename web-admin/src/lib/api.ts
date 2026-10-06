@@ -83,8 +83,6 @@ export type Node = {
   remark?: string
   /** Set by hand and public. Absent from a hub predating it. */
   public_remark?: string
-  /** Panel only. */
-  token?: string
   /** Panel only. Whether going offline and returning are announced. */
   notify?: boolean
 }

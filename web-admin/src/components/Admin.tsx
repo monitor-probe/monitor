@@ -1456,19 +1456,33 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   onClose: () => void
   onRotated: () => void
 }) {
-  const [token, setToken] = useState(node.token ?? "")
+  const [token, setToken] = useState("")
+  const [unread, setUnread] = useState("")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
   const interval = useIntervalOption(node.interval)
 
-  const command = iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
+  // Read as the dialog opens rather than carried in the node list, where it
+  // would share an answer with strings agents report. A token rotated meanwhile
+  // is newer and kept.
+  useEffect(() => {
+    let live = true
+    api<{ token: string }>(`/nodes/${node.id}/token`)
+      .then((t) => live && setToken((held) => held || t.token))
+      .catch((e) => live && setUnread((e as Error).message))
+    return () => { live = false }
+  }, [node.id])
+
+  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
+  const placeholder = unread ? `读取凭证失败：${unread}` : !token ? "正在读取凭证…" : "网卡名有误，改正后显示命令"
 
   async function rotate() {
     setRotating(true)
     try {
       const fresh = await api<{ token: string }>(`/nodes/${node.id}/token`, { method: "POST" })
       setToken(fresh.token)
+      setUnread("")
       setConfirmRotate(false)
       toast.success("凭证已换发，需用新命令重装")
       onRotated()
@@ -1497,7 +1511,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           <section className="space-y-2 border-t pt-5">
             <h3 className="text-sm font-medium">安装命令</h3>
             <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
-              {command || "网卡名有误，改正后显示命令"}
+              {command || placeholder}
             </Command>
           </section>
           <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
