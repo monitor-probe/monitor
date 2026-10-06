@@ -70,7 +70,10 @@ COOKIE=$(curl -fsS -D - -o /dev/null -H 'content-type: application/json' -d "{\"
 curl -fsS -o /dev/null -H "Cookie: $COOKIE" -H 'Origin: https://hub.example.com' -H 'Sec-Fetch-Site: same-origin' \
 	-H 'content-type: application/json' -d '{"name":"e2e","remark":"e2e-remark"}' "$URL/api/nodes" ||
 	fail "creating a node was refused"
-TOKEN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes" | jq -r '.nodes[0].token // empty')
+# The token is read on its own, as the install dialog does: the node list
+# carries strings agents report and must not carry it beside them.
+ID=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes" | jq -r '.nodes[0].id // empty')
+TOKEN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes/$ID/token" | jq -r '.token // empty')
 [ -n "$TOKEN" ] || fail "the panel shows no token for the new node"
 
 "$AGENT" --server "$URL" --token "$TOKEN" --interval 1 >"$DIR/agent.log" 2>&1 &
@@ -85,16 +88,18 @@ ADMIN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes")
 
 # The public check below would pass on a node that has no private fields at
 # all, so the panel's view must carry them first.
-echo "$ADMIN" | jq -e '.nodes[0] | .remark == "e2e-remark" and (.hostname // "") != "" and (.ip // "") != "" and (.token // "") != ""' \
+echo "$ADMIN" | jq -e '.nodes[0] | .remark == "e2e-remark" and (.hostname // "") != "" and (.ip // "") != ""' \
 	>/dev/null || fail "the panel's view lacks the private fields: $ADMIN"
+echo "$ADMIN" | jq -e --arg t "$TOKEN" 'any(.. | strings; contains($t)) | not' >/dev/null ||
+	fail "the node list carries the token beside what agents report: $ADMIN"
 
 # No address, hostname, note or token reaches a visitor, neither under its own
 # key nor as a value anywhere else in the response.
-LEAKED=$(jq -nc --argjson a "$ADMIN" --argjson p "$PUBLIC" '
+LEAKED=$(jq -nc --argjson a "$ADMIN" --argjson p "$PUBLIC" --arg t "$TOKEN" '
 	[$p.nodes[0] | keys[] | select(IN("ip", "ipv4", "ipv6", "ipv4_pin", "ipv6_pin", "ipv4_auto", "ipv6_auto", "addresses", "hostname",
 		"remark", "token"))]
 	+ ([$p | .. | strings] as $shown
-		| [$a.nodes[0] | .ip, .ipv4, .ipv6, .hostname, .remark, .token | select(. != "" and IN($shown[]))])')
+		| [($a.nodes[0] | .ip, .ipv4, .ipv6, .hostname, .remark), $t | select(. != "" and IN($shown[]))])')
 [ "$LEAKED" = "[]" ] || fail "the public view discloses $LEAKED: $PUBLIC"
 
 # Both official themes drop a node from the page when any of these is not a
