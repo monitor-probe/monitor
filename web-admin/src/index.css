@@ -134,7 +134,7 @@
 
 /* A drag keeps the grabbing cursor wherever the pointer goes. Unlayered, so it
    outranks the utilities. */
-:root:has(tr[data-dragging]) * { cursor: grabbing; }
+:root[data-dragging] * { cursor: grabbing; }
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }

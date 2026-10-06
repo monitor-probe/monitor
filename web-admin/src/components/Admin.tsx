@@ -53,15 +53,15 @@ function slide(rows: HTMLTableSectionElement | null, update: () => void) {
 //
 // Pointer events, not HTML5 drag and drop: a touch never starts a native drag,
 // and where Android synthesizes one from a long press, `dropEffect` reads
-// "none" on every release, so each drop counted as cancelled.
+// "none" on every release, so each drop would count as cancelled.
 function useDragOrder<T extends { id: number }>(items: T[], path: string, reload: () => void) {
   const [manualOrder, setManualOrder] = useState<number[]>([])
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
   const body = useRef<HTMLTableSectionElement | null>(null)
-  // The pointer that owns the drag and where it last was: a scroll moves rows
-  // under a pointer that holds still.
-  const pointer = useRef({ id: 0, x: 0, y: 0 })
+  // The pointer that owns the drag, where it was pressed, and where it last
+  // was: a scroll moves rows under a pointer that holds still.
+  const pointer = useRef({ id: 0, x: 0, y: 0, y0: 0 })
   // One save in flight at a time, so two quick reorders reach the hub in order.
   const saving = useRef<Promise<unknown>>(Promise.resolve())
   const byId = new Map(items.map((item) => [item.id, item]))
@@ -112,7 +112,10 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
       if (e.pointerId !== p.id) return
       p.x = e.clientX
       p.y = e.clientY
-      if (e.type === "pointermove") at()
+      // A move with no button down follows a release the page never saw, as
+      // when a context menu took it; the drag would otherwise trail the
+      // pointer until the next click saved wherever it was.
+      if (e.type === "pointermove" && e.buttons) at()
       else if (e.type === "pointerup" && inside()) save(ids())
       else cancel()
     }
@@ -128,21 +131,31 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     }
   })
 
-  // A touch on the handle never scrolls the page (`touch-none`), so a drag held
-  // near the top or bottom edge scrolls it, faster the closer it gets.
+  // While a drag lasts. A touch on the handle never scrolls the page
+  // (`touch-none`), so a drag held near the top or bottom edge scrolls it,
+  // faster the closer it gets -- only toward the edge it has moved toward, or
+  // a press on a row near the edge would scroll rows under a still pointer.
+  // The cursor is flagged on the root once per drag: a `:has()` on the dragged
+  // row would restyle the whole page on every displacement, 25 times the style
+  // work of a drag across 200 nodes.
   useEffect(() => {
     if (dragging === null) return
-    let last = performance.now()
+    const root = document.documentElement
+    root.dataset.dragging = ""
+    let last = 0
     const step = (now: number) => {
       const edge = Math.min(120, innerHeight / 4)
-      const { y } = pointer.current
-      const depth = (Math.max(0, y - innerHeight + edge) - Math.max(0, edge - y)) / edge
-      scrollBy(0, (Math.max(-1, Math.min(1, depth)) * 900 * Math.min(32, now - last)) / 1000)
+      const { y, y0 } = pointer.current
+      const depth = y > y0 ? Math.max(0, y - innerHeight + edge) : -Math.max(0, edge - y)
+      scrollBy(0, (Math.max(-1, Math.min(1, depth / edge)) * 900 * Math.min(32, last && now - last)) / 1000)
       last = now
       frame = requestAnimationFrame(step)
     }
     let frame = requestAnimationFrame(step)
-    return () => cancelAnimationFrame(frame)
+    return () => {
+      cancelAnimationFrame(frame)
+      delete root.dataset.dragging
+    }
   }, [dragging])
 
   function move(id: number, to: number) {
@@ -193,9 +206,9 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
         body.current = e.currentTarget.closest("tbody")!
         // Captured by the rows' container, which stays put: the handle's row
         // is moved in the document as it is displaced, and that releases a
-        // capture it holds, so a release outside the window went unseen.
+        // capture it holds, so a release outside the window would go unseen.
         body.current.setPointerCapture(e.pointerId)
-        pointer.current = { id: e.pointerId, x: e.clientX, y: e.clientY }
+        pointer.current = { id: e.pointerId, x: e.clientX, y: e.clientY, y0: e.clientY }
         setDragging(id)
       },
       onKeyDown: (e: React.KeyboardEvent) => {
@@ -216,8 +229,8 @@ function DragHandle({ name, disabled, title = "拖动排序", ...events }: React
     <button
       type="button"
       disabled={disabled}
-      // A larger target for a finger.
-      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent pointer-coarse:p-2"
+      // A larger target for a finger, and no text selection from a press.
+      className="cursor-grab touch-none rounded p-1 text-muted-foreground select-none hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent pointer-coarse:p-2"
       title={title}
       aria-label={`拖动 ${name} 排序`}
       {...events}
