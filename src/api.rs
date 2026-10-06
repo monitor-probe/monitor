@@ -330,8 +330,16 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
     // connection the agents write through.
-    ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
-        .into_response()
+    let mut res =
+        ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
+            .into_response();
+    // Uncompressed by the hub and by Cloudflare, as the admin stream is: every
+    // node's token and address beside strings an agent reports.
+    if full {
+        res.headers_mut()
+            .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store, no-transform"));
+    }
+    res
 }
 
 #[derive(Deserialize)]
@@ -3225,6 +3233,17 @@ mod tests {
         app.db.set("public_page", "off").unwrap();
         assert_eq!(stream_audience(&app, None), None, "closing the status page must end anonymous streams");
         assert_eq!(stream_audience(&app, Some(&hash)), Some(true), "a signed-in operator still gets theirs");
+    }
+
+    #[tokio::test]
+    async fn only_the_admin_node_list_is_marked_no_transform() {
+        let app = std::sync::Arc::new(app());
+        app.db.create_session(&sha256("live-token"), Utc::now().timestamp() + 3_600).unwrap();
+        let mut signed_in = HeaderMap::new();
+        signed_in.insert(header::COOKIE, format!("{}=live-token", crate::auth::COOKIE).parse().unwrap());
+        let cache = |res: Response| res.headers().get(header::CACHE_CONTROL).cloned();
+        assert_eq!(cache(nodes(State(app.clone()), signed_in).await).unwrap(), "no-store, no-transform");
+        assert_eq!(cache(nodes(State(app), HeaderMap::new()).await), None, "the public list compresses");
     }
 
     #[test]
