@@ -80,7 +80,7 @@ TOKEN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes/$ID/token" | jq -r '.toke
 AGENT_PID=$!
 wait_for "the node to report" reported
 # The panel's frame is cached for up to 1.9 s, and nothing an agent does renews
-# it, so the one taken above for the token may still predate the connection.
+# it, so the one read above for the node's id may still predate the connection.
 sleep 2
 
 PUBLIC=$(curl -fsS "$URL/api/nodes")

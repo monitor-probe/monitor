@@ -1172,8 +1172,8 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
   return site && `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).join(" ")}`
 }
 
-// Built here rather than fetched: the node list already carries the token, so
-// viewing an install command is a read rather than an action. Reissuing one to
+// Built here rather than fetched: the install dialog reads the token on its own,
+// so viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
 function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
   return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
@@ -1475,7 +1475,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   }, [node.id])
 
   const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
-  const placeholder = unread ? `读取凭证失败：${unread}` : !token ? "正在读取凭证…" : "网卡名有误，改正后显示命令"
+  const placeholder = token ? "网卡名有误，改正后显示命令" : unread ? `读取凭证失败：${unread}` : "正在读取凭证…"
 
   async function rotate() {
     setRotating(true)
@@ -1488,6 +1488,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
       onRotated()
     } catch (e) {
       toast.error((e as Error).message)
+      // The rotation may have taken effect with its answer lost on the way, and
+      // the command shown would then carry a retired token. Whichever holds now.
+      api<{ token: string }>(`/nodes/${node.id}/token`).then((t) => setToken(t.token)).catch(() => {})
     } finally {
       setRotating(false)
     }

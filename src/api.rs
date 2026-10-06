@@ -576,10 +576,10 @@ fn invalidate_snapshot(app: &App) {
 /// open to anonymous callers, and nothing once either ceases to hold.
 ///
 /// Both are checked every tick rather than at the handshake alone, because a
-/// socket outlives both answers. The admin frame carries every node's token in
-/// the clear, so one outliving its session would distribute credentials that
-/// survive revocation -- the same gap `reset_token` closes on the agent side by
-/// dropping its sender. The public frame is what an operator withdraws by
+/// socket outlives both answers. The admin frame carries every node's address
+/// and private notes, so one outliving its session would keep disclosing them
+/// after the session was revoked -- the gap `reset_token` closes on the agent
+/// side by dropping its sender. The public frame is what an operator withdraws by
 /// switching the status page off, and a socket opened a minute earlier would
 /// continue sending it for as long as the tab stayed open: `live_ws` refuses new
 /// anonymous connections from that moment and `nodes` answers them 401, leaving
@@ -903,8 +903,8 @@ pub async fn create_node(
     node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &token) {
-        // Usable immediately: the install command is readable from the node list,
-        // so adding and deploying require no reissue in between.
+        // Usable immediately: the install dialog reads the token as it opens, so
+        // adding and deploying require no reissue in between.
         Ok(id) => {
             invalidate_snapshot(&app);
             Json(json!({"id": id})).into_response()
@@ -3233,7 +3233,7 @@ mod tests {
 
     /// A stream outlives the request that opened it, so everything the handshake
     /// tested must be re-read rather than captured -- both answers, not one. The
-    /// admin frame carries every node's token in the clear, and the public frame
+    /// admin frame carries every node's address and private notes, and the public frame
     /// is what switching the status page off is meant to withdraw; a socket
     /// surviving either decision would continue sending what was withdrawn.
     #[test]
