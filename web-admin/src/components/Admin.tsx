@@ -2973,6 +2973,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
   const [testing, setTesting] = useState(false)
   if (!s) return null
   const text = (k: string) => String(s[k] ?? "")
+  const synology = text("notify_webhook_provider") === "synology_chat"
   // A credential is sent only when something was typed: the field starts empty
   // because the hub never returns the stored value.
   const typed = (...keys: string[]) =>
@@ -3048,6 +3049,15 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
       </ChannelCard>
 
       <ChannelCard title="Webhook" configured={!!s.notify_webhook_url_set}>
+        <Field label="类型">
+          <Select value={synology ? "synology_chat" : "generic"} onValueChange={(v) => set("notify_webhook_provider", v)}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="generic">通用 JSON</SelectItem>
+              <SelectItem value="synology_chat">群晖 Chat</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
         <Field label="URL" hint={secretHint("notify_webhook_url")}>
           <Input
             type="password"
@@ -3057,7 +3067,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             onChange={(e) => set("notify_webhook_url", e.target.value)}
           />
         </Field>
-        <Field label="请求头" hint={`可选，一行一个。${s.notify_webhook_headers_set ? "已设置，留空不变" : ""}`}>
+        <Field label="请求头" hint={`可选，一行一个。${s.notify_webhook_headers_set ? "已设置，留空不变。" : ""}${synology ? "发送格式由程序自动设置。" : ""}`}>
           <textarea
             rows={2}
             className={TEXTAREA}
@@ -3066,14 +3076,29 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             onChange={(e) => set("notify_webhook_headers", e.target.value)}
           />
         </Field>
-        <Field label="请求体" hint={`以 POST 发送，Content-Type 为 application/json。占位符 ${PLACEHOLDERS}，须写在引号内`}>
-          <textarea rows={4} className={TEXTAREA} value={text("notify_webhook_body")} onChange={(e) => set("notify_webhook_body", e.target.value)} />
-        </Field>
-        <TemplatePreview template={text("notify_webhook_body")} site={text("site_name") || "Monitor"} json />
+        {synology ? (
+          <>
+            <Field label="消息模板" hint={`纯文本。占位符 ${PLACEHOLDERS}。程序自动转换为群晖需要的格式，无须填写 JSON 或 payload。`}>
+              <textarea rows={4} className={TEXTAREA} value={text("notify_synology_text")} onChange={(e) => set("notify_synology_text", e.target.value)} />
+            </Field>
+            <TemplatePreview template={text("notify_synology_text")} site={text("site_name") || "Monitor"} />
+          </>
+        ) : (
+          <>
+            <Field label="请求体" hint={`以 POST 发送，Content-Type 为 application/json。占位符 ${PLACEHOLDERS}，须写在引号内`}>
+              <textarea rows={4} className={TEXTAREA} value={text("notify_webhook_body")} onChange={(e) => set("notify_webhook_body", e.target.value)} />
+            </Field>
+            <TemplatePreview template={text("notify_webhook_body")} site={text("site_name") || "Monitor"} json />
+          </>
+        )}
         <div className="flex gap-2">
           <Button
             size="sm"
-            onClick={() => save({ notify_webhook_body: text("notify_webhook_body"), ...typed("notify_webhook_url", "notify_webhook_headers") })}
+            onClick={() => save({
+              notify_webhook_provider: synology ? "synology_chat" : "generic",
+              ...(synology ? { notify_synology_text: text("notify_synology_text") } : { notify_webhook_body: text("notify_webhook_body") }),
+              ...typed("notify_webhook_url", "notify_webhook_headers"),
+            })}
           >
             保存 Webhook
           </Button>

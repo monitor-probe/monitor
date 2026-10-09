@@ -3793,6 +3793,8 @@ mod tests {
             "notify_telegram_chat": read["notify_telegram_chat"],
             "notify_telegram_text": read["notify_telegram_text"],
             "notify_webhook_body": read["notify_webhook_body"],
+            "notify_webhook_provider": read["notify_webhook_provider"],
+            "notify_synology_text": read["notify_synology_text"],
         });
         assert_eq!(
             save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(echoed)).await.status(),
@@ -3800,6 +3802,51 @@ mod tests {
             "a fresh hub's own settings must survive a round trip"
         );
         assert_eq!(app.db.retention_days(), 30, "and the stored window is the one that was shown");
+    }
+
+    #[tokio::test]
+    async fn webhook_providers_preserve_templates_and_reject_invalid_settings() {
+        let app = std::sync::Arc::new(app());
+        let Json(fresh) = settings(Admin, State(app.clone())).await;
+        assert_eq!(fresh["notify_webhook_provider"], "generic");
+        assert_eq!(fresh["notify_synology_text"], crate::notify::DEFAULT_SYNOLOGY_TEXT);
+        for provider in ["synology_chat", "generic", "synology_chat"] {
+            let response = save_settings(
+                Admin,
+                State(app.clone()),
+                HeaderMap::new(),
+                Json(json!({
+                    "notify_webhook_provider": provider,
+                    "notify_webhook_body": r#"{"text":"{{message}}"}"#,
+                    "notify_synology_text": "自定义 {{title}}\n{{message}}",
+                })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let Json(read) = settings(Admin, State(app.clone())).await;
+            assert_eq!(read["notify_webhook_provider"], provider);
+            assert_eq!(read["notify_webhook_body"], r#"{"text":"{{message}}"}"#);
+            assert_eq!(read["notify_synology_text"], "自定义 {{title}}\n{{message}}");
+        }
+        let invalid = save_settings(
+            Admin,
+            State(app.clone()),
+            HeaderMap::new(),
+            Json(json!({"notify_webhook_provider":"other", "notify_synology_text":"must not be stored"})),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.get("notify_synology_text").as_deref(), Some("自定义 {{title}}\n{{message}}"));
+        let reset = save_settings(
+            Admin,
+            State(app.clone()),
+            HeaderMap::new(),
+            Json(json!({"notify_synology_text":""})),
+        )
+        .await;
+        assert_eq!(reset.status(), StatusCode::OK);
+        let Json(read) = settings(Admin, State(app)).await;
+        assert_eq!(read["notify_synology_text"], crate::notify::DEFAULT_SYNOLOGY_TEXT);
     }
 
     #[tokio::test]

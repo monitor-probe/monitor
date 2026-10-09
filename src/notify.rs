@@ -1,4 +1,4 @@
-//! Outbound alerts through a Telegram bot, a webhook with a JSON body template,
+//! Outbound alerts through a Telegram bot, a JSON or Synology Chat webhook,
 //! or both. Channels are read from the settings at send time, so a panel edit
 //! applies to the next alert.
 //!
@@ -66,6 +66,8 @@ const FLAP_GRACE: i64 = 1_800;
 pub const DEFAULT_BODY: &str =
     r#"{"event":"{{event}}","node":"{{node}}","title":"{{title}}","message":"{{message}}"}"#;
 pub const DEFAULT_TEXT: &str = "{{title}}\n{{message}}";
+pub const DEFAULT_SYNOLOGY_TEXT: &str = "{{title}}\n{{message}}\n{{time}}";
+const SYNOLOGY_RESPONSE_LIMIT: usize = 64 * 1024;
 
 /// Numeric settings as `(key, min, max, default, the panel's name for it)`.
 const NUMBERS: [(&str, i64, i64, i64, &str); 3] = [
@@ -114,6 +116,11 @@ pub fn settings(app: &App, out: &mut serde_json::Map<String, Value>) {
     out.insert("notify_telegram_chat".into(), json!(app.db.get("notify_telegram_chat").unwrap_or_default()));
     out.insert("notify_telegram_text".into(), json!(template(app, "notify_telegram_text", DEFAULT_TEXT)));
     out.insert("notify_webhook_body".into(), json!(template(app, "notify_webhook_body", DEFAULT_BODY)));
+    out.insert("notify_webhook_provider".into(), json!(webhook_provider(app)));
+    out.insert(
+        "notify_synology_text".into(),
+        json!(template(app, "notify_synology_text", DEFAULT_SYNOLOGY_TEXT)),
+    );
     for key in SECRETS {
         out.insert(format!("{key}_set"), json!(setting(app, key).is_some()));
     }
@@ -131,6 +138,8 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let problem = match key {
         "notify_login" => (!matches!(value, "on" | "off")).then_some("登录提醒只能是 on 或 off"),
+        "notify_webhook_provider" => (!matches!(value, "generic" | "synology_chat"))
+            .then_some("Webhook 类型只能是通用 JSON 或群晖 Chat"),
         "notify_webhook_headers" => return parse_headers(value).err(),
         // Empty clears a channel's field, or restores a template's default.
         "notify_telegram_token"
@@ -142,7 +151,7 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
         {
             None
         }
-        "notify_telegram_text" => None,
+        "notify_telegram_text" | "notify_synology_text" => None,
         // Interpolated into the request path, so only the shape BotFather issues
         // is accepted.
         "notify_telegram_token" => {
@@ -238,6 +247,7 @@ fn render(template: &str, note: &Note, site: &str, json: bool) -> String {
 enum Channel {
     Telegram { token: String, chat: String, text: String },
     Webhook { url: String, headers: String, body: String },
+    SynologyChat { url: String, headers: String, text: String },
 }
 
 impl Channel {
@@ -245,7 +255,16 @@ impl Channel {
         match self {
             Channel::Telegram { .. } => "Telegram",
             Channel::Webhook { .. } => "Webhook",
+            Channel::SynologyChat { .. } => "群晖 Chat",
         }
+    }
+}
+
+fn webhook_provider(app: &App) -> &'static str {
+    if app.db.get("notify_webhook_provider").as_deref() == Some("synology_chat") {
+        "synology_chat"
+    } else {
+        "generic"
     }
 }
 
@@ -262,7 +281,15 @@ fn channels(app: &App) -> Vec<Channel> {
     }
     if let Some(url) = setting(app, "notify_webhook_url") {
         let headers = app.db.get("notify_webhook_headers").unwrap_or_default();
-        out.push(Channel::Webhook { url, headers, body: template(app, "notify_webhook_body", DEFAULT_BODY) });
+        out.push(if webhook_provider(app) == "synology_chat" {
+            Channel::SynologyChat {
+                url,
+                headers,
+                text: template(app, "notify_synology_text", DEFAULT_SYNOLOGY_TEXT),
+            }
+        } else {
+            Channel::Webhook { url, headers, body: template(app, "notify_webhook_body", DEFAULT_BODY) }
+        });
     }
     out
 }
@@ -277,6 +304,54 @@ struct Failure {
     retry: bool,
     reason: String,
     shown: String,
+}
+
+/// Custom headers may carry credentials. Synology's form content type must
+/// remain correct even when a JSON channel's old headers are still stored.
+fn webhook_headers(text: &str, content_type: &'static str, lock_type: bool) -> Result<HeaderMap, Failure> {
+    let mut map = HeaderMap::new();
+    map.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    let headers =
+        parse_headers(text).map_err(|reason| Failure { retry: false, shown: reason.clone(), reason })?;
+    for (name, value) in headers {
+        if !lock_type || name != CONTENT_TYPE {
+            map.insert(name, value);
+        }
+    }
+    Ok(map)
+}
+
+fn synology_failure(shown: String) -> Failure {
+    // Never quote the response: it may echo a token, URL or message contents.
+    Failure { retry: false, reason: shown.clone(), shown }
+}
+
+async fn synology_result(mut response: reqwest::Response) -> Result<(), Failure> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| Failure {
+        retry: true,
+        shown: if e.is_timeout() { "请求超时" } else { "读取群晖返回内容失败" }.into(),
+        reason: format!("{:#}", anyhow::Error::from(e.without_url())),
+    })? {
+        if chunk.len() > SYNOLOGY_RESPONSE_LIMIT - body.len() {
+            return Err(synology_failure("群晖返回内容过大，无法确认发送成功".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let parsed: Value = serde_json::from_slice(&body)
+        .map_err(|_| synology_failure("群晖返回内容不是有效的 JSON，无法确认发送成功".into()))?;
+    match parsed.get("success").and_then(Value::as_bool) {
+        Some(true) => Ok(()),
+        Some(false) => {
+            let shown = match parsed.pointer("/error/code").and_then(Value::as_u64) {
+                Some(152) => "群晖未识别到有效消息内容（错误码 152）".into(),
+                Some(code) => format!("群晖拒收了这条消息（错误码 {code}），请检查集成设置"),
+                None => "群晖拒收了这条消息，请检查集成设置".into(),
+            };
+            Err(synology_failure(shown))
+        }
+        None => Err(synology_failure("群晖没有返回成功标志，无法确认发送成功".into())),
+    }
 }
 
 /// The client alerts are sent with, separate from `App::http` because it must not
@@ -309,17 +384,13 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
             // `insert` into one map: `RequestBuilder::header` and `HeaderMap::extend`
             // both append, which would send a configured Content-Type alongside the
             // default instead of in its place.
-            let mut map = HeaderMap::new();
-            map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            let headers = parse_headers(headers).map_err(|reason| Failure {
-                retry: false,
-                shown: reason.clone(),
-                reason,
-            })?;
-            for (name, value) in headers {
-                map.insert(name, value);
-            }
+            let map = webhook_headers(headers, "application/json", false)?;
             client().post(url).headers(map).body(render(body, note, &site, true))
+        }
+        Channel::SynologyChat { url, headers, text } => {
+            let map = webhook_headers(headers, "application/x-www-form-urlencoded", true)?;
+            let payload = json!({"text": render(text, note, &site, false)}).to_string();
+            client().post(url).headers(map).form(&[("payload", payload)])
         }
     };
     // The URL is stripped from the error: Telegram's carries the bot token and a
@@ -332,7 +403,11 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
     })?;
     let status = response.status();
     if status.is_success() {
-        return Ok(());
+        return if matches!(channel, Channel::SynologyChat { .. }) {
+            synology_result(response).await
+        } else {
+            Ok(())
+        };
     }
     // The first chunk carries the reason (Telegram's `description`, Discord's
     // `message`) without reading an error page of arbitrary length.
@@ -352,10 +427,14 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
     Err(Failure {
         retry: status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
         shown: format!("{why}（HTTP {code}）"),
-        reason: format!(
-            "{status}: {}",
-            String::from_utf8_lossy(&head).chars().take(300).collect::<String>().trim()
-        ),
+        reason: if matches!(channel, Channel::SynologyChat { .. }) {
+            format!("{why}（HTTP {code}）")
+        } else {
+            format!(
+                "{status}: {}",
+                String::from_utf8_lossy(&head).chars().take(300).collect::<String>().trim()
+            )
+        },
     })
 }
 
@@ -677,6 +756,146 @@ mod tests {
     /// Offline alerts are only marked while a channel exists to carry them.
     fn with_channel(app: &App) {
         app.db.set("notify_webhook_url", "http://127.0.0.1:9/").unwrap();
+    }
+
+    /// Capture the actual HTTP request, not only a reconstructed template.
+    async fn webhook_server(
+        status: StatusCode,
+        response: String,
+        delay: Duration,
+    ) -> (String, mpsc::Receiver<(HeaderMap, axum::body::Bytes)>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel(8);
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let tx = tx.clone();
+                let response = response.clone();
+                async move {
+                    tx.send((headers, body)).await.unwrap();
+                    tokio::time::sleep(delay).await;
+                    let mut headers = HeaderMap::new();
+                    if status.is_redirection() {
+                        headers.insert(reqwest::header::LOCATION, HeaderValue::from_static("/unexpected"));
+                    }
+                    (status, headers, response)
+                }
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (url, rx, task)
+    }
+
+    #[tokio::test]
+    async fn synology_posts_one_form_payload_and_preserves_text() {
+        let app = app();
+        let (url, mut received, server) =
+            webhook_server(StatusCode::OK, r#"{"success":true}"#.into(), Duration::ZERO).await;
+        let channel = Channel::SynologyChat {
+            url,
+            headers: "Content-Type: application/json\nX-Test-Key: example-secret".into(),
+            text: "{{site}}\n{{title}}\n{{node}}\n{{event}}\n{{message}}\n{{time}}".into(),
+        };
+        let note = Note {
+            event: "test",
+            node: "示例节点".into(),
+            title: "中文 \"引号\" & + = % \\".into(),
+            message: "第一行\n第二行 {{title}}".into(),
+            time: 1_700_000_000,
+        };
+        assert!(post(&app, &channel, &note).await.is_ok());
+        let (headers, body) = received.recv().await.unwrap();
+        assert_eq!(headers[CONTENT_TYPE], "application/x-www-form-urlencoded");
+        assert_eq!(headers.get_all(CONTENT_TYPE).iter().count(), 1);
+        assert_eq!(headers["x-test-key"], "example-secret");
+        let form: Vec<(String, String)> = serde_urlencoded::from_bytes(&body).unwrap();
+        assert_eq!(form.len(), 1);
+        assert_eq!(form[0].0, "payload");
+        let payload: Value = serde_json::from_str(&form[0].1).unwrap();
+        assert_eq!(
+            payload,
+            json!({"text": format!(
+                "{}\n{}\n{}\n{}\n{}\n{}",
+                site_name(&app), note.title, note.node, note.event, note.message, clock(note.time)
+            )})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn synology_requires_a_boolean_success_and_never_echoes_responses() {
+        let app = app();
+        for (body, expected) in [
+            (r#"{"success":false,"error":{"code":152,"errors":"private-secret"}}"#, "152"),
+            (r#"{"success":false,"error":{"code":404,"errors":"private-secret"}}"#, "404"),
+            (r#"{"success":false,"error":{"code":"private-secret"}}"#, "拒收"),
+            (r#"{"success":"true","private-secret":1}"#, "成功标志"),
+            (r#"{"private-secret":true}"#, "成功标志"),
+            ("", "JSON"),
+            ("<html>private-secret</html>", "JSON"),
+        ] {
+            let (url, _received, server) = webhook_server(StatusCode::OK, body.into(), Duration::ZERO).await;
+            let channel =
+                Channel::SynologyChat { url, headers: String::new(), text: DEFAULT_SYNOLOGY_TEXT.into() };
+            let failure = post(&app, &channel, &sample()).await.unwrap_err();
+            assert!(!failure.retry, "an explicit rejection must not be retried");
+            assert!(failure.shown.contains(expected), "{}", failure.shown);
+            assert!(!failure.shown.contains("private-secret"));
+            assert!(!failure.reason.contains("private-secret"));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn synology_bounds_the_response_and_preserves_http_failure_rules() {
+        let app = app();
+        for (status, body, expected_retry, expected) in [
+            (StatusCode::OK, "x".repeat(SYNOLOGY_RESPONSE_LIMIT + 1), false, "过大"),
+            (StatusCode::FOUND, "private-secret".into(), false, "跳转"),
+            (StatusCode::UNAUTHORIZED, "private-secret".into(), false, "鉴权"),
+            (StatusCode::TOO_MANY_REQUESTS, "private-secret".into(), true, "限流"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "private-secret".into(), true, "服务器出错"),
+        ] {
+            let (url, _received, server) = webhook_server(status, body, Duration::ZERO).await;
+            let channel =
+                Channel::SynologyChat { url, headers: String::new(), text: DEFAULT_SYNOLOGY_TEXT.into() };
+            let failure = post(&app, &channel, &sample()).await.unwrap_err();
+            assert_eq!(failure.retry, expected_retry);
+            assert!(failure.shown.contains(expected), "{}", failure.shown);
+            assert!(!failure.reason.contains("private-secret"));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn synology_keeps_the_request_timeout() {
+        let app = app();
+        let (url, mut received, server) =
+            webhook_server(StatusCode::OK, r#"{"success":true}"#.into(), Duration::from_secs(30)).await;
+        let channel =
+            Channel::SynologyChat { url, headers: String::new(), text: DEFAULT_SYNOLOGY_TEXT.into() };
+        let failure = post(&app, &channel, &sample()).await.unwrap_err();
+        assert!(received.try_recv().is_ok(), "the request reached the server before it stalled");
+        assert!(failure.retry);
+        assert_eq!(failure.shown, "请求超时");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn generic_webhooks_keep_their_json_body_and_status_only_result() {
+        let app = app();
+        with_channel(&app);
+        assert!(matches!(channels(&app).as_slice(), [Channel::Webhook { .. }]));
+        let (url, mut received, server) =
+            webhook_server(StatusCode::OK, r#"{"success":false}"#.into(), Duration::ZERO).await;
+        let channel = Channel::Webhook { url, headers: String::new(), body: DEFAULT_BODY.into() };
+        assert!(post(&app, &channel, &sample()).await.is_ok());
+        let (headers, body) = received.recv().await.unwrap();
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["node"], sample().node);
+        server.abort();
     }
 
     #[test]
