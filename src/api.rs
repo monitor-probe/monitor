@@ -623,7 +623,11 @@ pub async fn live_ws(
 
 async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>, gzip: bool) {
     // The panel and both official themes treat 10 s without a frame as a lost
-    // stream and reconnect, so the interval must stay well below that.
+    // stream and reconnect, so the interval must stay well below that. Not one
+    // second to match the agent's default report: that would double what every
+    // open page costs -- a hundred nodes are 15 KB a frame compressed, 110 KB for
+    // the panel, which is never compressed -- while history, the mean and peak of
+    // every report in its minute, would gain nothing.
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     // A delayed tick, for instance behind a vacuum holding the database, is
     // followed by one frame rather than by every tick it missed: those would
