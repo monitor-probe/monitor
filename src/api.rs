@@ -528,7 +528,7 @@ pub struct Frame {
     /// The millisecond it was built.
     at: i64,
     json: Utf8Bytes,
-    /// `json` gzipped, made by the first stream that asks for it.
+    /// `json` gzipped, made by the first stream or `/api/nodes` request that asks for it.
     gzip: Option<axum::body::Bytes>,
 }
 
