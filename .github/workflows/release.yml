@@ -5,8 +5,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Read-only by default: the build jobs run third-party actions, dependency
+# build scripts and install hooks, none of which may hold a token that can
+# publish. Only the job that creates the release asks for more.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:

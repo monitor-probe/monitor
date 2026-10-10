@@ -534,11 +534,19 @@ export function useNodes() {
         }, 10_000)
       }
       watch()
+      // Only a frame that parses re-arms the watchdog, so a stream whose frames
+      // cannot be read counts as silent and is replaced.
       opened.onmessage = (event) => {
+        let nodes, admin
+        try {
+          ;({ nodes, admin } = JSON.parse(event.data))
+        } catch (e) {
+          console.warn("live frame dropped:", e)
+          return
+        }
         watch()
-        const frame = JSON.parse(event.data)
-        setNodes(frame.nodes)
-        setAdmin(frame.admin)
+        setNodes(nodes)
+        setAdmin(admin)
         setError(null)
         // The stream has returned; the poll was only covering for it.
         if (poll) {

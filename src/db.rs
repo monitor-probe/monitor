@@ -12,6 +12,17 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
 use tracing::info;
 
+/// A string an agent reported, cut down to what may be shown. Control
+/// characters break the panel's rows, and the characters markup is made of are
+/// dropped because the value reaches a theme from a machine nobody has vouched
+/// for: a theme that sets it as HTML would otherwise run a node's script in the
+/// hub's origin, beside the administrator's session. No real OS name, kernel,
+/// CPU model or host name contains any of them. `chars()` rather than bytes, so
+/// the cut falls on a character boundary.
+pub fn reported_text(raw: &str, max: usize) -> String {
+    raw.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>' | '"' | '\'')).take(max).collect()
+}
+
 pub struct Db {
     /// A read-only connection to the same file, for the history charts. A week
     /// of one node's probe results is a scan of 98 ms at four 60-second probes
@@ -1271,23 +1282,12 @@ impl Db {
     /// moves to `country_prev_ip` / `country_prev` if it had an answer, and a
     /// source equal to that address takes its answer back without a lookup.
     pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str, source: &str) -> Result<bool> {
-        // The same rule `api::agent_register` applies to the name it receives:
-        // these values come from an unvouched machine, control characters break
-        // the panel's rows, and the length must be bounded. Six of them -- os,
-        // kernel, arch, virt, cpu_name, agent_version -- go straight into the
-        // anonymous public frame, which is rebuilt and pushed to every viewer
-        // every two seconds, so without a ceiling one node would determine that
-        // frame's size. 128 rather than 64: a real PRETTY_NAME runs to about 60
-        // characters and a CPU model to about 50.
-        let s = |k: &str| {
-            f.get(k)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(128)
-                .collect::<String>()
-        };
+        // Six of these -- os, kernel, arch, virt, cpu_name, agent_version -- go
+        // straight into the anonymous public frame, which is rebuilt and pushed to
+        // every viewer every two seconds, so without a ceiling one node would
+        // determine that frame's size. 128 rather than 64: a real PRETTY_NAME runs
+        // to about 60 characters and a CPU model to about 50.
+        let s = |k: &str| reported_text(f.get(k).and_then(|v| v.as_str()).unwrap_or(""), 128);
         let n = |k: &str| f.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
         let conn = self.conn();
         conn.execute(
@@ -3503,6 +3503,14 @@ mod tests {
         let stored = db.node(id).unwrap().unwrap();
         assert_eq!(stored.os.chars().count(), 128);
         assert_eq!(stored.hostname, "xy", "control characters break the panel's rows");
+
+        db.save_facts(id, &serde_json::json!({"os": "<img src=x onerror=\"a()\">'Debian'"}), "ip", "")
+            .unwrap();
+        assert_eq!(
+            db.node(id).unwrap().unwrap().os,
+            "img src=x onerror=a()Debian",
+            "no markup reaches a theme"
+        );
     }
 
     /// The address seen in the other family arrives on its own connection, in no

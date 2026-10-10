@@ -396,6 +396,41 @@ fn parse_args() -> Result<Args> {
     })
 }
 
+/// The soft open-file limit the hub asks for. Every agent holds one descriptor,
+/// every open page another, and every request in flight a third. 65536 leaves
+/// about 65 for each of the 1000 nodes a hub is sized for.
+const NOFILE_TARGET: u64 = 65_536;
+
+/// Raises the soft open-file limit toward [`NOFILE_TARGET`], capped by the hard
+/// one. systemd and Docker start a process at a soft limit of 1024, which Rust
+/// does not raise as Go does: with about a thousand connections `accept` fails
+/// with EMFILE, which the server retries silently, and the hub stops answering
+/// without logging a line (measured: 846 of 1000 agents connected, `/api/me`
+/// unanswered).
+fn raise_open_files() {
+    use rustix::process::{getrlimit, setrlimit, Resource};
+    let mut limit = getrlimit(Resource::Nofile);
+    // Unlimited needs nothing.
+    let Some(soft) = limit.current else { return };
+    let wanted = limit.maximum.map_or(NOFILE_TARGET, |hard| hard.min(NOFILE_TARGET));
+    let mut now = soft;
+    if soft < wanted {
+        limit.current = Some(wanted);
+        match setrlimit(Resource::Nofile, limit) {
+            Ok(()) => now = wanted,
+            Err(e) => warn!("open-file limit could not be raised from {soft}: {e}"),
+        }
+    }
+    if now < NOFILE_TARGET {
+        warn!(
+            "open-file limit is {now}, and the hub stops accepting connections near it. Raise \
+             LimitNOFILE for the service, or --ulimit nofile for the container"
+        );
+    } else if now > soft {
+        info!("open-file limit raised from {soft} to {now}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -417,6 +452,8 @@ async fn main() -> Result<()> {
         println!("Emergency password: {}", new_password(&Db::open(&args.database)?)?);
         return Ok(());
     }
+    // After the two arguments that print and exit, so their output stays theirs.
+    raise_open_files();
     std::fs::create_dir_all(&args.themes)?;
     if let Err(e) = db::temp_files_beside(&args.database) {
         warn!("SQLite keeps its temporary files in its default directory: {e:#}");
@@ -530,7 +567,7 @@ async fn main() -> Result<()> {
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         // The two chunked uploads, merged after that layer rather than beneath
         // it. They raise the ceiling on a single request to `api::MAX_CHUNK`,
-        // not on the file behind it: a 256 MiB backup arrives as 64 of the
+        // not on the file behind it: a 1 GiB backup arrives as 256 of the
         // panel's 4 MiB pieces, so no reverse proxy needs to know the database
         // size. The whole-file ceilings live on `total` and are checked on the
         // first request.
@@ -541,8 +578,9 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
                 .with_state(app.clone()),
         )
+        .layer(axum::middleware::from_fn(api::same_origin_writes))
         .layer(axum::middleware::map_response(api::plain_errors))
-        // Agents, merged after that layer: `install.sh` and the agent print these
+        // Agents, merged after those layers: `install.sh` and the agent print these
         // replies beside their own English output, so they are left as written.
         .merge(
             Router::new()
@@ -611,8 +649,7 @@ fn advertised_url(site: &str, listen: SocketAddr) -> String {
 /// This host's own address on its outbound route. Asking the kernel to route a
 /// datagram it never sends is the cheapest way to select one interface among
 /// several, and it answers without any network traffic. Behind NAT it yields the
-/// private address, since the hub cannot know its public one, which is why
-/// install-hub.sh prints the address it looked up instead.
+/// private address, since the hub cannot know its public one; `--site` states it.
 fn outbound_ip() -> Option<IpAddr> {
     [("0.0.0.0:0", "1.1.1.1:80"), ("[::]:0", "[2606:4700:4700::1111]:80")].into_iter().find_map(
         |(bind, route_to)| {
@@ -839,6 +876,20 @@ fn compressible() -> impl Predicate {
 mod tests {
     use super::*;
     use axum::http::{StatusCode, Uri};
+
+    /// The limit only moves up, so raising it here cannot disturb another test.
+    #[test]
+    fn the_soft_open_file_limit_reaches_the_target_or_the_hard_one() {
+        use rustix::process::{getrlimit, Resource};
+        raise_open_files();
+        let limit = getrlimit(Resource::Nofile);
+        let wanted = limit.maximum.map_or(NOFILE_TARGET, |hard| hard.min(NOFILE_TARGET));
+        assert!(
+            limit.current.is_none_or(|soft| soft >= wanted),
+            "soft limit {:?} below {wanted}",
+            limit.current
+        );
+    }
 
     fn app(site: &str) -> App {
         App::new(

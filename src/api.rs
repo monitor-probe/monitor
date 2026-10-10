@@ -4,9 +4,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -35,6 +36,32 @@ impl FromRequestParts<Shared> for Admin {
             Err(answer(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录"))
         }
     }
+}
+
+/// Whether a page other than the panel sent this request. `SameSite=Lax` holds
+/// a cookie back from other *sites*, but a sibling subdomain of the hub's
+/// registrable domain is the same site: its script may send a request without a
+/// body (`no-cors`, no preflight) and the cookie goes along, which suffices for
+/// a token reset or a vacuum. Browsers name where a request came from in
+/// `Sec-Fetch-Site`; only `same-origin` is the panel itself. The header is
+/// absent from a client that is not a browser, from a browser too old to send
+/// it, and from every browser on a plain-http address other than loopback; the
+/// last two are not told apart from the panel.
+fn from_other_origin(headers: &HeaderMap) -> bool {
+    headers.get("sec-fetch-site").is_some_and(|site| site != "same-origin")
+}
+
+fn cross_site_write(method: &Method, headers: &HeaderMap) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) && from_other_origin(headers)
+}
+
+/// Refuses writes from another origin before any handler sees them, so a route
+/// added later is covered without remembering to ask.
+pub async fn same_origin_writes(request: Request, next: Next) -> Response {
+    if cross_site_write(request.method(), request.headers()) {
+        return answer(StatusCode::FORBIDDEN, "请求来自其他网站，已拒绝");
+    }
+    next.run(request).await
 }
 
 /// Marks a response whose text was written for the reader; see [`plain_errors`].
@@ -636,6 +663,31 @@ pub struct Stream {
     gzip: Option<String>,
 }
 
+/// How many anonymous streams may be open at once. The fourth bound of the
+/// anonymous paths, beside `HISTORY_GATE`, `main::RELAY_GATE` and
+/// `auth::PASSWORD_GATE`: a stream holds a descriptor and a task for as long as
+/// its page stays open, and at a hundred nodes sends about 7 KB/s of compressed
+/// frames, 55 KB/s to a page that does not ask for gzip. A thousand pages are
+/// 7 to 55 MB/s outbound. Beyond it a page falls back to polling `/api/nodes`,
+/// whose rendered frame every viewer shares.
+const PUBLIC_STREAMS: usize = 1000;
+static PUBLIC_STREAM_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(PUBLIC_STREAMS);
+
+/// A send that blocks this long has no reader left: the pages treat 10 s
+/// without a frame as a lost stream and open another. A peer that vanished
+/// without a FIN would otherwise keep its slot until TCP gives up, about
+/// 15 minutes.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The slot a new stream holds until it ends. A session is the operator's own
+/// and is not counted, so whoever holds one can always open the panel.
+fn stream_slot(session: Option<&str>) -> Result<Option<tokio::sync::SemaphorePermit<'static>>, ()> {
+    if session.is_some() {
+        return Ok(None);
+    }
+    PUBLIC_STREAM_GATE.try_acquire().map(Some).map_err(|_| ())
+}
+
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
@@ -647,14 +699,23 @@ pub async fn live_ws(
 ) -> Response {
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
-    let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
+    // A sibling subdomain's script opens this with the cookie too, and a
+    // WebSocket is not held back by CORS: it would read the admin frame. Such a
+    // handshake is answered as an anonymous one.
+    let session = current_session(&headers)
+        .filter(|_| !from_other_origin(&headers))
+        .filter(|hash| app.db.session_valid(hash));
     if session.is_none() && !app.public_page() {
         return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
-    upgrade
-        .read_buffer_size(SOCKET_BUFFER)
-        .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| stream_live(app, socket, session, stream.gzip.is_some()))
+    let Ok(slot) = stream_slot(session.as_deref()) else {
+        return answer(StatusCode::SERVICE_UNAVAILABLE, "同时在线的访客太多，请稍后再试");
+    };
+    upgrade.read_buffer_size(SOCKET_BUFFER).max_message_size(MAX_FRAME).on_upgrade(move |socket| async move {
+        // Held until the stream ends.
+        let _slot = slot;
+        stream_live(app, socket, session, stream.gzip.is_some()).await
+    })
 }
 
 async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>, gzip: bool) {
@@ -694,7 +755,7 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
         } else {
             Message::Text(live_snapshot(&app, full))
         };
-        if socket.send(frame).await.is_err() {
+        if !matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(frame)).await, Ok(Ok(()))) {
             break;
         }
     }
@@ -776,15 +837,6 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
     };
     if https_domain(origin).is_none() && !(loopback_origin(origin) && !app.site.is_empty()) {
         debug!("provisioning refused: Origin {origin:?} is not an https domain entry");
-        return Err(PROVISIONING_DENIED);
-    }
-    // States that the request belongs to the page it addresses, which `Origin`
-    // alone does not: the panel is the only caller, and a page elsewhere holds no
-    // session here anyway, `SameSite=Lax` keeping the cookie from it. Browsers
-    // predating the header send none, and the origin above remains the test.
-    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
-    if fetch_site.is_some_and(|site| site != "same-origin") {
-        debug!("provisioning refused: Sec-Fetch-Site {fetch_site:?} is not same-origin");
         return Err(PROVISIONING_DENIED);
     }
     Ok(())
@@ -1054,10 +1106,10 @@ pub async fn agent_register(
         Ok(_) => {}
     }
 
-    // The name comes from a machine not yet vouched for: control characters would
-    // break the panel's rows, and the length must be bounded. `chars()` rather
-    // than bytes, so the cut falls on a character boundary.
-    let name: String = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    // The name comes from a machine not yet vouched for, and is shown to every
+    // visitor until the operator renames the node. Trimmed last: a name made of
+    // markup characters and spaces must come out empty, not as a blank.
+    let name = db::reported_text(&name, 64).trim().to_owned();
     let name = if name.is_empty() { "unnamed".to_owned() } else { name };
     // Field defaults live in `Node`'s serde attributes and nowhere else.
     // `Node::default()` is a different set of values -- private, reset day 0 --
@@ -2286,6 +2338,29 @@ mod tests {
         ])
     }
 
+    /// A sibling subdomain is the same site, so `SameSite=Lax` lets its bodiless
+    /// POST carry the session; only `Sec-Fetch-Site` tells it from the panel.
+    #[test]
+    fn a_write_from_another_origin_is_refused() {
+        let from = |site: &str| {
+            HeaderMap::from_iter([(header::HeaderName::from_static("sec-fetch-site"), site.parse().unwrap())])
+        };
+        for site in ["same-site", "cross-site", "none"] {
+            assert!(cross_site_write(&Method::POST, &from(site)), "{site}");
+            assert!(cross_site_write(&Method::DELETE, &from(site)), "{site}");
+        }
+        assert!(!cross_site_write(&Method::POST, &from("same-origin")));
+        assert!(!cross_site_write(&Method::POST, &HeaderMap::new()), "not a browser, or one too old to say");
+        assert!(
+            !cross_site_write(&Method::GET, &from("cross-site")),
+            "reads are answered to the page that cannot read them"
+        );
+        // A WebSocket handshake is a GET that the page can read.
+        assert!(from_other_origin(&from("same-site")));
+        assert!(!from_other_origin(&from("same-origin")));
+        assert!(!from_other_origin(&HeaderMap::new()));
+    }
+
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
     }
@@ -2364,10 +2439,6 @@ mod tests {
         let mut headers = good.clone();
         headers.remove(header::ORIGIN);
         assert_eq!(provisioning_allowed(&app, &headers), Err(ORIGIN_MISSING));
-        // A request sent from a page elsewhere.
-        headers = good.clone();
-        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
-        assert!(provisioning_allowed(&app, &headers).is_err());
 
         // Both panel paths refuse, and neither leaves anything behind.
         headers = good.clone();
@@ -3552,6 +3623,32 @@ mod tests {
         assert_eq!(app.db.nodes().unwrap().len(), 1);
     }
 
+    /// The name comes from an unvouched machine: markup characters are dropped,
+    /// and what that leaves is trimmed, so a name made only of them is `unnamed`.
+    #[tokio::test]
+    async fn a_registered_name_loses_markup_and_is_never_blank() {
+        let app = std::sync::Arc::new(app());
+        open_register(Admin, State(app.clone()), panel_headers()).await;
+        let key = app.db.get("register_key").unwrap();
+        for (sent, stored) in [("< >", "unnamed"), ("<b>web</b>", "bweb/b"), ("Tom's \"VPS\"", "Toms VPS")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+            let reply = agent_register(
+                State(app.clone()),
+                ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+                headers,
+                sent.to_owned(),
+            )
+            .await;
+            let token = String::from_utf8(
+                axum::body::to_bytes(reply.into_body(), usize::MAX).await.unwrap().to_vec(),
+            )
+            .unwrap();
+            let id = app.db.node_by_token(&token).unwrap().expect("token opens a node");
+            assert_eq!(app.db.node(id).unwrap().unwrap().name, stored, "sent {sent:?}");
+        }
+    }
+
     /// The ceiling on the anonymous route: a leaked key cannot fill the table.
     #[tokio::test]
     async fn one_window_stops_registering_at_the_limit() {
@@ -3635,6 +3732,17 @@ mod tests {
         assert_eq!(live["swap_total"], 0, "swapoff means zero, not the gigabyte that was there at connect");
         assert_eq!(live["disk_total"], live["metrics"]["disk_total"], "one number, not two");
         assert_eq!(app.db.node(id).unwrap().unwrap().disk_total, 30i64 << 30, "and no extra write to get it");
+    }
+
+    /// Only anonymous streams are counted, and a slot comes back when its
+    /// stream ends. `PUBLIC_STREAM_GATE` is touched by no other test.
+    #[test]
+    fn anonymous_streams_past_the_gate_are_refused_and_a_session_is_not() {
+        let held: Vec<_> = (0..PUBLIC_STREAMS).map(|_| stream_slot(None).expect("up to the limit")).collect();
+        assert!(stream_slot(None).is_err(), "the stream past the limit must be refused");
+        assert!(stream_slot(Some("hash")).is_ok(), "a session opens its stream with every slot taken");
+        drop(held);
+        assert!(stream_slot(None).is_ok(), "a finished stream gives its slot back");
     }
 
     /// `span` bounds one window; this bounds how many are built concurrently.
