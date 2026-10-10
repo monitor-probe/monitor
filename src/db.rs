@@ -1643,10 +1643,10 @@ impl Db {
     /// the seven-day window integrated to 53.69 GB against the 27.52 GB the
     /// minutes hold, while averaging gives 28.02 GB, matching the accumulator.
     ///
-    /// `swap_used`, `tcp`, `udp` and `procs` are stored but not returned, as
-    /// nothing draws them from history. The columns are retained deliberately,
-    /// in the hourly tier as well; `load1` was the fifth and has been removed,
-    /// see `migrate_to_2`.
+    /// `swap_used`, `tcp`, `udp` and `procs` are returned although the official
+    /// themes draw none of them from history: a theme the hub does not ship may.
+    /// The counts are rounded, as in `fold_next`; a truncated mean would show
+    /// a socket held half the bucket as none.
     ///
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
@@ -1692,6 +1692,8 @@ impl Db {
                 "net_rx": r.get::<_, i64>(4)?, "net_tx": r.get::<_, i64>(5)?,
                 "net_rx_max": r.get::<_, i64>(6)?, "net_tx_max": r.get::<_, i64>(7)?,
                 "cpu_max": r.get::<_, f64>(8)?, "minutes": r.get::<_, i64>(9)?,
+                "swap_used": r.get::<_, i64>(10)?, "tcp": r.get::<_, i64>(11)?,
+                "udp": r.get::<_, i64>(12)?, "procs": r.get::<_, i64>(13)?,
             }))
         };
         if !span.hourly {
@@ -1700,7 +1702,9 @@ impl Db {
                         CAST(AVG(disk_used) AS INTEGER),
                         CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
                         MAX(MAX(net_rx, net_rx_max)), MAX(MAX(net_tx, net_tx_max)),
-                        MAX(MAX(cpu, cpu_max)), COUNT(*)
+                        MAX(MAX(cpu, cpu_max)), COUNT(*), CAST(AVG(swap_used) AS INTEGER),
+                        CAST(ROUND(AVG(tcp)) AS INTEGER), CAST(ROUND(AVG(udp)) AS INTEGER),
+                        CAST(ROUND(AVG(procs)) AS INTEGER)
                  FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
             )?;
             let rows = stmt.query_map(params![node_id, span.since, span.step], row)?;
@@ -1709,13 +1713,18 @@ impl Db {
         let rolled = rolled(&conn)?.unwrap_or(i64::MIN);
         let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, SUM(cpu*w)/SUM(w), SUM(mem_used*w)/SUM(w), SUM(disk_used*w)/SUM(w),
-                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max), MAX(cpu_top), SUM(w)
+                    SUM(net_rx*w)/SUM(w), SUM(net_tx*w)/SUM(w), MAX(rx_max), MAX(tx_max), MAX(cpu_top), SUM(w),
+                    SUM(swap_used*w)/SUM(w), CAST(ROUND(SUM(tcp*w)*1.0/SUM(w)) AS INTEGER),
+                    CAST(ROUND(SUM(udp*w)*1.0/SUM(w)) AS INTEGER),
+                    CAST(ROUND(SUM(procs*w)*1.0/SUM(w)) AS INTEGER)
              FROM (SELECT ts, minutes AS w, cpu, mem_used, disk_used, net_rx, net_tx,
-                          net_rx_max AS rx_max, net_tx_max AS tx_max, cpu_max AS cpu_top
+                          net_rx_max AS rx_max, net_tx_max AS tx_max, cpu_max AS cpu_top,
+                          swap_used, tcp, udp, procs
                    FROM metric_hour WHERE node_id=?1 AND ts>=?2 AND ts<?4
                    UNION ALL
                    SELECT ts, 1, cpu, mem_used, disk_used, net_rx, net_tx,
-                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max), MAX(cpu, cpu_max)
+                          MAX(net_rx, net_rx_max), MAX(net_tx, net_tx_max), MAX(cpu, cpu_max),
+                          swap_used, tcp, udp, procs
                    FROM metric WHERE node_id=?1
                         AND ts>=MAX(?2, ?4, (SELECT MAX(ts) FROM metric WHERE node_id=?1) - ?5))
              GROUP BY ts/?3 ORDER BY ts/?3",
@@ -3692,8 +3701,8 @@ mod tests {
         // Six hours whose values vary within each hour, with minutes missing so
         // the hours carry different weights, and a probe that loses rounds.
         let start = 472_224 * 3_600;
-        // Per hour, the columns the chart does not return, to check the tier
-        // keeps them.
+        // Per hour, the columns the official themes do not draw, to check the
+        // tier keeps them.
         let mut kept: [Vec<[i64; 4]>; 6] = Default::default();
         for m in (0..6 * 60).filter(|m| m % 17 != 3 && !(100..130).contains(m)) {
             let ts = start + m * 60;
@@ -3725,7 +3734,7 @@ mod tests {
                 );
                 assert!((g["cpu"].as_f64().unwrap() - w["cpu"].as_f64().unwrap()).abs() < 1e-9, "{g} {w}");
                 let slack = if step == 3_600 { 0 } else { 1 };
-                for key in ["mem_used", "disk_used", "net_rx", "net_tx"] {
+                for key in ["mem_used", "disk_used", "net_rx", "net_tx", "swap_used", "tcp", "udp", "procs"] {
                     let d = g[key].as_i64().unwrap() - w[key].as_i64().unwrap();
                     assert!(d.abs() <= slack, "{key} at {step}s: {g} {w}");
                 }
@@ -3769,7 +3778,7 @@ mod tests {
         let held: usize = kept.iter().map(Vec::len).sum();
         assert_eq!(points.iter().map(|p| p["minutes"].as_i64().unwrap()).sum::<i64>(), held as i64);
         assert_eq!(points.iter().map(|p| p["cpu_max"].as_f64().unwrap()).fold(0.0, f64::max), 9.0 + 10.0);
-        // The columns the chart does not return are kept as each hour's mean,
+        // The columns the official themes do not draw are kept as each hour's mean,
         // swap truncated like the other bytes and the counts rounded.
         let stored: Vec<[i64; 4]> = db
             .conn()
