@@ -2850,8 +2850,8 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             onChange={(v) => set("public_page", v ? "on" : "off")}
           />
           <SwitchRow
-            label="hub 前面有 CDN，且源站只允许 CDN 访问"
-            hint="登录通知和限流取访客的真实地址，不用填 IP；没有 CDN 不用管"
+            label="我确认源站只有 CDN 或隧道能连上"
+            hint="登录通知和限流取访客的真实地址，不用填 IP。hub 不会替你限制访问，没做到就别打开"
             helpWidth="max-w-62 min-[392px]:max-w-90 min-[440px]:max-w-104"
             help={
               <>
