@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS node (
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
   ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
   -- Where the hub saw the node in the address family `ip` is not in, from the
-  -- short connection an agent makes over it (`agent_ws::handler`, `?echo`).
+  -- short connection an agent makes over it (`agent_ws::echo`).
   -- Empty until one has arrived, and left as it was when none does: the family
   -- it belongs to must still be held on an interface for it to be shown.
   ip_other TEXT NOT NULL DEFAULT '',

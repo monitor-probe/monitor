@@ -284,15 +284,13 @@ struct Rpc {
     params: serde_json::Value,
 }
 
-/// The node a request's bearer token belongs to, or the refusal. The same
-/// response whether the token is malformed or merely unknown.
-fn authenticate(app: &App, headers: &HeaderMap) -> Result<i64, Response> {
-    let Some(token) = bearer(headers) else {
-        return Err(crate::api::answer(StatusCode::UNAUTHORIZED, "missing token"));
-    };
+/// The node a request's bearer token belongs to, or the 401 text. The same
+/// text whether the token is malformed or merely unknown.
+fn authenticate(app: &App, headers: &HeaderMap) -> Result<i64, &'static str> {
+    let token = bearer(headers).ok_or("missing token")?;
     match app.db.node_by_token(token) {
         Ok(Some(id)) => Ok(id),
-        _ => Err(crate::api::answer(StatusCode::UNAUTHORIZED, "invalid token")),
+        _ => Err("invalid token"),
     }
 }
 
@@ -304,7 +302,7 @@ pub async fn handler(
 ) -> Response {
     let node_id = match authenticate(&app, &headers) {
         Ok(id) => id,
-        Err(refusal) => return refusal,
+        Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
     };
     let ip = node_ip(&app, &headers, peer.ip()).to_string();
 
@@ -336,11 +334,15 @@ pub async fn echo(
 ) -> Response {
     let node_id = match authenticate(&app, &headers) {
         Ok(id) => id,
-        Err(refusal) => return refusal,
+        Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
     };
-    let ip = node_ip(&app, &headers, peer.ip()).to_string();
-    if let Err(e) = app.db.set_ip_other(node_id, &ip) {
-        warn!("node {node_id}: storing the address seen in the other family failed: {e:#}");
+    // A proxy that wrote nothing leaves the proxy's own address here, which
+    // would replace an exit recorded earlier with one the panel never shows.
+    let ip = node_ip(&app, &headers, peer.ip());
+    if public(ip) {
+        if let Err(e) = app.db.set_ip_other(node_id, &ip.to_string()) {
+            warn!("node {node_id}: storing the address seen in the other family failed: {e:#}");
+        }
     }
     upgrade.on_upgrade(|_| async {})
 }
@@ -895,6 +897,22 @@ mod tests {
                 &crate::auth::random_token(),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn a_token_opens_the_route_only_for_its_node() {
+        let app = app();
+        let token = crate::auth::random_token();
+        let id = app.db.create_node(&Node { name: "n".into(), ..Default::default() }, &token).unwrap();
+        let with = |value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", value.parse().unwrap());
+            h
+        };
+        assert_eq!(authenticate(&app, &with(&format!("Bearer {token}"))).ok(), Some(id));
+        for refused in [HeaderMap::new(), with("Bearer nope"), with("Basic abc")] {
+            assert!(authenticate(&app, &refused).is_err());
+        }
     }
 
     /// A connected agent, the precondition for filing any report: the session

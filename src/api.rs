@@ -156,10 +156,10 @@ fn addresses<'a>(
             Some((pin, "manual"))
         } else if public(held, v6) {
             Some((held, "interface"))
-        } else if let Some(exit) = exits.into_iter().find(|ip| !held.is_empty() && public(ip, v6)) {
-            Some((exit, "exit"))
-        } else {
+        } else if held.is_empty() {
             None
+        } else {
+            exits.into_iter().find(|ip| public(ip, v6)).map(|exit| (exit, "exit"))
         }
     };
     let shown: Vec<_> = [family(pin4, ipv4, false), family(pin6, ipv6, true)].into_iter().flatten().collect();
