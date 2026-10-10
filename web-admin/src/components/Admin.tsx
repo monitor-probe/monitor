@@ -510,9 +510,10 @@ function Field({ label, hint, help, helpWidth, className = "", children }: {
 // in one line underneath, and why or at what risk behind the question mark. Not
 // a <label>: a tap on the words must not flip the switch, only the switch is
 // pressable. aria-labelledby keeps the association for screen readers.
-function SwitchRow({ label, hint, help, helpWidth, checked, onChange }: {
+function SwitchRow({ label, hint, extra, help, helpWidth, checked, onChange }: {
   label: string
   hint?: string
+  extra?: React.ReactNode
   help?: React.ReactNode
   helpWidth?: string
   checked: boolean
@@ -532,6 +533,7 @@ function SwitchRow({ label, hint, help, helpWidth, checked, onChange }: {
           )}
         </div>
         {hint && <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">{hint}</p>}
+        {extra}
       </div>
     </div>
   )
@@ -2851,7 +2853,15 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           />
           <SwitchRow
             label="我确认源站只有 CDN 或隧道能连上"
-            hint={`登录通知和限流取访客的真实地址。保存后核对：当前认出你的地址是 ${s.your_address ?? "未知"}`}
+            hint="登录通知和限流取访客的真实地址"
+            extra={
+              <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                <span>保存后核对，当前认出你的地址</span>
+                <code className="rounded-md border bg-muted/50 px-1.5 py-0.5 font-mono text-foreground select-all">
+                  {String(s.your_address ?? "未知")}
+                </code>
+              </p>
+            }
             helpWidth="max-w-62 min-[392px]:max-w-90 min-[440px]:max-w-104"
             help={
               <>
