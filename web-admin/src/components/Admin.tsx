@@ -2837,6 +2837,21 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               placeholder={"203.0.113.0/24\n2001:db8::/32"}
             />
           </Field>
+          <div className="space-y-2 sm:col-span-2">
+            <div className="flex items-center gap-2 text-sm">
+              <Switch
+                aria-labelledby="origin-cdn-only-label"
+                checked={s.origin_cdn_only === "on"}
+                onCheckedChange={(v) => set("origin_cdn_only", v ? "on" : "off")}
+              />
+              <span id="origin-cdn-only-label">源站只允许 CDN 访问，登录通知和限流直接取访客地址，不用填名单</span>
+            </div>
+            <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">
+              打开前先确认源站真的只有 CDN 连得上：用隧道（源站不开公网端口）、防火墙只放行 CDN 的回源地址，或
+              CDN 回源时带一个密钥头而反代没带就拒绝。做不到却打开，别人直连源站并自己写 X-Forwarded-For，
+              就能每次换一个地址猜密码，登录限流形同虚设。
+            </p>
+          </div>
         </div>
         {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
             aria-labelledby 保住读屏软件那边的关联。 */}
@@ -2859,6 +2874,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
                 trusted_proxies: String(s.trusted_proxies ?? ""),
+                origin_cdn_only: s.origin_cdn_only === "on" ? "on" : "off",
                 public_page: s.public_page === "off" ? "off" : "on",
               }).then((ok) => ok && onSaved())
             }
