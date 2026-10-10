@@ -454,8 +454,12 @@ pub fn client_ip(app: &crate::App, headers: &HeaderMap, peer: IpAddr) -> IpAddr 
     if !behind_local_proxy(peer) {
         return peer;
     }
+    // The last line: a proxy that adds a line of its own, HAProxy's
+    // `option forwardfor` for one, leaves the caller's lines ahead of it.
     headers
-        .get("x-forwarded-for")
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit(',').next())
         .and_then(|v| v.trim().parse::<IpAddr>().ok())
@@ -663,6 +667,12 @@ mod tests {
         // which is the same local peer.
         assert_eq!(client_ip(&app, &forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
         assert_eq!(client_ip(&app, &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+
+        // A proxy that adds a line of its own puts it after the caller's.
+        let mut lines = HeaderMap::new();
+        lines.append("x-forwarded-for", "10.0.0.2".parse().unwrap());
+        lines.append("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        assert_eq!(client_ip(&app, &lines, ip("127.0.0.1")).to_string(), "198.51.100.9");
 
         // Directly from the internet the entire header is caller-supplied, and
         // honouring any part of it bypasses the lockout.
