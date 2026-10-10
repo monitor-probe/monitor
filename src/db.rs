@@ -1328,7 +1328,9 @@ impl Db {
     /// not in. Kept apart from `save_facts`, which an agent's hello rewrites: the
     /// two arrive on different connections, in no fixed order.
     pub fn set_ip_other(&self, id: i64, ip: &str) -> Result<()> {
-        self.conn().execute("UPDATE node SET ip_other=?2 WHERE id=?1", params![id, ip])?;
+        // Unchanged is not written: a reconnecting agent, or a token holder
+        // repeating the request, would otherwise cost a write transaction each.
+        self.conn().execute("UPDATE node SET ip_other=?2 WHERE id=?1 AND ip_other<>?2", params![id, ip])?;
         Ok(())
     }
 
