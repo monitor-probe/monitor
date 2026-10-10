@@ -1669,7 +1669,10 @@ async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
         app.db.check_backup(&source)?;
-        app.db.restore_from(&source)
+        app.db.restore_from(&source)?;
+        // A statement about where this hub is reachable from, which the file
+        // cannot carry to a different machine; the operator confirms it again.
+        app.db.set("origin_cdn_only", "off")
     })
     .await?
 }
@@ -2562,6 +2565,7 @@ mod tests {
         let live = dir.join("live.db").to_string_lossy().into_owned();
         let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
         node(&app, "kept", true);
+        app.db.set("origin_cdn_only", "on").unwrap();
 
         // What a restore actually receives: a backup of a hub database.
         let copy = format!("{live}.copy");
@@ -2579,6 +2583,11 @@ mod tests {
         .await;
         assert_eq!(done.status(), StatusCode::OK);
         assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
+        assert_eq!(
+            app.db.get("origin_cdn_only").as_deref(),
+            Some("off"),
+            "the premise is the operator's to restate"
+        );
 
         // The database and its journal are the only files that may remain.
         let left: Vec<String> = std::fs::read_dir(&dir)
