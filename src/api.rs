@@ -38,17 +38,21 @@ impl FromRequestParts<Shared> for Admin {
     }
 }
 
-/// Whether this is a write that a page on another site sent. `SameSite=Lax`
-/// holds a cookie back from other *sites*, but a sibling subdomain of the hub's
+/// Whether a page other than the panel sent this request. `SameSite=Lax` holds
+/// a cookie back from other *sites*, but a sibling subdomain of the hub's
 /// registrable domain is the same site: its script may send a request without a
 /// body (`no-cors`, no preflight) and the cookie goes along, which suffices for
 /// a token reset or a vacuum. Browsers name where a request came from in
-/// `Sec-Fetch-Site`; only `same-origin` is the panel itself. Absent for a client
-/// that is not a browser, and for one too old to send it, which no page's script
-/// can be.
+/// `Sec-Fetch-Site`; only `same-origin` is the panel itself. The header is
+/// absent from a client that is not a browser, from a browser too old to send
+/// it, and from every browser on a plain-http address other than loopback; the
+/// last two are not told apart from the panel.
+fn from_other_origin(headers: &HeaderMap) -> bool {
+    headers.get("sec-fetch-site").is_some_and(|site| site != "same-origin")
+}
+
 fn cross_site_write(method: &Method, headers: &HeaderMap) -> bool {
-    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
-        && headers.get("sec-fetch-site").is_some_and(|site| site != "same-origin")
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) && from_other_origin(headers)
 }
 
 /// Refuses writes from another origin before any handler sees them, so a route
@@ -669,7 +673,12 @@ pub async fn live_ws(
 ) -> Response {
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
-    let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
+    // A sibling subdomain's script opens this with the cookie too, and a
+    // WebSocket is not held back by CORS: it would read the admin frame. Such a
+    // handshake is answered as an anonymous one.
+    let session = current_session(&headers)
+        .filter(|_| !from_other_origin(&headers))
+        .filter(|hash| app.db.session_valid(hash));
     if session.is_none() && !app.public_page() {
         return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
@@ -798,15 +807,6 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
     };
     if https_domain(origin).is_none() && !(loopback_origin(origin) && !app.site.is_empty()) {
         debug!("provisioning refused: Origin {origin:?} is not an https domain entry");
-        return Err(PROVISIONING_DENIED);
-    }
-    // States that the request belongs to the page it addresses, which `Origin`
-    // alone does not: the panel is the only caller, and a page elsewhere holds no
-    // session here anyway, `SameSite=Lax` keeping the cookie from it. Browsers
-    // predating the header send none, and the origin above remains the test.
-    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
-    if fetch_site.is_some_and(|site| site != "same-origin") {
-        debug!("provisioning refused: Sec-Fetch-Site {fetch_site:?} is not same-origin");
         return Err(PROVISIONING_DENIED);
     }
     Ok(())
@@ -2309,6 +2309,10 @@ mod tests {
             !cross_site_write(&Method::GET, &from("cross-site")),
             "reads are answered to the page that cannot read them"
         );
+        // A WebSocket handshake is a GET that the page can read.
+        assert!(from_other_origin(&from("same-site")));
+        assert!(!from_other_origin(&from("same-origin")));
+        assert!(!from_other_origin(&HeaderMap::new()));
     }
 
     fn app() -> App {
@@ -2385,10 +2389,6 @@ mod tests {
         let mut headers = good.clone();
         headers.remove(header::ORIGIN);
         assert_eq!(provisioning_allowed(&app, &headers), Err(ORIGIN_MISSING));
-        // A request sent from a page elsewhere.
-        headers = good.clone();
-        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
-        assert!(provisioning_allowed(&app, &headers).is_err());
 
         // Both panel paths refuse, and neither leaves anything behind.
         headers = good.clone();
