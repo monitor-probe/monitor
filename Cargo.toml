@@ -32,6 +32,9 @@ tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
 # tar.
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# The open-file limit, raised at startup. Pure Rust on Linux, so the cross-built
+# musl binary gains no C dependency.
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 serde_urlencoded = "0.7"

@@ -635,6 +635,16 @@ pub struct Stream {
     gzip: Option<String>,
 }
 
+/// How many anonymous streams may be open at once. The third bound of the
+/// anonymous paths, beside `HISTORY_GATE` and `main::RELAY_GATE`: a stream holds
+/// a descriptor and a task for as long as its page stays open, and at a hundred
+/// nodes sends about 7 KB/s of compressed frames, 55 KB/s to a page that does
+/// not ask for gzip. A thousand pages are 7 to 55 MB/s outbound, past what a
+/// status page draws at once. Beyond it a page falls back to polling
+/// `/api/nodes`, whose rendered frame every viewer shares.
+const PUBLIC_STREAMS: usize = 1000;
+static PUBLIC_STREAM_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(PUBLIC_STREAMS);
+
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
@@ -650,10 +660,20 @@ pub async fn live_ws(
     if session.is_none() && !app.public_page() {
         return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
-    upgrade
-        .read_buffer_size(SOCKET_BUFFER)
-        .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| stream_live(app, socket, session, stream.gzip.is_some()))
+    // Only anonymous streams count: a session is the operator's own, and the one
+    // that holds it can always open the panel.
+    let slot = match session {
+        Some(_) => None,
+        None => match PUBLIC_STREAM_GATE.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => return answer(StatusCode::SERVICE_UNAVAILABLE, "同时在线的访客太多，请稍后再试"),
+        },
+    };
+    upgrade.read_buffer_size(SOCKET_BUFFER).max_message_size(MAX_FRAME).on_upgrade(move |socket| async move {
+        // Held until the stream ends.
+        let _slot = slot;
+        stream_live(app, socket, session, stream.gzip.is_some()).await
+    })
 }
 
 async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>, gzip: bool) {
