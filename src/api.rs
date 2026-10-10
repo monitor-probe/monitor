@@ -1053,10 +1053,9 @@ pub async fn agent_register(
         Ok(_) => {}
     }
 
-    // The name comes from a machine not yet vouched for: control characters would
-    // break the panel's rows, and the length must be bounded. `chars()` rather
-    // than bytes, so the cut falls on a character boundary.
-    let name: String = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    // The name comes from a machine not yet vouched for, and is shown to every
+    // visitor until the operator renames the node.
+    let name = db::reported_text(name.trim(), 64);
     let name = if name.is_empty() { "unnamed".to_owned() } else { name };
     // Field defaults live in `Node`'s serde attributes and nowhere else.
     // `Node::default()` is a different set of values -- private, reset day 0 --
