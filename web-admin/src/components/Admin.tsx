@@ -2679,7 +2679,7 @@ function useSettings() {
         const fresh = await api<Settings>("/settings")
         setS((old) => {
           const next = { ...old }
-          for (const key of Object.keys(patch)) next[key] = fresh[key]
+          for (const key of [...Object.keys(patch), "your_address"]) next[key] = fresh[key]
           for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set")) next[key] = value
           return next
         })
@@ -2851,7 +2851,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           />
           <SwitchRow
             label="我确认源站只有 CDN 或隧道能连上"
-            hint="登录通知和限流取访客的真实地址"
+            hint={`登录通知和限流取访客的真实地址。保存后核对：当前认出你的地址是 ${s.your_address ?? "未知"}`}
             helpWidth="max-w-62 min-[392px]:max-w-90 min-[440px]:max-w-104"
             help={
               <>

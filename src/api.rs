@@ -2152,8 +2152,17 @@ pub async fn delete_session(_: Admin, State(app): State<Shared>, Path(id): Path<
     }
 }
 
-pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
+pub async fn settings(
+    _: Admin,
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Json<Value> {
     let mut out = serde_json::Map::new();
+    // The address this request is taken for under the saved `origin_cdn_only`,
+    // so the admin can see whether the switch recognizes them: behind a CDN the
+    // proxy's own address means it does not.
+    out.insert("your_address".into(), json!(client_ip(&app, &headers, peer.ip()).to_string()));
     for key in READABLE_SETTINGS {
         out.insert((*key).to_owned(), json!(app.db.get(key).unwrap_or_default()));
     }
@@ -2275,6 +2284,10 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    fn peer() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("198.51.100.7:40000".parse().unwrap())
     }
 
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,
@@ -3853,8 +3866,9 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
-        let Json(read) = settings(Admin, State(app.clone())).await;
+        let Json(read) = settings(Admin, State(app.clone()), peer(), HeaderMap::new()).await;
         assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
+        assert_eq!(read["your_address"], "198.51.100.7");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -3887,7 +3901,8 @@ mod tests {
         app.db.set("notify_webhook_url", "https://hooks.example/url-secret").unwrap();
         app.db.set("notify_webhook_headers", "Authorization: header-secret").unwrap();
 
-        let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
+        let Json(body) =
+            settings(Admin, axum::extract::State(std::sync::Arc::new(app)), peer(), HeaderMap::new()).await;
         assert_eq!(body["github_client_id"], "public-id");
         assert_eq!(body["github_secret_set"], true);
         assert_eq!(body["notify_webhook_url_set"], true);
