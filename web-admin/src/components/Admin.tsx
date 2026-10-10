@@ -524,7 +524,7 @@ function SwitchRow({ label, hint, extra, help, helpWidth, checked, onChange }: {
     <div className="flex items-start gap-2">
       <Switch aria-labelledby={id} checked={checked} onCheckedChange={onChange} className="mt-0.5" />
       <div className="space-y-1">
-        <div className="text-sm leading-snug">
+        <div className="text-sm leading-snug text-balance">
           <span id={id}>{label}</span>
           {help && (
             <span className="ml-1.5 inline-flex align-middle">
@@ -2852,7 +2852,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             onChange={(v) => set("public_page", v ? "on" : "off")}
           />
           <SwitchRow
-            label="我确认源站只有 Cloudflare 或隧道能连上"
+            label="我确认源站只对 Cloudflare 或隧道开放"
             hint="登录通知和限流取访客的真实地址"
             extra={
               <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
