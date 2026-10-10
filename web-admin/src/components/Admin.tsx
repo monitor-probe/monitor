@@ -2813,6 +2813,30 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               placeholder="https://ghfast.top"
             />
           </Field>
+          <Field
+            label="可信代理"
+            className="sm:col-span-2"
+            hint="hub 前面有 Cloudflare 以外的 CDN 时，填它的回源网段，登录通知和节点出口才显示真实地址；没有就留空"
+            helpWidth="max-w-62 min-[392px]:max-w-90"
+            help={
+              <>
+                <p>
+                  每行一个 IP 或网段，如 <span className="whitespace-nowrap">203.0.113.0/24</span>。
+                </p>
+                <p>名单里的地址写进 X-Forwarded-For 的内容会被采信，只填自己用的 CDN 或反代的回源地址。</p>
+                <p>源站要只允许 CDN 访问，否则绕过 CDN 的请求仍会被记成 CDN 的地址。</p>
+              </>
+            }
+          >
+            <textarea
+              className={`${TEXTAREA} min-h-20`}
+              rows={3}
+              spellCheck={false}
+              value={String(s.trusted_proxies ?? "")}
+              onChange={(e) => set("trusted_proxies", e.target.value)}
+              placeholder={"203.0.113.0/24\n2001:db8::/32"}
+            />
+          </Field>
         </div>
         {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
             aria-labelledby 保住读屏软件那边的关联。 */}
@@ -2834,6 +2858,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 // being the one value this key's write path refuses.
                 retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
+                trusted_proxies: String(s.trusted_proxies ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
               }).then((ok) => ok && onSaved())
             }

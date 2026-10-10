@@ -1003,7 +1003,7 @@ pub async fn agent_register(
     // a POSIX `sh`.
     name: String,
 ) -> Response {
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(&app, &headers, peer.ip());
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
@@ -1403,6 +1403,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "update_notice",
     "favicon",
     "touch_icon",
+    "trusted_proxies",
 ];
 
 // ---- the database itself ----
@@ -2214,6 +2215,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
+        "trusted_proxies" => crate::auth::parse_proxies(value).err(),
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("没有这个设置项：{key}")),

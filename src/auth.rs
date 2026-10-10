@@ -168,7 +168,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(&app, &headers, peer.ip());
     if app.throttle.locked(ip) {
         return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
     }
@@ -267,7 +267,7 @@ pub async fn github_callback(
         Ok(cookie) => cookie,
         Err(e) => return sign_in_failed(&app, &headers, e),
     };
-    crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&headers, peer.ip()));
+    crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&app, &headers, peer.ip()));
     with_cookies(Redirect::to("/admin/nodes"), [clear_state(&app, &headers), session])
 }
 
@@ -398,40 +398,116 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
     Ok(user.login)
 }
 
-/// Peer address, or the last hop in X-Forwarded-For when the request arrived
-/// through a local reverse proxy. Used for throttling and for the address shown
-/// beside a node, never for authorization.
-///
-/// The header is honoured only when the peer is itself local. Otherwise a
-/// caller could mint a fresh identity per request, bypassing the lockout and
-/// growing the throttle map without bound.
-///
-/// The last value is taken, not the first. Both documented proxies append
-/// rather than replace -- nginx's `$proxy_add_x_forwarded_for`, caddy's
-/// `reverse_proxy` default -- so a caller supplying its own `X-Forwarded-For`
-/// leaves that value at the head while the address the proxy observed lands at
-/// the tail. Reading the head would return control of the lockout to the
-/// caller: rotating the header makes every attempt a fresh address, and writing
-/// the operator's address locks them out of the sign-in page.
-///
-/// A second trusted proxy in front of the local one places its own address at
-/// the tail instead. No single value in this header identifies the client, so
-/// such a deployment must have its edge write the client address.
-///
-/// Both addresses are canonicalized: the default dual-stack `[::]` listener
-/// reports IPv4 peers, 127.0.0.1 included, as `::ffff:a.b.c.d`, which no IPv6
-/// range below recognizes as local.
-pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
-    let peer = peer.to_canonical();
-    if !behind_local_proxy(peer) {
-        return peer;
+/// A network the operator named as one of their own proxies, or a single
+/// address: the form `trusted_proxies` entries parse into.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Net {
+    addr: IpAddr,
+    len: u8,
+}
+
+impl Net {
+    /// Narrowest bounds an entry may span. A prefix any wider covers more of the
+    /// internet than any proxy fleet, and trusting it hands every caller the
+    /// right to name its own address.
+    const WIDEST_V4: u8 = 8;
+    const WIDEST_V6: u8 = 16;
+
+    fn parse(entry: &str) -> Option<Net> {
+        let (addr, len) = match entry.split_once('/') {
+            Some((addr, len)) => (addr, Some(len.parse::<u8>().ok()?)),
+            None => (entry, None),
+        };
+        let addr = addr.parse::<IpAddr>().ok()?.to_canonical();
+        let (widest, longest) = if addr.is_ipv4() { (Self::WIDEST_V4, 32) } else { (Self::WIDEST_V6, 128) };
+        let len = len.unwrap_or(longest);
+        (widest..=longest).contains(&len).then_some(Net { addr, len })
     }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').next())
-        .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        .map_or(peer, |ip| ip.to_canonical())
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(self.len)).unwrap_or(0);
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX.checked_shl(128 - u32::from(self.len)).unwrap_or(0);
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Longest `trusted_proxies` value. The list is parsed on each sign-in and
+/// each node connection; a CDN's published ranges come to a few KiB.
+const MAX_PROXIES: usize = 8 * 1024;
+
+/// Reads a `trusted_proxies` value: addresses and CIDR ranges separated by
+/// whitespace, commas or semicolons. The error is the sentence the panel shows.
+pub fn parse_proxies(text: &str) -> Result<Vec<Net>, String> {
+    if text.len() > MAX_PROXIES {
+        return Err(format!("可信代理名单最多 {} KiB", MAX_PROXIES / 1024));
+    }
+    text.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            Net::parse(entry).ok_or_else(|| {
+                format!(
+                    "可信代理里的「{entry}」不是 IP 或网段；写成 203.0.113.0/24 或单个地址，\
+                     网段不能比 IPv4 /8、IPv6 /16 更宽"
+                )
+            })
+        })
+        .collect()
+}
+
+/// The address a request came from: the peer, or, when the peer is a proxy the
+/// operator trusts, the one it says it received the request from.
+///
+/// A proxy appends the address it observed to `X-Forwarded-For`, so the header
+/// is read from its tail, one hop at a time, for as long as the address just
+/// read is itself a proxy. The first address that is not one is the client.
+/// Trusted are this machine and its private networks, where a reverse proxy
+/// resides, and the `trusted_proxies` setting, where a CDN's edge is named: with
+/// the edge listed, `client, edge` behind a local nginx resolves to `client`;
+/// unlisted, to the edge, which every visitor then shares.
+///
+/// Reading from the tail is what keeps the header unforgeable. A caller's own
+/// `X-Forwarded-For` sits at the head, and the walk stops at the first address
+/// it does not trust, which is the one the nearest proxy observed. A peer that is
+/// no proxy has the whole header ignored, as one could otherwise mint a fresh
+/// identity per request, bypassing the lockout and growing the throttle map
+/// without bound.
+///
+/// Used for throttling and for the address shown beside a node, never for
+/// authorization. Addresses are canonicalized: the default dual-stack `[::]`
+/// listener reports IPv4 peers, 127.0.0.1 included, as `::ffff:a.b.c.d`, which
+/// no IPv6 range recognizes as local.
+pub fn client_ip(app: &crate::App, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+    let proxies = app.db.get("trusted_proxies").map(|v| parse_proxies(&v).unwrap_or_default());
+    walk(proxies.as_deref().unwrap_or_default(), headers, peer)
+}
+
+fn walk(proxies: &[Net], headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+    let trusted = |ip: IpAddr| behind_local_proxy(ip) || proxies.iter().any(|net| net.contains(ip));
+    let mut addr = peer.to_canonical();
+    let hops = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .rev()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.rsplit(','));
+    for hop in hops {
+        if !trusted(addr) {
+            break;
+        }
+        match hop.trim().parse::<IpAddr>() {
+            Ok(ip) => addr = ip.to_canonical(),
+            Err(_) => break,
+        }
+    }
+    addr
 }
 
 /// Where a node's connection came from: its exit on the panel, and the address
@@ -443,12 +519,12 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
 /// Cloudflare's network -- a Worker's raw socket, for one -- can write it. A
 /// token holder, the only caller here, can report any address of its own
 /// already.
-pub fn node_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+pub fn node_ip(app: &crate::App, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     headers
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        .map_or_else(|| client_ip(headers, peer), |ip| ip.to_canonical())
+        .map_or_else(|| client_ip(app, headers, peer), |ip| ip.to_canonical())
 }
 
 /// Loopback or a private network, where a reverse proxy resides.
@@ -594,6 +670,7 @@ mod tests {
     #[test]
     fn forwarded_header_is_trusted_only_behind_a_local_proxy() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let app = crate::App::for_test(crate::db::Db::open(":memory:").unwrap());
         let xff = |v: &str| {
             let mut h = HeaderMap::new();
             h.insert("x-forwarded-for", v.parse().unwrap());
@@ -602,7 +679,7 @@ mod tests {
 
         // Nothing arrived with the request: the proxy appended the single
         // address it observed, which is the entire header.
-        assert_eq!(client_ip(&xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&app, &xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
 
         // The caller supplied a header of its own. Both documented proxies
         // append, so the fabricated value sits at the head and the proxy's
@@ -610,30 +687,88 @@ mod tests {
         // own throttle bucket each request, or claim the operator's address.
         let forged = xff("10.0.0.2, 198.51.100.9");
         for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
-            assert_eq!(client_ip(&forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
+            assert_eq!(client_ip(&app, &forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
         }
 
         // A dual-stack `[::]` listener reports an IPv4 proxy as `::ffff:a.b.c.d`,
         // which is the same local peer.
-        assert_eq!(client_ip(&forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(&HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(&app, &forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&app, &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
 
         // Directly from the internet the entire header is caller-supplied, and
         // honouring any part of it bypasses the lockout.
-        assert_eq!(client_ip(&forged, ip("203.0.113.5")), ip("203.0.113.5"));
-        assert_eq!(client_ip(&forged, ip("2001:db8::5")), ip("2001:db8::5"));
+        assert_eq!(client_ip(&app, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(&app, &forged, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer address is used.
-        assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+        assert_eq!(client_ip(&app, &HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
 
         // Cloudflare in front of the local proxy: the tail is its edge. The
         // throttle stays on it, as anyone on Cloudflare's network can write
         // CF-Connecting-IP; a node's address follows the header.
         let mut edge = xff("10.0.0.2, 203.0.113.7, 162.158.88.126");
         edge.insert("cf-connecting-ip", "::ffff:203.0.113.7".parse().unwrap());
-        assert_eq!(client_ip(&edge, ip("127.0.0.1")), ip("162.158.88.126"));
-        assert_eq!(node_ip(&edge, ip("127.0.0.1")), ip("203.0.113.7"));
+        assert_eq!(client_ip(&app, &edge, ip("127.0.0.1")), ip("162.158.88.126"));
+        assert_eq!(node_ip(&app, &edge, ip("127.0.0.1")), ip("203.0.113.7"));
         // Without the header a node's address is the same as the throttle's.
-        assert_eq!(node_ip(&forged, ip("127.0.0.1")), ip("198.51.100.9"));
-        assert_eq!(node_ip(&forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(node_ip(&app, &forged, ip("127.0.0.1")), ip("198.51.100.9"));
+        assert_eq!(node_ip(&app, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+    }
+
+    /// Naming a CDN's edge turns `client, edge` behind a local proxy, or a lone
+    /// `client` from an edge connecting straight to the hub, into the client --
+    /// and only while the walk reaches the client through proxies alone.
+    #[test]
+    fn a_listed_edge_is_seen_through_and_nothing_else_is() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let app = crate::App::for_test(crate::db::Db::open(":memory:").unwrap());
+        let xff = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-for", v.parse().unwrap());
+            h
+        };
+        app.db.set("trusted_proxies", "162.158.0.0/15, 2400:cb00::/32").unwrap();
+
+        // CDN, then the local nginx.
+        assert_eq!(
+            client_ip(&app, &xff("198.51.100.9, 162.158.88.126"), ip("127.0.0.1")),
+            ip("198.51.100.9")
+        );
+        assert_eq!(client_ip(&app, &xff("2001:db8::7, 2400:cb00::1"), ip("::1")), ip("2001:db8::7"));
+        // The edge reaching the hub itself.
+        assert_eq!(client_ip(&app, &xff("198.51.100.9"), ip("162.158.88.126")), ip("198.51.100.9"));
+        // A caller's own header ahead of the edge's does not get past it: the
+        // walk ends at the first address that is no proxy.
+        assert_eq!(
+            client_ip(&app, &xff("10.9.9.9, 198.51.100.9, 162.158.88.126"), ip("127.0.0.1")),
+            ip("198.51.100.9")
+        );
+        // The origin reached around the CDN: the proxy observed the caller, who
+        // is not listed, so whatever it wrote ahead of that is ignored.
+        assert_eq!(client_ip(&app, &xff("198.51.100.9, 192.0.2.66"), ip("127.0.0.1")), ip("192.0.2.66"));
+        // A listed address elsewhere in the world is still a peer, not a header.
+        assert_eq!(client_ip(&app, &xff("198.51.100.9"), ip("203.0.113.5")), ip("203.0.113.5"));
+        // Several header lines read as one list, last line last.
+        let mut two = HeaderMap::new();
+        two.append("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        two.append("x-forwarded-for", "162.158.88.126".parse().unwrap());
+        assert_eq!(client_ip(&app, &two, ip("127.0.0.1")), ip("198.51.100.9"));
+        // Junk ends the walk where it stands.
+        assert_eq!(client_ip(&app, &xff("198.51.100.9, nonsense"), ip("127.0.0.1")), ip("127.0.0.1"));
+    }
+
+    #[test]
+    fn trusted_proxy_entries_are_addresses_or_bounded_ranges() {
+        for ok in ["203.0.113.7", "203.0.113.0/24", "2001:db8::/32", "10.0.0.0/8", "::ffff:203.0.113.7", ""] {
+            assert!(parse_proxies(ok).is_ok(), "{ok:?}");
+        }
+        assert_eq!(parse_proxies("1.2.3.0/24;\n4.5.6.7 , 2001:db8::/32").unwrap().len(), 3);
+        for bad in
+            ["0.0.0.0/0", "::/0", "8.0.0.0/7", "2000::/15", "203.0.113.0/33", "cdn.example.com", "1.2.3"]
+        {
+            assert!(parse_proxies(bad).is_err(), "{bad:?}");
+        }
+        assert!(Net::parse("203.0.113.0/24").unwrap().contains("203.0.113.200".parse().unwrap()));
+        assert!(!Net::parse("203.0.113.0/24").unwrap().contains("203.0.114.1".parse().unwrap()));
+        assert!(!Net::parse("203.0.113.0/24").unwrap().contains("2001:db8::1".parse().unwrap()));
     }
 }
