@@ -506,6 +506,37 @@ function Field({ label, hint, help, helpWidth, className = "", children }: {
   )
 }
 
+// A switch with its label, in the same two registers as `Field`: what it does
+// in one line underneath, and why or at what risk behind the question mark. Not
+// a <label>: a tap on the words must not flip the switch, only the switch is
+// pressable. aria-labelledby keeps the association for screen readers.
+function SwitchRow({ label, hint, help, helpWidth, checked, onChange }: {
+  label: string
+  hint?: string
+  help?: React.ReactNode
+  helpWidth?: string
+  checked: boolean
+  onChange: (on: boolean) => void
+}) {
+  const id = useId()
+  return (
+    <div className="flex items-start gap-2">
+      <Switch aria-labelledby={id} checked={checked} onCheckedChange={onChange} className="mt-0.5" />
+      <div className="space-y-1">
+        <div className="text-sm leading-snug">
+          <span id={id}>{label}</span>
+          {help && (
+            <span className="ml-1.5 inline-flex align-middle">
+              <Help width={helpWidth}>{help}</Help>
+            </span>
+          )}
+        </div>
+        {hint && <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">{hint}</p>}
+      </div>
+    </div>
+  )
+}
+
 // A tap shows no tooltip on its own, so a click opens it as well. The trigger's
 // own handlers would close it on press and on click; both are prevented.
 //
@@ -2800,13 +2831,9 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           </Field>
           <Field
             label="GitHub 代理"
-            helpWidth="max-w-58 min-[376px]:max-w-86 min-[432px]:max-w-100"
-            help={
-              <>
-                <p>留空直连。仅在 hub 自己拉不到 GitHub Release 时填。</p>
-                <p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>
-              </>
-            }
+            hint="留空直连，只在 hub 拉不到 GitHub Release 时填"
+            helpWidth="max-w-58 min-[376px]:max-w-86"
+            help={<p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>}
           >
             <Input
               value={String(s.github_proxy ?? "")}
@@ -2814,56 +2841,60 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               placeholder="https://ghfast.top"
             />
           </Field>
-          <div className="space-y-3 sm:col-span-2">
-            <div className="space-y-2">
-              <div className="flex items-center gap-2 text-sm">
-                <Switch
-                  aria-labelledby="origin-cdn-only-label"
-                  checked={cdnOnly}
-                  onCheckedChange={(v) => set("origin_cdn_only", v ? "on" : "off")}
-                />
-                <span id="origin-cdn-only-label">hub 前面有 CDN，且源站只允许 CDN 访问</span>
-              </div>
-              <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">
-                {"打开后，登录通知和限流直接取访客的真实地址，不用填 IP。节点地址不受影响，本来就不用配置。没有 CDN 就不用管这里。"}
-              </p>
-              <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">
-                {"打开前先确认源站只有 CDN 连得上：用隧道（源站不开公网端口），或防火墙只放行 CDN 的回源地址，或 CDN 回源带密钥头、反代没带就拒绝。做不到却打开，别人直连源站自己写 X-Forwarded-For，就能每次换一个地址猜密码，限流形同虚设。"}
-              </p>
-            </div>
-            <details className="group" open={!cdnOnly && String(s.trusted_proxies ?? "") !== ""}>
-              <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md text-sm font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
-                <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
-                源站做不到上面那样，只想信任指定的 CDN 网段
-              </summary>
-              <div className="mt-3 space-y-2">
+        </div>
+        <div className="space-y-4">
+          <SwitchRow
+            label="开放公开状态页"
+            hint="关闭后所有页面需登录"
+            checked={s.public_page !== "off"}
+            onChange={(v) => set("public_page", v ? "on" : "off")}
+          />
+          <SwitchRow
+            label="hub 前面有 CDN，且源站只允许 CDN 访问"
+            hint="登录通知和限流取访客的真实地址，不用填 IP；没有 CDN 不用管"
+            helpWidth="max-w-62 min-[392px]:max-w-90 min-[440px]:max-w-104"
+            help={
+              <>
+                <p>打开前先确认源站只有 CDN 连得上，做法有三种：</p>
+                <p>用隧道，源站不开公网端口；防火墙只放行 CDN 的回源地址；CDN 回源带一个密钥头，反代没带就拒绝。</p>
+                <p>
+                  做不到却打开，别人直连源站自己写 <span className="whitespace-nowrap">X-Forwarded-For</span>
+                  ，就能每次换一个地址猜密码，限流形同虚设。
+                </p>
+              </>
+            }
+            checked={cdnOnly}
+            onChange={(v) => set("origin_cdn_only", v ? "on" : "off")}
+          />
+          <details className="group" open={!cdnOnly && String(s.trusted_proxies ?? "") !== ""}>
+            <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md text-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+              <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+              改为只信任指定的 CDN 网段
+            </summary>
+            <div className="mt-3">
+              <Field
+                label="可信代理"
+                hint={cdnOnly ? "上面的开关已打开，名单暂时不起作用" : "每行一个 IP 或网段，填 CDN 公布的回源网段"}
+                helpWidth="max-w-58 min-[376px]:max-w-86"
+                help={
+                  <>
+                    <p>只有名单里的地址写进 X-Forwarded-For 的内容会被采信。</p>
+                    <p>直连源站的请求仍按它自己的地址计，所以不要求源站只允许 CDN 访问。</p>
+                  </>
+                }
+              >
                 <textarea
                   className={`${TEXTAREA} min-h-20 disabled:opacity-50`}
                   rows={3}
                   spellCheck={false}
                   disabled={cdnOnly}
-                  aria-label="可信代理"
                   value={String(s.trusted_proxies ?? "")}
                   onChange={(e) => set("trusted_proxies", e.target.value)}
                   placeholder={"203.0.113.0/24\n2001:db8::/32"}
                 />
-                <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">
-                  {"每行一个 IP 或网段，填 CDN 公布的回源网段。只有名单里的地址写进 X-Forwarded-For 的内容会被采信，直连源站的请求仍按它自己的地址计。"}
-                  {cdnOnly ? "上面的开关已打开，名单暂时不起作用。" : ""}
-                </p>
-              </div>
-            </details>
-          </div>
-        </div>
-        {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
-            aria-labelledby 保住读屏软件那边的关联。 */}
-        <div className="flex items-center gap-2 text-sm">
-          <Switch
-            aria-labelledby="public-page-label"
-            checked={s.public_page !== "off"}
-            onCheckedChange={(v) => set("public_page", v ? "on" : "off")}
-          />
-          <span id="public-page-label">开放公开状态页，关闭后所有页面需登录</span>
+              </Field>
+            </div>
+          </details>
         </div>
         <div>
           <Button
