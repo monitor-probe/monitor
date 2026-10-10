@@ -2855,12 +2855,13 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             helpWidth="max-w-62 min-[392px]:max-w-90 min-[440px]:max-w-104"
             help={
               <>
-                <p>打开前先确认源站只有 CDN 连得上，做法有三种：</p>
-                <p>用隧道，源站不开公网端口；防火墙只放行 CDN 的回源地址；CDN 回源带一个密钥头，反代没带就拒绝。</p>
+                <p>打开前先确认源站只有 CDN 连得上：用隧道，源站不开公网端口；或让 CDN 回源带一个密钥头，反代没带就拒绝。</p>
+                <p>只放行 CDN 的回源地址不够，同一个 CDN 上别人的 Worker 也从那些地址连过来。</p>
                 <p>
-                  不是却打开，别人直连源站自己写 <span className="whitespace-nowrap">X-Forwarded-For</span>
-                  ，就能每次换一个地址猜密码，限流形同虚设。
+                  不是却打开，别人直连源站自己写 <span className="whitespace-nowrap">CF-Connecting-IP</span> 或{" "}
+                  <span className="whitespace-nowrap">X-Forwarded-For</span>，就能每次换一个地址猜密码，限流形同虚设。
                 </p>
+                <p>不是 Cloudflare 的 CDN，还要在反代上配 realip。</p>
               </>
             }
             checked={cdnOnly}
