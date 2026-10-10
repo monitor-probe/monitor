@@ -4,9 +4,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -35,6 +36,28 @@ impl FromRequestParts<Shared> for Admin {
             Err(answer(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录"))
         }
     }
+}
+
+/// Whether this is a write that a page on another site sent. `SameSite=Lax`
+/// holds a cookie back from other *sites*, but a sibling subdomain of the hub's
+/// registrable domain is the same site: its script may send a request without a
+/// body (`no-cors`, no preflight) and the cookie goes along, which suffices for
+/// a token reset or a vacuum. Browsers name where a request came from in
+/// `Sec-Fetch-Site`; only `same-origin` is the panel itself. Absent for a client
+/// that is not a browser, and for one too old to send it, which no page's script
+/// can be.
+fn cross_site_write(method: &Method, headers: &HeaderMap) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        && headers.get("sec-fetch-site").is_some_and(|site| site != "same-origin")
+}
+
+/// Refuses writes from another origin before any handler sees them, so a route
+/// added later is covered without remembering to ask.
+pub async fn same_origin_writes(request: Request, next: Next) -> Response {
+    if cross_site_write(request.method(), request.headers()) {
+        return answer(StatusCode::FORBIDDEN, "请求来自其他网站，已拒绝");
+    }
+    next.run(request).await
 }
 
 /// Marks a response whose text was written for the reader; see [`plain_errors`].
@@ -2267,6 +2290,25 @@ mod tests {
             (header::ORIGIN, "https://monitor.example.com".parse().unwrap()),
             (header::HeaderName::from_static("sec-fetch-site"), "same-origin".parse().unwrap()),
         ])
+    }
+
+    /// A sibling subdomain is the same site, so `SameSite=Lax` lets its bodiless
+    /// POST carry the session; only `Sec-Fetch-Site` tells it from the panel.
+    #[test]
+    fn a_write_from_another_origin_is_refused() {
+        let from = |site: &str| {
+            HeaderMap::from_iter([(header::HeaderName::from_static("sec-fetch-site"), site.parse().unwrap())])
+        };
+        for site in ["same-site", "cross-site", "none"] {
+            assert!(cross_site_write(&Method::POST, &from(site)), "{site}");
+            assert!(cross_site_write(&Method::DELETE, &from(site)), "{site}");
+        }
+        assert!(!cross_site_write(&Method::POST, &from("same-origin")));
+        assert!(!cross_site_write(&Method::POST, &HeaderMap::new()), "not a browser, or one too old to say");
+        assert!(
+            !cross_site_write(&Method::GET, &from("cross-site")),
+            "reads are answered to the page that cannot read them"
+        );
     }
 
     fn app() -> App {

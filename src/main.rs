@@ -541,8 +541,9 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
                 .with_state(app.clone()),
         )
+        .layer(axum::middleware::from_fn(api::same_origin_writes))
         .layer(axum::middleware::map_response(api::plain_errors))
-        // Agents, merged after that layer: `install.sh` and the agent print these
+        // Agents, merged after those layers: `install.sh` and the agent print these
         // replies beside their own English output, so they are left as written.
         .merge(
             Router::new()
