@@ -1054,8 +1054,9 @@ pub async fn agent_register(
     }
 
     // The name comes from a machine not yet vouched for, and is shown to every
-    // visitor until the operator renames the node.
-    let name = db::reported_text(name.trim(), 64);
+    // visitor until the operator renames the node. Trimmed last: a name made of
+    // markup characters and spaces must come out empty, not as a blank.
+    let name = db::reported_text(&name, 64).trim().to_owned();
     let name = if name.is_empty() { "unnamed".to_owned() } else { name };
     // Field defaults live in `Node`'s serde attributes and nowhere else.
     // `Node::default()` is a different set of values -- private, reset day 0 --
@@ -3510,6 +3511,32 @@ mod tests {
         assert_ne!(fresh, token);
         assert!(app.db.node_by_token(&fresh).unwrap().is_some());
         assert_eq!(app.db.nodes().unwrap().len(), 1);
+    }
+
+    /// The name comes from an unvouched machine: markup characters are dropped,
+    /// and what that leaves is trimmed, so a name made only of them is `unnamed`.
+    #[tokio::test]
+    async fn a_registered_name_loses_markup_and_is_never_blank() {
+        let app = std::sync::Arc::new(app());
+        open_register(Admin, State(app.clone()), panel_headers()).await;
+        let key = app.db.get("register_key").unwrap();
+        for (sent, stored) in [("< >", "unnamed"), ("<b>web</b>", "bweb/b"), ("Tom's \"VPS\"", "Toms VPS")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+            let reply = agent_register(
+                State(app.clone()),
+                ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+                headers,
+                sent.to_owned(),
+            )
+            .await;
+            let token = String::from_utf8(
+                axum::body::to_bytes(reply.into_body(), usize::MAX).await.unwrap().to_vec(),
+            )
+            .unwrap();
+            let id = app.db.node_by_token(&token).unwrap().expect("token opens a node");
+            assert_eq!(app.db.node(id).unwrap().unwrap().name, stored, "sent {sent:?}");
+        }
     }
 
     /// The ceiling on the anonymous route: a leaked key cannot fill the table.

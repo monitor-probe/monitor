@@ -92,7 +92,7 @@ fi
 	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
 	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS]" >&2
 	echo "       install.sh --uninstall" >&2
-	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
+	echo "--name NAME names the node --register creates; the hostname otherwise. < > \" ' are dropped from it; the panel renames a node freely" >&2
 	exit 2
 }
 # Names the node a registration creates. A token belongs to a node that already
