@@ -88,7 +88,17 @@ impl Default for Throttle {
 }
 
 impl Throttle {
+    /// An IPv6 visitor holds a whole /64, so the full address as key would be a
+    /// fresh bucket per attempt.
+    fn key(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (!0u128 << 64)).into()),
+            v4 => v4,
+        }
+    }
+
     pub(crate) fn locked(&self, ip: IpAddr) -> bool {
+        let ip = Self::key(ip);
         let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         match map.get(&ip) {
             Some((n, since)) if since.elapsed() < self.window => *n >= MAX_ATTEMPTS,
@@ -101,6 +111,7 @@ impl Throttle {
     }
 
     pub(crate) fn record_failure(&self, ip: IpAddr) {
+        let ip = Self::key(ip);
         let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         // Addresses past their window are dropped here rather than allowed to
         // accumulate, which also restarts the count for a returning address.
@@ -109,7 +120,7 @@ impl Throttle {
     }
 
     pub(crate) fn clear(&self, ip: IpAddr) {
-        self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&ip);
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&Self::key(ip));
     }
 }
 
@@ -399,8 +410,8 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
-/// through a local reverse proxy. Used for throttling and for the address shown
-/// beside a node, never for authorization.
+/// through a local reverse proxy. Used for throttling and the sign-in
+/// notification, never for authorization.
 ///
 /// The header is honoured only when the peer is itself local. Otherwise a
 /// caller could mint a fresh identity per request, bypassing the lockout and
@@ -418,19 +429,24 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
 /// the tail instead. No single value in this header identifies the client, so
 /// such a deployment must have its edge write the client address.
 ///
+/// With `origin_cdn_only` on, the operator states that nothing but a CDN or
+/// tunnel can reach the hub, and the peer no longer matters: the visitor is
+/// `CF-Connecting-IP`, which Cloudflare overwrites, else the rightmost public
+/// address in `X-Forwarded-For`, past any private hops a local proxy appended.
+/// Rightmost, because a CDN appends what it saw and everything before that is
+/// the caller's. Behind a public proxy of the operator's own the tail is still
+/// that proxy's address, which its realip setting turns into the visitor. The
+/// operator's statement is theirs to have made true -- a tunnel with no public
+/// port, a secret header the CDN adds and the proxy requires -- and with it
+/// untrue the caller writes its own address and the lockout means nothing.
+///
 /// Both addresses are canonicalized: the default dual-stack `[::]` listener
 /// reports IPv4 peers, 127.0.0.1 included, as `::ffff:a.b.c.d`, which no IPv6
 /// range below recognizes as local.
-///
-/// With `origin_cdn_only` on, the operator states that nothing but a CDN can
-/// reach the hub, and the address is read as for a node: what the CDN wrote,
-/// whoever the peer is. That answer is theirs to have made true -- a tunnel with
-/// no public port, a firewall on the CDN's ranges, a secret header the proxy
-/// requires -- and with it untrue a caller writes its own address, and the
-/// lockout means nothing.
 pub fn client_ip(app: &crate::App, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     if app.db.get("origin_cdn_only").as_deref() == Some("on") {
-        if let Some(ip) = forwarded_client(headers) {
+        let visitor = written(headers, "cf-connecting-ip").next();
+        if let Some(ip) = visitor.or_else(|| written(headers, "x-forwarded-for").last()) {
             return ip;
         }
     }
@@ -446,20 +462,17 @@ pub fn client_ip(app: &crate::App, headers: &HeaderMap, peer: IpAddr) -> IpAddr 
         .map_or(peer, |ip| ip.to_canonical())
 }
 
-/// The client address a proxy in front wrote: `CF-Connecting-IP` if there is
-/// one, else the first public address in `X-Forwarded-For`, which is where a
-/// CDN puts the address it received the connection from. Anyone can write
-/// either, so it is read only where that is acceptable.
-fn forwarded_client(headers: &HeaderMap) -> Option<IpAddr> {
-    let header_ip = |name: &str| {
-        headers.get_all(name).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).find_map(
-            |v| {
-                let ip = v.trim().parse::<IpAddr>().ok()?.to_canonical();
-                (name == "cf-connecting-ip" || crate::agent_ws::public(ip)).then_some(ip)
-            },
-        )
-    };
-    header_ip("cf-connecting-ip").or_else(|| header_ip("x-forwarded-for"))
+/// The public addresses written in a header, in order, however many lines and
+/// commas it spans. Private and unparseable entries are passed over.
+fn written<'a>(headers: &'a HeaderMap, name: &str) -> impl Iterator<Item = IpAddr> + 'a {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|v| v.trim().parse::<IpAddr>().ok())
+        .map(|ip| ip.to_canonical())
+        .filter(|ip| crate::agent_ws::public(*ip))
 }
 
 /// Where a node's connection came from: its exit on the panel, and the address
@@ -472,13 +485,15 @@ fn forwarded_client(headers: &HeaderMap) -> Option<IpAddr> {
 /// [`client_ip`] sees the edge.
 ///
 /// That would be no way to read a throttle's key, which anyone can write to
-/// lock others out or to slip past a lockout, so [`client_ip`] is strict unless
-/// the operator has declared otherwise. Here a forged value costs the forger
-/// only a wrong address beside their own node: a token holder reports any
-/// public address of its own in the hello already, and the country lookup
+/// lock others out or to slip past a lockout. Here a forged value costs the
+/// forger only a wrong address beside their own node: a token holder reports
+/// any public address of its own in the hello already, and the country lookup
 /// follows what was believed, as it did for `CF-Connecting-IP`.
 pub fn node_ip(app: &crate::App, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
-    forwarded_client(headers).unwrap_or_else(|| client_ip(app, headers, peer))
+    let written_by_proxy = written(headers, "cf-connecting-ip").next();
+    written_by_proxy
+        .or_else(|| written(headers, "x-forwarded-for").next())
+        .unwrap_or_else(|| client_ip(app, headers, peer))
 }
 
 /// Loopback or a private network, where a reverse proxy resides.
@@ -690,30 +705,56 @@ mod tests {
         junk.insert("x-forwarded-for", "nonsense, 10.0.0.9".parse().unwrap());
         assert_eq!(node_ip(&app, &junk, ip("127.0.0.1")), ip("10.0.0.9"));
     }
-    /// The operator's statement that only a CDN reaches the hub makes the
-    /// throttle's address the one the CDN wrote -- and, said falsely, nothing
-    /// else holds: the caller writes it.
+
+    /// With the origin declared reachable by a CDN only, the visitor is what the
+    /// CDN wrote, and what the caller put ahead of it never chooses the key.
     #[test]
     fn with_the_origin_declared_cdn_only_the_visitor_is_the_address() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let app = crate::App::for_test(crate::db::Db::open(":memory:").unwrap());
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", "198.51.100.77, 162.158.88.126".parse().unwrap());
-        // Off, and not set at all, is the strict rule: the edge.
-        assert_eq!(client_ip(&app, &h, ip("127.0.0.1")), ip("162.158.88.126"));
+        let xff = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-for", v.parse().unwrap());
+            h
+        };
+        // A tunnel, then the local proxy that appended the tunnel's address,
+        // behind a caller-written prefix: the CDN's entry is the one to take.
+        let tunnel = xff("192.0.2.1, 198.51.100.77, 127.0.0.1");
+        // Off, and not set at all, is the strict rule.
+        assert_eq!(client_ip(&app, &tunnel, ip("127.0.0.1")), ip("127.0.0.1"));
         app.db.set("origin_cdn_only", "off").unwrap();
-        assert_eq!(client_ip(&app, &h, ip("127.0.0.1")), ip("162.158.88.126"));
+        assert_eq!(client_ip(&app, &tunnel, ip("127.0.0.1")), ip("127.0.0.1"));
 
         app.db.set("origin_cdn_only", "on").unwrap();
-        // Behind a local proxy, or the CDN itself reaching the hub.
         for peer in ["127.0.0.1", "10.0.0.1", "162.158.88.126"] {
-            assert_eq!(client_ip(&app, &h, ip(peer)), ip("198.51.100.77"), "{peer}");
+            assert_eq!(client_ip(&app, &tunnel, ip(peer)), ip("198.51.100.77"), "{peer}");
         }
+        // The tunnel straight into the hub.
+        assert_eq!(client_ip(&app, &xff("192.0.2.1, 198.51.100.77"), ip("127.0.0.1")), ip("198.51.100.77"));
+        // Cloudflare writes the header itself, whatever the list says.
+        let mut cf = xff("192.0.2.1, 198.51.100.77, 162.158.88.126");
+        cf.insert("cf-connecting-ip", "198.51.100.88".parse().unwrap());
+        assert_eq!(client_ip(&app, &cf, ip("127.0.0.1")), ip("198.51.100.88"));
+        // A private value there is not a visitor.
+        cf.insert("cf-connecting-ip", "127.0.0.1".parse().unwrap());
+        assert_eq!(client_ip(&app, &cf, ip("127.0.0.1")), ip("162.158.88.126"));
+        // A CDN edge that is the proxy's peer is the tail, and stays one bucket.
+        let edge = xff("192.0.2.1, 198.51.100.77, 162.158.88.126");
+        assert_eq!(client_ip(&app, &edge, ip("127.0.0.1")), ip("162.158.88.126"));
         // Nothing written: the peer, as ever.
         assert_eq!(client_ip(&app, &HeaderMap::new(), ip("203.0.113.5")), ip("203.0.113.5"));
         // The cost of saying it falsely.
-        let mut forged = HeaderMap::new();
-        forged.insert("x-forwarded-for", "192.0.2.1".parse().unwrap());
-        assert_eq!(client_ip(&app, &forged, ip("203.0.113.5")), ip("192.0.2.1"));
+        assert_eq!(client_ip(&app, &xff("192.0.2.1"), ip("203.0.113.5")), ip("192.0.2.1"));
+    }
+
+    #[test]
+    fn an_ipv6_visitor_is_one_bucket_per_64() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let throttle = Throttle::default();
+        for n in 0..MAX_ATTEMPTS {
+            throttle.record_failure(ip(&format!("2001:db8:1:2::{n:x}")));
+        }
+        assert!(throttle.locked(ip("2001:db8:1:2:ffff::1")));
+        assert!(!throttle.locked(ip("2001:db8:1:3::1")));
     }
 }
