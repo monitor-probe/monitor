@@ -517,7 +517,7 @@ export function useNodes() {
         return
       }
       socket = opened
-      // Re-armed by every frame read. Five of the hub's two-second pushes without one
+      // Re-armed by every frame. Five of the hub's two-second pushes without one
       // mean the connection died without closing, as when a NAT on the path
       // forgets it or the hub's machine drops off the network; the browser sends
       // nothing on it and would notice only when TCP keepalive gives up, 450 s
@@ -537,10 +537,16 @@ export function useNodes() {
       // Only a frame that parses re-arms the watchdog, so a stream whose frames
       // cannot be read counts as silent and is replaced.
       opened.onmessage = (event) => {
-        const frame = JSON.parse(event.data)
+        let nodes, admin
+        try {
+          ;({ nodes, admin } = JSON.parse(event.data))
+        } catch (e) {
+          console.warn("live frame dropped:", e)
+          return
+        }
         watch()
-        setNodes(frame.nodes)
-        setAdmin(frame.admin)
+        setNodes(nodes)
+        setAdmin(admin)
         setError(null)
         // The stream has returned; the poll was only covering for it.
         if (poll) {
