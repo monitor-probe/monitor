@@ -2816,7 +2816,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           <Field
             label="可信代理"
             className="sm:col-span-2"
-            hint="hub 前面有 Cloudflare 以外的 CDN 时，填它的回源网段，登录通知和节点出口才显示真实地址；没有就留空"
+            hint="hub 前面有 Cloudflare 以外的 CDN 时，填它的回源网段，登录通知和限流才按访客的真实地址记；节点地址不用填，没有 CDN 就留空"
             helpWidth="max-w-62 min-[392px]:max-w-90"
             help={
               <>

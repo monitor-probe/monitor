@@ -513,18 +513,30 @@ fn walk(proxies: &[Net], headers: &HeaderMap, peer: IpAddr) -> IpAddr {
 /// Where a node's connection came from: its exit on the panel, and the address
 /// its country falls back to. Called only once the node's token has checked out.
 ///
-/// Cloudflare in front of the hub, by proxy or tunnel, writes the node's address
-/// into `CF-Connecting-IP`, while [`client_ip`] sees its edge or the local proxy.
-/// The header is not read for throttling: anyone reaching the origin from
-/// Cloudflare's network -- a Worker's raw socket, for one -- can write it. A
-/// token holder, the only caller here, can report any address of its own
-/// already.
+/// What a proxy in front of the hub says, believed without a list of proxies:
+/// `CF-Connecting-IP` if there is one, else the first public address in
+/// `X-Forwarded-For`, which is where a CDN puts the address it received the
+/// connection from. Behind a CDN, `client, edge` is thus the client with nothing
+/// configured, where [`client_ip`] sees the edge until the edge is listed.
+///
+/// That would be no way to read a throttle's key, which anyone can write to
+/// lock others out or to slip past a lockout, and [`client_ip`] stays strict.
+/// Here a forged value costs the forger only a wrong address beside their own
+/// node: a token holder reports any public address of its own in the hello
+/// already, and the country lookup follows what was believed, as it did for
+/// `CF-Connecting-IP`.
 pub fn node_ip(app: &crate::App, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
-    headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        .map_or_else(|| client_ip(app, headers, peer), |ip| ip.to_canonical())
+    let header_ip = |name: &str| {
+        headers.get_all(name).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).find_map(
+            |v| {
+                let ip = v.trim().parse::<IpAddr>().ok()?.to_canonical();
+                (name == "cf-connecting-ip" || crate::agent_ws::public(ip)).then_some(ip)
+            },
+        )
+    };
+    header_ip("cf-connecting-ip")
+        .or_else(|| header_ip("x-forwarded-for"))
+        .unwrap_or_else(|| client_ip(app, headers, peer))
 }
 
 /// Loopback or a private network, where a reverse proxy resides.
@@ -709,9 +721,32 @@ mod tests {
         edge.insert("cf-connecting-ip", "::ffff:203.0.113.7".parse().unwrap());
         assert_eq!(client_ip(&app, &edge, ip("127.0.0.1")), ip("162.158.88.126"));
         assert_eq!(node_ip(&app, &edge, ip("127.0.0.1")), ip("203.0.113.7"));
-        // Without the header a node's address is the same as the throttle's.
+        // Without the header a node's address is the first public one in the
+        // list, private hops ahead of it passed over.
         assert_eq!(node_ip(&app, &forged, ip("127.0.0.1")), ip("198.51.100.9"));
-        assert_eq!(node_ip(&app, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        // And with no proxy to speak of, there is nothing else to go by.
+        assert_eq!(node_ip(&app, &HeaderMap::new(), ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(node_ip(&app, &xff("10.0.0.2"), ip("203.0.113.5")), ip("203.0.113.5"));
+    }
+
+    /// A CDN's edge is not listed, and a node's address is still its own: the
+    /// first public address of the list, where the throttle's key stays the
+    /// edge. Whatever else is written ahead of it is the node's to choose.
+    #[test]
+    fn a_nodes_address_sees_through_an_unlisted_edge_and_the_throttle_does_not() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let app = crate::App::for_test(crate::db::Db::open(":memory:").unwrap());
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "198.51.100.77, 162.158.88.126".parse().unwrap());
+        for peer in ["127.0.0.1", "10.0.0.1", "162.158.88.126"] {
+            assert_eq!(node_ip(&app, &h, ip(peer)), ip("198.51.100.77"), "{peer}");
+        }
+        assert_eq!(client_ip(&app, &h, ip("127.0.0.1")), ip("162.158.88.126"));
+        assert_eq!(client_ip(&app, &h, ip("162.158.88.126")), ip("162.158.88.126"));
+        // An unparseable or private-only list falls back to the throttle's rule.
+        let mut junk = HeaderMap::new();
+        junk.insert("x-forwarded-for", "nonsense, 10.0.0.9".parse().unwrap());
+        assert_eq!(node_ip(&app, &junk, ip("127.0.0.1")), ip("10.0.0.9"));
     }
 
     /// Naming a CDN's edge turns `client, edge` behind a local proxy, or a lone
