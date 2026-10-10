@@ -2852,7 +2852,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             onChange={(v) => set("public_page", v ? "on" : "off")}
           />
           <SwitchRow
-            label="我确认源站只有 CDN 或隧道能连上"
+            label="我确认源站只有 Cloudflare 或隧道能连上"
             hint="登录通知和限流取访客的真实地址"
             extra={
               <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
@@ -2865,13 +2865,13 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             helpWidth="max-w-62 min-[392px]:max-w-90 min-[440px]:max-w-104"
             help={
               <>
-                <p>打开前先确认源站只有 CDN 连得上：用隧道，源站不开公网端口；或让 CDN 回源带一个密钥头，反代没带就拒绝。</p>
-                <p>只放行 CDN 的回源地址不够，同一个 CDN 上别人的 Worker 也从那些地址连过来。</p>
+                <p>打开前先确认源站只有 Cloudflare 连得上：用隧道，源站不开公网端口；或让 Cloudflare 回源带一个密钥头，反代没带就拒绝。</p>
+                <p>只放行 Cloudflare 的回源地址不够，别人的 Worker 也从那些地址连过来。</p>
                 <p>
                   不是却打开，别人直连源站自己写 <span className="whitespace-nowrap">CF-Connecting-IP</span> 或{" "}
                   <span className="whitespace-nowrap">X-Forwarded-For</span>，就能每次换一个地址猜密码，限流形同虚设。
                 </p>
-                <p>不是 Cloudflare 的 CDN，还要在反代上配 realip。</p>
+                <p>别家 CDN 用不上这个开关，在反代上配 realip。</p>
               </>
             }
             checked={cdnOnly}
