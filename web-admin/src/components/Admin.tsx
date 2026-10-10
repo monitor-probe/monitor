@@ -2851,14 +2851,14 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
           />
           <SwitchRow
             label="我确认源站只有 CDN 或隧道能连上"
-            hint="登录通知和限流取访客的真实地址，不用填 IP。hub 不会替你限制访问，没做到就别打开"
+            hint="登录通知和限流取访客的真实地址"
             helpWidth="max-w-62 min-[392px]:max-w-90 min-[440px]:max-w-104"
             help={
               <>
                 <p>打开前先确认源站只有 CDN 连得上，做法有三种：</p>
                 <p>用隧道，源站不开公网端口；防火墙只放行 CDN 的回源地址；CDN 回源带一个密钥头，反代没带就拒绝。</p>
                 <p>
-                  做不到却打开，别人直连源站自己写 <span className="whitespace-nowrap">X-Forwarded-For</span>
+                  不是却打开，别人直连源站自己写 <span className="whitespace-nowrap">X-Forwarded-For</span>
                   ，就能每次换一个地址猜密码，限流形同虚设。
                 </p>
               </>
