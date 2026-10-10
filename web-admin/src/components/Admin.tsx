@@ -2719,6 +2719,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
   const { s, set, save } = useSettings()
   const iconPicker = useRef<HTMLInputElement>(null)
   if (!s) return null
+  const cdnOnly = s.origin_cdn_only === "on"
   // Applied on its own, as soon as a file is picked: a picked file is already a
   // decision, and the form's save button below is easy to miss for it.
   const saveIcons = (icons: { favicon: string; touch_icon: string }, done: string) =>
@@ -2813,44 +2814,45 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               placeholder="https://ghfast.top"
             />
           </Field>
-          <Field
-            label="可信代理"
-            className="sm:col-span-2"
-            hint="hub 前面有 Cloudflare 以外的 CDN 时，填它的回源网段，登录通知和限流才按访客的真实地址记；节点地址不用填，没有 CDN 就留空"
-            helpWidth="max-w-62 min-[392px]:max-w-90"
-            help={
-              <>
-                <p>
-                  每行一个 IP 或网段，如 <span className="whitespace-nowrap">203.0.113.0/24</span>。
-                </p>
-                <p>名单里的地址写进 X-Forwarded-For 的内容会被采信，只填自己用的 CDN 或反代的回源地址。</p>
-                <p>源站要只允许 CDN 访问，否则绕过 CDN 的请求仍会被记成 CDN 的地址。</p>
-              </>
-            }
-          >
-            <textarea
-              className={`${TEXTAREA} min-h-20`}
-              rows={3}
-              spellCheck={false}
-              value={String(s.trusted_proxies ?? "")}
-              onChange={(e) => set("trusted_proxies", e.target.value)}
-              placeholder={"203.0.113.0/24\n2001:db8::/32"}
-            />
-          </Field>
-          <div className="space-y-2 sm:col-span-2">
-            <div className="flex items-center gap-2 text-sm">
-              <Switch
-                aria-labelledby="origin-cdn-only-label"
-                checked={s.origin_cdn_only === "on"}
-                onCheckedChange={(v) => set("origin_cdn_only", v ? "on" : "off")}
-              />
-              <span id="origin-cdn-only-label">源站只允许 CDN 访问，登录通知和限流直接取访客地址，不用填名单</span>
+          <div className="space-y-3 sm:col-span-2">
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 text-sm">
+                <Switch
+                  aria-labelledby="origin-cdn-only-label"
+                  checked={cdnOnly}
+                  onCheckedChange={(v) => set("origin_cdn_only", v ? "on" : "off")}
+                />
+                <span id="origin-cdn-only-label">hub 前面有 CDN，且源站只允许 CDN 访问</span>
+              </div>
+              <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">
+                {"打开后，登录通知和限流直接取访客的真实地址，不用填 IP。节点地址不受影响，本来就不用配置。没有 CDN 就不用管这里。"}
+              </p>
+              <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">
+                {"打开前先确认源站只有 CDN 连得上：用隧道（源站不开公网端口），或防火墙只放行 CDN 的回源地址，或 CDN 回源带密钥头、反代没带就拒绝。做不到却打开，别人直连源站自己写 X-Forwarded-For，就能每次换一个地址猜密码，限流形同虚设。"}
+              </p>
             </div>
-            <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">
-              打开前先确认源站真的只有 CDN 连得上：用隧道（源站不开公网端口）、防火墙只放行 CDN 的回源地址，或
-              CDN 回源时带一个密钥头而反代没带就拒绝。做不到却打开，别人直连源站并自己写 X-Forwarded-For，
-              就能每次换一个地址猜密码，登录限流形同虚设。
-            </p>
+            <details className="group" open={!cdnOnly && String(s.trusted_proxies ?? "") !== ""}>
+              <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md text-sm font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+                <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+                源站做不到上面那样，只想信任指定的 CDN 网段
+              </summary>
+              <div className="mt-3 space-y-2">
+                <textarea
+                  className={`${TEXTAREA} min-h-20 disabled:opacity-50`}
+                  rows={3}
+                  spellCheck={false}
+                  disabled={cdnOnly}
+                  aria-label="可信代理"
+                  value={String(s.trusted_proxies ?? "")}
+                  onChange={(e) => set("trusted_proxies", e.target.value)}
+                  placeholder={"203.0.113.0/24\n2001:db8::/32"}
+                />
+                <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">
+                  {"每行一个 IP 或网段，填 CDN 公布的回源网段。只有名单里的地址写进 X-Forwarded-For 的内容会被采信，直连源站的请求仍按它自己的地址计。"}
+                  {cdnOnly ? "上面的开关已打开，名单暂时不起作用。" : ""}
+                </p>
+              </div>
+            </details>
           </div>
         </div>
         {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
