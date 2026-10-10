@@ -284,18 +284,27 @@ struct Rpc {
     params: serde_json::Value,
 }
 
+/// The node a request's bearer token belongs to, or the refusal. The same
+/// response whether the token is malformed or merely unknown.
+fn authenticate(app: &App, headers: &HeaderMap) -> Result<i64, Response> {
+    let Some(token) = bearer(headers) else {
+        return Err(crate::api::answer(StatusCode::UNAUTHORIZED, "missing token"));
+    };
+    match app.db.node_by_token(token) {
+        Ok(Some(id)) => Ok(id),
+        _ => Err(crate::api::answer(StatusCode::UNAUTHORIZED, "invalid token")),
+    }
+}
+
 pub async fn handler(
     State(app): State<Shared>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let Some(token) = bearer(&headers) else {
-        return crate::api::answer(StatusCode::UNAUTHORIZED, "missing token");
-    };
-    let Ok(Some(node_id)) = app.db.node_by_token(token) else {
-        // The same response whether the token is malformed or merely unknown.
-        return crate::api::answer(StatusCode::UNAUTHORIZED, "invalid token");
+    let node_id = match authenticate(&app, &headers) {
+        Ok(id) => id,
+        Err(refusal) => return refusal,
     };
     let ip = node_ip(&app, &headers, peer.ip()).to_string();
 
@@ -306,6 +315,34 @@ pub async fn handler(
             }
         },
     )
+}
+
+/// A glimpse rather than a session: an agent whose session runs over one
+/// address family connects here over the other, so the hub can record the
+/// address it appears at there. An interface holding only a private address of
+/// that family -- NAT66, a ULA behind a masquerading host -- says nothing of
+/// where it exits, and the session, arriving in one family, cannot.
+///
+/// A route of its own rather than a query on the session's: a hub from before
+/// this one would take `?echo` for a session, retire the live one, and flap the
+/// node on every connect, where it answers an unknown path with 404 and the
+/// agent goes without. Authenticated like a session, so no anonymous path, and
+/// it opens none: whatever is running is left alone.
+pub async fn echo(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let node_id = match authenticate(&app, &headers) {
+        Ok(id) => id,
+        Err(refusal) => return refusal,
+    };
+    let ip = node_ip(&app, &headers, peer.ip()).to_string();
+    if let Err(e) = app.db.set_ip_other(node_id, &ip) {
+        warn!("node {node_id}: storing the address seen in the other family failed: {e:#}");
+    }
+    upgrade.on_upgrade(|_| async {})
 }
 
 /// Extracts the node token from `Authorization: Bearer <token>`.

@@ -547,6 +547,7 @@ async fn main() -> Result<()> {
         .merge(
             Router::new()
                 .route("/api/agent/ws", get(agent_ws::handler))
+                .route("/api/agent/echo", get(agent_ws::echo))
                 .route("/api/agent/register", post(api::agent_register))
                 .route("/install.sh", get(install_script))
                 .route("/agent/{arch}", get(agent_binary))

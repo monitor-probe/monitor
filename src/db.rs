@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS node (
   swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
   ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
+  -- Where the hub saw the node in the address family `ip` is not in, from the
+  -- short connection an agent makes over it (`agent_ws::handler`, `?echo`).
+  -- Empty until one has arrived, and left as it was when none does: the family
+  -- it belongs to must still be held on an interface for it to be shown.
+  ip_other TEXT NOT NULL DEFAULT '',
   -- ISO 3166-1 alpha-2, looked up from `country_ip` once per address. Empty
   -- until the lookup answers, and empty is what a node whose country nobody
   -- could tell stays: the public page just leaves the badge off.
@@ -220,7 +225,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -393,6 +398,10 @@ fn migrate_to_12(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "public_remark TEXT NOT NULL DEFAULT ''")
 }
 
+fn migrate_to_13(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "ip_other TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -441,6 +450,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 12 {
         migrate_to_12(&tx)?;
+    }
+    if from < 13 {
+        migrate_to_13(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -521,6 +533,10 @@ pub struct Node {
     pub agent_version: String,
     #[serde(default)]
     pub ip: String,
+    /// Likewise the address the hub saw, in the family `ip` is not; see the
+    /// column.
+    #[serde(default)]
+    pub ip_other: String,
     /// Reported by the agent from its own interfaces, unlike `ip`, which is
     /// merely the address the agent's connection originated from.
     #[serde(default)]
@@ -1306,6 +1322,14 @@ impl Db {
         )?;
         let blank: bool = conn.query_row("SELECT country = '' FROM node WHERE id=?1", [id], |r| r.get(0))?;
         Ok(blank && !source.is_empty())
+    }
+
+    /// Records where the hub saw a node over the address family its session is
+    /// not in. Kept apart from `save_facts`, which an agent's hello rewrites: the
+    /// two arrive on different connections, in no fixed order.
+    pub fn set_ip_other(&self, id: i64, ip: &str) -> Result<()> {
+        self.conn().execute("UPDATE node SET ip_other=?2 WHERE id=?1", params![id, ip])?;
+        Ok(())
     }
 
     /// Whether the node still lacks a country for `source`: false once a lookup
@@ -2617,6 +2641,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         disk_total: n("disk_total"),
         agent_version: s("agent_version"),
         ip: s("ip"),
+        ip_other: s("ip_other"),
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
         country: s("country"),
@@ -3476,6 +3501,24 @@ mod tests {
         let stored = db.node(id).unwrap().unwrap();
         assert_eq!(stored.os.chars().count(), 128);
         assert_eq!(stored.hostname, "xy", "control characters break the panel's rows");
+    }
+
+    /// The address seen in the other family arrives on its own connection, in no
+    /// fixed order against the hello, and must not be wiped by it.
+    #[test]
+    fn the_address_seen_in_the_other_family_survives_a_hello() {
+        let db = db();
+        let id = node(&db, 1);
+        db.set_ip_other(id, "2001:db8:1::9").unwrap();
+        db.save_facts(
+            id,
+            &serde_json::json!({"ipv4": "10.0.0.5", "ipv6": "fd00::5"}),
+            "203.0.113.9",
+            "203.0.113.9",
+        )
+        .unwrap();
+        let stored = db.node(id).unwrap().unwrap();
+        assert_eq!((stored.ip.as_str(), stored.ip_other.as_str()), ("203.0.113.9", "2001:db8:1::9"));
     }
 
     /// A correction must survive the node's return. `all_traffic` gates the month

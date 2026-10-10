@@ -131,21 +131,21 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
 
 /// The addresses the panel shows for a node, each with where it comes from: at
 /// most one per family, v4 first, the one the machine is reached by. The agent
-/// reports its interfaces; `ip` is where its connection arrived from, in dotted
-/// form for IPv4.
+/// reports its interfaces; `exits` are where the hub saw it: the address its
+/// session arrived from, and the one a short second connection arrived from in
+/// the other family, each in dotted form for IPv4.
 ///
 /// Per family an address set by hand comes first, then a public one on the
 /// interface. Failing both, where the interface holds only a private address of
-/// the family the connection used -- NAT, or a proxy in front -- the
-/// connection's public address, its exit, stands in. An exit in a family the
-/// interface does not hold is a translator such as NAT64 or WARP and is left
-/// out.
+/// that family -- NAT, or a proxy in front -- the public address the hub saw in
+/// it, its exit, stands in. An exit in a family the interface does not hold is a
+/// translator such as NAT64 or WARP and is left out.
 ///
 /// Private addresses appear only when nothing public is known, as where hub and
-/// node share a network and they are all there is. `ip` alone is the fallback
-/// for an agent reporting no interface.
+/// node share a network and they are all there is. The session's own exit alone
+/// is the fallback for an agent reporting no interface.
 fn addresses<'a>(
-    ip: &'a str,
+    exits: [&'a str; 2],
     (ipv4, ipv6): (&'a str, &'a str),
     (pin4, pin6): (&'a str, &'a str),
 ) -> Vec<(&'a str, &'static str)> {
@@ -156,8 +156,8 @@ fn addresses<'a>(
             Some((pin, "manual"))
         } else if public(held, v6) {
             Some((held, "interface"))
-        } else if !held.is_empty() && public(ip, v6) {
-            Some((ip, "exit"))
+        } else if let Some(exit) = exits.into_iter().find(|ip| !held.is_empty() && public(ip, v6)) {
+            Some((exit, "exit"))
         } else {
             None
         }
@@ -170,7 +170,7 @@ fn addresses<'a>(
     if !held.is_empty() {
         return held;
     }
-    [ip].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "connection")).collect()
+    [exits[0]].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "connection")).collect()
 }
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
@@ -278,11 +278,12 @@ fn node_view(
     if full {
         let held = (node.ipv4.as_str(), node.ipv6.as_str());
         let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
-        let shown = addresses(&node.ip, held, (pin4, pin6));
+        let exits = [node.ip.as_str(), node.ip_other.as_str()];
+        let shown = addresses(exits, held, (pin4, pin6));
         // What each family shows with its own pin cleared and the other's kept,
         // for the edit form to offer as the fallback.
         let auto = |pins, v6: bool| {
-            addresses(&node.ip, held, pins)
+            addresses(exits, held, pins)
                 .into_iter()
                 .find(|(a, _)| a.contains(':') == v6)
                 .map_or("", |(a, _)| a)
@@ -2878,7 +2879,7 @@ mod tests {
     #[test]
     fn a_node_shows_the_address_it_is_reached_by() {
         let rows = |ip, held, pins| -> Vec<String> {
-            addresses(ip, held, pins).into_iter().map(|(a, source)| format!("{a} {source}")).collect()
+            addresses([ip, ""], held, pins).into_iter().map(|(a, source)| format!("{a} {source}")).collect()
         };
         let none = ("", "");
         // A public interface is the machine; a different exit in front of it is a
@@ -2900,6 +2901,18 @@ mod tests {
         );
         // ...and over v6 by an older one reporting the ULA ahead of it.
         assert_eq!(rows("2401:b60:1c::5", ("10.10.1.5", "fd42:43af::1"), none), ["2401:b60:1c::5 exit"]);
+        // NAT66: a private v4 and a ULA v6, the session over v4 and a second
+        // connection over v6. Each exit stands in for its own family's address,
+        // and the one in a family the interface lacks is a translator again.
+        let both = |held| -> Vec<String> {
+            addresses(["203.0.113.7", "2001:db8:1::9"], held, none)
+                .into_iter()
+                .map(|(a, source)| format!("{a} {source}"))
+                .collect()
+        };
+        assert_eq!(both(("10.0.0.5", "fd00::5")), ["203.0.113.7 exit", "2001:db8:1::9 exit"]);
+        assert_eq!(both(("10.0.0.5", "")), ["203.0.113.7 exit"]);
+        assert_eq!(both(("10.0.0.5", "2401:b60:1c::5")), ["203.0.113.7 exit", "2401:b60:1c::5 interface"]);
         // Behind a transparent proxy the exit is the proxy's; the home line can
         // only be set by hand.
         let home = ("192.168.1.5", "2409:8a1e::5");
