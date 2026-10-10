@@ -1403,7 +1403,6 @@ const READABLE_SETTINGS: &[&str] = &[
     "update_notice",
     "favicon",
     "touch_icon",
-    "trusted_proxies",
     "origin_cdn_only",
 ];
 
@@ -2216,7 +2215,6 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
-        "trusted_proxies" => crate::auth::parse_proxies(value).err(),
         "origin_cdn_only" if !matches!(value, "" | "on" | "off") => {
             Some("源站只允许 CDN 访问：取值是 on 或 off".into())
         }

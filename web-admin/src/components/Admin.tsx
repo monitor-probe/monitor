@@ -2866,35 +2866,6 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             checked={cdnOnly}
             onChange={(v) => set("origin_cdn_only", v ? "on" : "off")}
           />
-          <details className="group" open={!cdnOnly && String(s.trusted_proxies ?? "") !== ""}>
-            <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md text-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
-              <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
-              改为只信任指定的 CDN 网段
-            </summary>
-            <div className="mt-3">
-              <Field
-                label="可信代理"
-                hint={cdnOnly ? "上面的开关已打开，名单暂时不起作用" : "每行一个 IP 或网段，填 CDN 公布的回源网段"}
-                helpWidth="max-w-58 min-[376px]:max-w-86"
-                help={
-                  <>
-                    <p>只有名单里的地址写进 X-Forwarded-For 的内容会被采信。</p>
-                    <p>直连源站的请求仍按它自己的地址计，所以不要求源站只允许 CDN 访问。</p>
-                  </>
-                }
-              >
-                <textarea
-                  className={`${TEXTAREA} min-h-20 disabled:opacity-50`}
-                  rows={3}
-                  spellCheck={false}
-                  disabled={cdnOnly}
-                  value={String(s.trusted_proxies ?? "")}
-                  onChange={(e) => set("trusted_proxies", e.target.value)}
-                  placeholder={"203.0.113.0/24\n2001:db8::/32"}
-                />
-              </Field>
-            </div>
-          </details>
         </div>
         <div>
           <Button
@@ -2906,7 +2877,6 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 // being the one value this key's write path refuses.
                 retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
-                trusted_proxies: String(s.trusted_proxies ?? ""),
                 origin_cdn_only: s.origin_cdn_only === "on" ? "on" : "off",
                 public_page: s.public_page === "off" ? "off" : "on",
               }).then((ok) => ok && onSaved())
