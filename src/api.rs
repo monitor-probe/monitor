@@ -635,15 +635,30 @@ pub struct Stream {
     gzip: Option<String>,
 }
 
-/// How many anonymous streams may be open at once. The third bound of the
-/// anonymous paths, beside `HISTORY_GATE` and `main::RELAY_GATE`: a stream holds
-/// a descriptor and a task for as long as its page stays open, and at a hundred
-/// nodes sends about 7 KB/s of compressed frames, 55 KB/s to a page that does
-/// not ask for gzip. A thousand pages are 7 to 55 MB/s outbound, past what a
-/// status page draws at once. Beyond it a page falls back to polling
-/// `/api/nodes`, whose rendered frame every viewer shares.
+/// How many anonymous streams may be open at once. The fourth bound of the
+/// anonymous paths, beside `HISTORY_GATE`, `main::RELAY_GATE` and
+/// `auth::PASSWORD_GATE`: a stream holds a descriptor and a task for as long as
+/// its page stays open, and at a hundred nodes sends about 7 KB/s of compressed
+/// frames, 55 KB/s to a page that does not ask for gzip. A thousand pages are
+/// 7 to 55 MB/s outbound. Beyond it a page falls back to polling `/api/nodes`,
+/// whose rendered frame every viewer shares.
 const PUBLIC_STREAMS: usize = 1000;
 static PUBLIC_STREAM_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(PUBLIC_STREAMS);
+
+/// A send that blocks this long has no reader left: the pages treat 10 s
+/// without a frame as a lost stream and open another. A peer that vanished
+/// without a FIN would otherwise keep its slot until TCP gives up, about
+/// 15 minutes.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The slot a new stream holds until it ends. A session is the operator's own
+/// and is not counted, so whoever holds one can always open the panel.
+fn stream_slot(session: Option<&str>) -> Result<Option<tokio::sync::SemaphorePermit<'static>>, ()> {
+    if session.is_some() {
+        return Ok(None);
+    }
+    PUBLIC_STREAM_GATE.try_acquire().map(Some).map_err(|_| ())
+}
 
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
@@ -660,14 +675,8 @@ pub async fn live_ws(
     if session.is_none() && !app.public_page() {
         return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
-    // Only anonymous streams count: a session is the operator's own, and the one
-    // that holds it can always open the panel.
-    let slot = match session {
-        Some(_) => None,
-        None => match PUBLIC_STREAM_GATE.try_acquire() {
-            Ok(permit) => Some(permit),
-            Err(_) => return answer(StatusCode::SERVICE_UNAVAILABLE, "同时在线的访客太多，请稍后再试"),
-        },
+    let Ok(slot) = stream_slot(session.as_deref()) else {
+        return answer(StatusCode::SERVICE_UNAVAILABLE, "同时在线的访客太多，请稍后再试");
     };
     upgrade.read_buffer_size(SOCKET_BUFFER).max_message_size(MAX_FRAME).on_upgrade(move |socket| async move {
         // Held until the stream ends.
@@ -713,7 +722,7 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
         } else {
             Message::Text(live_snapshot(&app, full))
         };
-        if socket.send(frame).await.is_err() {
+        if !matches!(tokio::time::timeout(SEND_TIMEOUT, socket.send(frame)).await, Ok(Ok(()))) {
             break;
         }
     }
@@ -3616,6 +3625,17 @@ mod tests {
         assert_eq!(live["swap_total"], 0, "swapoff means zero, not the gigabyte that was there at connect");
         assert_eq!(live["disk_total"], live["metrics"]["disk_total"], "one number, not two");
         assert_eq!(app.db.node(id).unwrap().unwrap().disk_total, 30i64 << 30, "and no extra write to get it");
+    }
+
+    /// Only anonymous streams are counted, and a slot comes back when its
+    /// stream ends. `PUBLIC_STREAM_GATE` is touched by no other test.
+    #[test]
+    fn anonymous_streams_past_the_gate_are_refused_and_a_session_is_not() {
+        let held: Vec<_> = (0..PUBLIC_STREAMS).map(|_| stream_slot(None).expect("up to the limit")).collect();
+        assert!(stream_slot(None).is_err(), "the stream past the limit must be refused");
+        assert!(stream_slot(Some("hash")).is_ok(), "a session opens its stream with every slot taken");
+        drop(held);
+        assert!(stream_slot(None).is_ok(), "a finished stream gives its slot back");
     }
 
     /// `span` bounds one window; this bounds how many are built concurrently.

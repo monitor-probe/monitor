@@ -398,8 +398,7 @@ fn parse_args() -> Result<Args> {
 
 /// The soft open-file limit the hub asks for. Every agent holds one descriptor,
 /// every open page another, and every request in flight a third. 65536 leaves
-/// room for a hundred times the 1000 nodes a hub is sized for, and a descriptor
-/// costs nothing until it is opened.
+/// about 65 for each of the 1000 nodes a hub is sized for.
 const NOFILE_TARGET: u64 = 65_536;
 
 /// Raises the soft open-file limit toward [`NOFILE_TARGET`], capped by the hard
@@ -440,7 +439,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "monitor_hub=info,tower_http=warn".into()),
         )
         .init();
-    raise_open_files();
 
     let args = parse_args()?;
     // Delivered on the terminal rather than through the service log, which some
@@ -454,6 +452,8 @@ async fn main() -> Result<()> {
         println!("Emergency password: {}", new_password(&Db::open(&args.database)?)?);
         return Ok(());
     }
+    // After the two arguments that print and exit, so their output stays theirs.
+    raise_open_files();
     std::fs::create_dir_all(&args.themes)?;
     if let Err(e) = db::temp_files_beside(&args.database) {
         warn!("SQLite keeps its temporary files in its default directory: {e:#}");
@@ -874,6 +874,20 @@ fn compressible() -> impl Predicate {
 mod tests {
     use super::*;
     use axum::http::{StatusCode, Uri};
+
+    /// The limit only moves up, so raising it here cannot disturb another test.
+    #[test]
+    fn the_soft_open_file_limit_reaches_the_target_or_the_hard_one() {
+        use rustix::process::{getrlimit, Resource};
+        raise_open_files();
+        let limit = getrlimit(Resource::Nofile);
+        let wanted = limit.maximum.map_or(NOFILE_TARGET, |hard| hard.min(NOFILE_TARGET));
+        assert!(
+            limit.current.is_none_or(|soft| soft >= wanted),
+            "soft limit {:?} below {wanted}",
+            limit.current
+        );
+    }
 
     fn app(site: &str) -> App {
         App::new(
