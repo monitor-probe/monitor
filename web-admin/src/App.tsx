@@ -52,7 +52,14 @@ const DARK_MEDIA = matchMedia("(prefers-color-scheme: dark)")
  * listener is otherwise never heard, and the next one is a day away.
  */
 function useTheme() {
-  const [saved, setSaved] = useState(() => localStorage.getItem("theme"))
+  // Storage can be switched off for the site, and then even reading it throws.
+  const [saved, setSaved] = useState(() => {
+    try {
+      return localStorage.getItem("theme")
+    } catch {
+      return null
+    }
+  })
   const system = useSyncExternalStore(
     (notify) => {
       DARK_MEDIA.addEventListener("change", notify)
@@ -80,7 +87,11 @@ function useTheme() {
     dark,
     () => {
       const next = dark ? "light" : "dark"
-      localStorage.setItem("theme", next)
+      try {
+        localStorage.setItem("theme", next)
+      } catch {
+        // The choice then lasts until the page is closed.
+      }
       setSaved(next)
     },
   ] as const
