@@ -92,7 +92,7 @@ fi
 	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
 	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS]" >&2
 	echo "       install.sh --uninstall" >&2
-	echo "--name NAME names the node --register creates; the hostname otherwise. < > \" ' are dropped from it; the panel renames a node freely" >&2
+	echo "--name NAME names the node --register creates, which is otherwise named after its id. < > \" ' are dropped from it; the panel renames a node freely" >&2
 	exit 2
 }
 # Names the node a registration creates. A token belongs to a node that already
@@ -284,10 +284,11 @@ if [ -z "$TOKEN" ]; then
 	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
 		HELD=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	fi
-	# --name as given on this machine, or else the hostname, restricted to
-	# characters a hostname may contain. The hub trims and bounds either.
-	[ -n "$NAME" ] || NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
-	echo "registering $NAME with the hub"
+	# --name as given, which the hub trims and bounds. The hostname is not sent
+	# in its place: it often carries the machine's address or the provider's
+	# label, and the name reaches the public page. Without one the hub names
+	# the node after its id.
+	echo "registering ${NAME:-this machine} with the hub"
 	# curl sends no header at all for an empty $HELD. The status follows the body
 	# on a line of its own, so a refusal shows the hub's own reason: a closed
 	# window, a lockout, an entry that is not an https domain and a database

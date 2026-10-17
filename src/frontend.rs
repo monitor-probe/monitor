@@ -392,6 +392,14 @@ const MAX_EXPANDED: u64 = 64 << 20;
 /// zeros there would inflate at 1 GiB per MiB uploaded, 1.4 s of CPU each.
 const MAX_PADDING: u64 = 1 << 20;
 
+/// Every byte the gzip stream may expand to, headers included. tar reads a GNU
+/// long name or pax header into memory whole, under the size the header itself
+/// declares, before `unpack` sees an entry: a 397 KiB upload declaring 400 MiB
+/// would have taken the hub from 10 to 414 MiB resident. 8 MiB covers the
+/// headers and block padding of [`MAX_ENTRIES`] entries, one extension header
+/// each, twice over.
+const MAX_STREAM: u64 = MAX_EXPANDED + MAX_PADDING + (8 << 20);
+
 /// Installs a theme from its published `theme.tar.gz`, under the name its own
 /// manifest carries.
 ///
@@ -451,7 +459,30 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
         refuse!("{NOT_GZIP}");
     }
     fs::create_dir(into)?;
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive).take(MAX_STREAM));
+    let entries = unpack_entries(&mut archive, into);
+    let mut rest = archive.into_inner();
+    // Read to the end, where gzip keeps its checksum. The entries stop at tar's
+    // end marker, short of it, so otherwise an archive whose bytes changed in
+    // transit would install as long as its headers survived.
+    let mut tail = 0;
+    if entries.is_ok() {
+        std::io::copy(&mut (&mut rest).take(MAX_PADDING), &mut std::io::sink()).map_err(archive_error)?;
+        tail = rest.read(&mut [0]).map_err(archive_error)?;
+    }
+    // Ahead of the entries' error: a stream cut off by the budget reads as
+    // truncated, and that answer would send the reader to download it again.
+    if rest.limit() == 0 {
+        refuse!("主题包解压后超过 {} MiB", MAX_EXPANDED >> 20);
+    }
+    entries?;
+    if tail != 0 {
+        refuse!("主题包在 tar 结尾之后还有超过 1 MiB 的数据，包本身有问题，请联系主题作者");
+    }
+    Ok(())
+}
+
+fn unpack_entries<R: Read>(archive: &mut tar::Archive<R>, into: &Path) -> Result<()> {
     let mut expanded = 0u64;
     for (seen, entry) in archive.entries()?.enumerate() {
         // Only reading happens here, so every failure is the archive's.
@@ -488,14 +519,6 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
         if !entry.unpack_in(into).map_err(archive_error)? {
             refuse!("主题包里的路径越出了主题目录");
         }
-    }
-    // Read to the end, where gzip keeps its checksum. The entries stop at tar's
-    // end marker, short of it, so otherwise an archive whose bytes changed in
-    // transit would install as long as its headers survived.
-    let mut rest = archive.into_inner();
-    std::io::copy(&mut (&mut rest).take(MAX_PADDING), &mut std::io::sink()).map_err(archive_error)?;
-    if rest.read(&mut [0]).map_err(archive_error)? != 0 {
-        refuse!("主题包在 tar 结尾之后还有超过 1 MiB 的数据，包本身有问题，请联系主题作者");
     }
     Ok(())
 }
@@ -625,6 +648,45 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// The per-file and total ceilings hold at their exact boundary: a file of
+    /// [`MAX_FILE`] and a total of [`MAX_EXPANDED`] install, one byte more does not.
+    #[test]
+    fn a_package_at_the_size_ceilings_installs_and_one_byte_past_does_not() {
+        let base = std::env::temp_dir().join(format!("monitor-ceilings-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let manifest = r#"{"name":"x","short":"x","description":"","version":"1","author":"a","url":""}"#;
+        let pack = |sizes: &[u64]| {
+            let mut tar =
+                tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+            // A directory entry, as `tar czf` writes one for every directory.
+            let mut dir = tar::Header::new_gnu();
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_size(0);
+            dir.set_mode(0o755);
+            tar.append_data(&mut dir, "dist/", &[][..]).unwrap();
+            let mut add = |name: &str, data: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                tar.append_data(&mut header, name, data).unwrap();
+            };
+            add("theme.json", manifest.as_bytes());
+            add("dist/index.html", b"x");
+            for (i, &size) in sizes.iter().enumerate() {
+                add(&format!("dist/{i}.bin"), &vec![0; size as usize]);
+            }
+            tar.into_inner().unwrap().finish().unwrap()
+        };
+        let headroom = MAX_EXPANDED - (manifest.len() as u64 + 1);
+        let refused = |sizes: &[u64]| install(&base, &pack(sizes)[..], None).is_err();
+        assert!(!refused(&[MAX_FILE]));
+        assert!(refused(&[MAX_FILE + 1]));
+        let full = [MAX_FILE; 7].into_iter().chain([headroom - 7 * MAX_FILE]).collect::<Vec<_>>();
+        assert!(!refused(&full));
+        assert!(refused(&[full.as_slice(), &[1]].concat()));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
     /// Everything an uploaded archive must satisfy before replacing a theme
     /// currently being served.
     #[test]
@@ -749,6 +811,23 @@ mod tests {
             panic!("an oversized tail installed")
         };
         assert!(e.to_string().contains("tar 结尾之后"), "{e:#}");
+        // A GNU long-name header declaring 400 MiB, which tar reads into memory
+        // before any entry is seen: stopped at the stream budget.
+        let mut header = [0u8; 512];
+        header[..13].copy_from_slice(b"././@LongLink");
+        header[124..135].copy_from_slice(format!("{:011o}", 400u64 << 20).as_bytes());
+        header[148..156].fill(b' ');
+        header[156] = b'L';
+        header[257..265].copy_from_slice(b"ustar  \0");
+        let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+        header[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut gz, &header).unwrap();
+        std::io::Write::write_all(&mut gz, &vec![b'a'; (MAX_STREAM + 1) as usize]).unwrap();
+        let Err(e) = install(&base, &gz.finish().unwrap()[..], None) else {
+            panic!("a long-name bomb installed")
+        };
+        assert!(e.to_string().contains("解压后超过"), "{e:#}");
 
         // None of that affected the theme being served or left a staging
         // directory behind.

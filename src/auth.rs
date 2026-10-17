@@ -462,8 +462,20 @@ pub fn client_ip(app: &crate::App, headers: &HeaderMap, peer: IpAddr) -> IpAddr 
         .next_back()
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit(',').next())
-        .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        .and_then(entry)
         .map_or(peer, |ip| ip.to_canonical())
+}
+
+/// One entry of a forwarding header. Some proxies, Azure's gateways among
+/// them, add the port: `1.2.3.4:5678`, `[2001:db8::1]:443`. Unparsed, such an
+/// entry would fall back to the proxy's address, one throttle key for every
+/// visitor.
+fn entry(v: &str) -> Option<IpAddr> {
+    let v = v.trim();
+    v.parse()
+        .ok()
+        .or_else(|| v.parse::<std::net::SocketAddr>().ok().map(|s| s.ip()))
+        .or_else(|| v.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
 /// The public addresses written in a header, in order, however many lines and
@@ -474,7 +486,7 @@ fn written<'a>(headers: &'a HeaderMap, name: &str) -> impl Iterator<Item = IpAdd
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .filter_map(|v| v.trim().parse::<IpAddr>().ok())
+        .filter_map(entry)
         .map(|ip| ip.to_canonical())
         .filter(|ip| crate::agent_ws::public(*ip))
 }
@@ -516,6 +528,20 @@ fn behind_local_proxy(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forwarded_entry_may_carry_a_port_or_brackets() {
+        for (written, ip) in [
+            ("1.2.3.4", Some("1.2.3.4")),
+            ("1.2.3.4:5678", Some("1.2.3.4")),
+            ("[2001:db8::1]:443", Some("2001:db8::1")),
+            ("[2001:db8::1]", Some("2001:db8::1")),
+            (" 2001:db8::1 ", Some("2001:db8::1")),
+            ("unknown", None),
+        ] {
+            assert_eq!(entry(written), ip.map(|ip| ip.parse().unwrap()), "{written}");
+        }
+    }
 
     #[test]
     fn a_password_round_trips_fails_closed_and_never_repeats_a_salt() {

@@ -862,7 +862,7 @@ function CreateNode({ onClose, onSaved }: {
         </DialogHeader>
         <form className="space-y-4" onSubmit={save}>
           <Field label="名称">
-            <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="香港 · 甲商家" />
+            <Input autoFocus maxLength={64} value={name} onChange={(e) => setName(e.target.value)} placeholder="香港 · 甲商家" />
           </Field>
           <DialogFooter className="border-t pt-4">
             <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
@@ -956,7 +956,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
             <section className="space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="名称">
-                  <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
+                  <Input maxLength={64} value={form.name} onChange={(e) => set("name", e.target.value)} />
                 </Field>
                 <Field label="分组" hint="公开页可见，留空为未分组">
                   <GroupInput nodes={nodes} value={form.group ?? ""} onChange={(v) => set("group", v)} />
@@ -1342,7 +1342,7 @@ function RegisterDialog({ site, reg, onClose }: {
           {/* One string: JSX turns a line break inside CJK text into a visible space. */}
           <p className="text-sm text-muted-foreground">
             {"开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在列表里，" +
-              "名字默认取它的 hostname。命令里没有任何一台机器的凭证，可以同时发给多台机器。"}
+              "名字默认是「节点 N」（N 是节点编号）。命令里没有任何一台机器的凭证，可以同时发给多台机器。"}
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
@@ -1934,7 +1934,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
               <Field label="名称" className="col-span-full sm:col-span-1">
                 {/* A new monitor starts empty, so the cursor belongs here;
                     editing an existing one starts with nothing selected. */}
-                <Input autoFocus={!task.id} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
+                <Input autoFocus={!task.id} maxLength={64} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
               </Field>
               <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接">
                 <Input value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />

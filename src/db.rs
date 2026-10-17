@@ -1119,6 +1119,11 @@ impl Db {
             ],
         )?;
         let id = tx.last_insert_rowid();
+        // Only a registration without `--name` arrives unnamed; the panel
+        // requires a name.
+        if n.name.is_empty() {
+            tx.execute("UPDATE node SET name = ?1 WHERE id = ?2", params![format!("节点 {id}"), id])?;
+        }
         tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
         tx.execute(
             "INSERT INTO ping_node (task_id, node_id) SELECT id, ?1 FROM ping_task WHERE auto_join",
