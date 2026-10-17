@@ -2835,7 +2835,7 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             label="GitHub 代理"
             hint="留空直连，只在 hub 拉不到 GitHub Release 时填"
             helpWidth="max-w-58 min-[376px]:max-w-86"
-            help={<p>这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像。</p>}
+            help={<p>agent 有签名校验，主题包没有，只填信得过的镜像。</p>}
           >
             <Input
               value={String(s.github_proxy ?? "")}

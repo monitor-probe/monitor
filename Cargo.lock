@@ -956,6 +956,7 @@ dependencies = [
  "mime_guess",
  "rand 0.9.5",
  "reqwest",
+ "ring",
  "rusqlite",
  "rust-embed",
  "rustix",
