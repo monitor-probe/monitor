@@ -1273,14 +1273,10 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Err(e) => return fail(e),
     }
     // The token is checked only at the handshake, so deleting the row does not
-    // end a connection already open on it; dropping the sender does. Without
-    // this the agent would keep reporting under an id SQLite reassigns to the
-    // next node created, which would then appear online on another node's
-    // metrics. Dropped after the delete, so the reconnect that follows finds no
-    // token to accept. The same reasoning applies in `reset_token` below.
+    // end a connection already open on it; dropping the sender does. Dropped
+    // after the delete, so the reconnect that follows finds no token to accept. The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    // Its held reading as well, which would otherwise be booked into the node
-    // that inherits the id.
+    // Its held reading as well, which no node would book.
     app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
@@ -3249,10 +3245,7 @@ mod tests {
     }
 
     /// Deleting a node must reach the connection it opened, for the same reason
-    /// rotating its token does, and more urgently: SQLite reassigns the freed id
-    /// to the next node created. Left connected, the old machine reports under
-    /// that id, so an undeployed node appears online with another machine's
-    /// metrics, and its traffic and history are booked to it.
+    /// rotating its token does, and a node created afterwards inherits nothing.
     #[tokio::test]
     async fn deleting_a_node_closes_its_session_so_the_next_id_does_not_inherit_it() {
         let app = std::sync::Arc::new(app());
@@ -3268,9 +3261,8 @@ mod tests {
             "the deleted node's agent must be told to go"
         );
 
-        // SQLite reuses the id; nothing of the old machine may accompany it.
         let fresh = node(&app, "fresh", true);
-        assert_eq!(fresh, old, "the fixture only means anything if the id is reused");
+        assert_ne!(fresh, old, "a deleted node's id is not issued again");
         let nodes = visible_nodes(&app, true).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["online"], json!(false), "a node nobody deployed is not online");

@@ -544,11 +544,8 @@ pub async fn watch(app: Shared) {
 fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let online: HashSet<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     let nodes = app.db.nodes()?;
-    // Node ids are rowids, which SQLite hands to the next node created once the
-    // newest is deleted; state kept under a deleted id would pass that node's
-    // absence, return and traffic step to the new one.
-    // ponytail: a delete and a create within one SWEEP still inherit; key by
-    // creation time if that ever matters.
+    // A deleted node's id is never issued again (`db::next_id`); this only
+    // keeps the maps from growing with deleted nodes.
     let ids: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
     watch.absent.retain(|id, _| ids.contains(id));
     watch.returned.retain(|id, _| ids.contains(id));
@@ -860,7 +857,7 @@ mod tests {
         assert_eq!(at(t + 11_180), ["offline"], "the next absence keeps the ordinary grace period");
     }
 
-    /// A deleted node's id goes to the next node created, and a node's first
+    /// A node created after a delete gets a fresh id, and a node's first
     /// connection is not a return from an outage: either would put a new node on
     /// the flapping grace period or suppress its first traffic alert.
     #[test]
@@ -889,7 +886,7 @@ mod tests {
         assert!(at(t + 30).is_empty());
 
         let new = node(&app, "new", true, 0);
-        assert_eq!(new, old, "the id is reused");
+        assert_ne!(new, old, "a deleted node's id is not issued again");
         metered(new);
         assert_eq!(at(t + 60), ["traffic"]);
         connect(&app, new);

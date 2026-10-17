@@ -1095,13 +1095,14 @@ impl Db {
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let id = next_id(&tx, "node")?;
         tx.execute(
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
-            "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
+            "INSERT INTO node (id, name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
                                group_name)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?14,?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -1115,10 +1116,10 @@ impl Db {
                 n.traffic_mode,
                 n.traffic_reset_day,
                 Utc::now().timestamp(),
-                n.group
+                n.group,
+                id
             ],
         )?;
-        let id = tx.last_insert_rowid();
         // Only a registration without `--name` arrives unnamed; the panel
         // requires a name.
         if n.name.is_empty() {
@@ -1259,9 +1260,7 @@ impl Db {
         let conn = self.conn();
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
         // for the chart query -- so it is cleared explicitly; the other history
-        // tables cascade. SQLite reassigns a deleted node's id to the next node
-        // created, which would otherwise inherit the removed machine's latency
-        // chart.
+        // tables cascade.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
         Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
@@ -2004,12 +2003,13 @@ impl Db {
             t.id
         } else {
             // At the end, as in `create_node`.
+            let id = next_id(&tx, "ping_task")?;
             tx.execute(
-                "INSERT INTO ping_task (name, target, interval, auto_join, sort)
-                 VALUES (?1,?2,?3,?4,(SELECT COALESCE(MAX(sort),-1)+1 FROM ping_task))",
-                params![t.name, t.target, t.interval, t.auto_join],
+                "INSERT INTO ping_task (id, name, target, interval, auto_join, sort)
+                 VALUES (?5,?1,?2,?3,?4,(SELECT COALESCE(MAX(sort),-1)+1 FROM ping_task))",
+                params![t.name, t.target, t.interval, t.auto_join, id],
             )?;
-            tx.last_insert_rowid()
+            id
         };
         let added: Vec<i64> = match &t.base {
             Some(base) if t.id > 0 => {
@@ -2112,11 +2112,7 @@ impl Db {
     /// Deletes a probe and the results filed under it.
     ///
     /// `ping_record` carries no foreign key, so it is cleared explicitly, as in
-    /// `delete_node`; `ping_hour` cascades. SQLite reassigns a deleted probe's
-    /// id to the next one created, and the chart selects on `task_id IN
-    /// (assignments for this node)`: without this the new probe would draw the
-    /// removed one's latency under its own name, with its timeouts folded into
-    /// the loss figure.
+    /// `delete_node`; `ping_hour` cascades.
     ///
     /// Each delete is a scan -- the keys begin at `node_id` -- bounded by the
     /// week of minute rows and the hourly tier, for an action taken manually a
@@ -2188,12 +2184,12 @@ impl Db {
     /// being WITHOUT ROWID and keyed for the chart query. Two cases arrive
     /// without an assignment. A result already in flight when the panel deleted
     /// its probe, which would otherwise land after `delete_ping_task` swept the
-    /// history and be inherited by whichever probe SQLite assigns the id to next.
+    /// history and stay behind under an id no probe holds.
     /// And a node token in the wrong hands: `task_id` is chosen by the reporter,
     /// so without the test the rows it could create would be unbounded.
     ///
     /// The chart's `task_id IN (assignments)` filter hides both afterwards, but
-    /// does not prevent the write, its storage, or the id being reused.
+    /// does not prevent the write or its storage.
     pub fn insert_pings(&self, node_id: i64, results: &[(i64, i64, i64)]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -2649,6 +2645,29 @@ fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Tally)>, 
         }
         out.push(row);
     }
+}
+
+/// The id for a new row of `table`: one past every id it has issued, deleted
+/// rows included. SQLite's default reissues the highest id once its row is
+/// deleted, and state the hub keeps by id -- the offline sweep's absence and
+/// return times, an editor opened before the delete -- would pass to the new
+/// row. The high mark lives in `setting`, so a backup carries it; without one,
+/// as after an upgrade, the table's own highest id stands in.
+fn next_id(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<i64> {
+    let key = format!("{table}_id_issued");
+    let id: i64 = tx.query_row(
+        &format!(
+            "SELECT MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM setting WHERE key = ?1), 0),
+                        COALESCE((SELECT MAX(id) FROM {table}), 0)) + 1"
+        ),
+        [&key],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO setting (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, id.to_string()],
+    )?;
+    Ok(id)
 }
 
 fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
@@ -3411,11 +3430,10 @@ mod tests {
             "{gone:#}"
         );
 
-        // `ping_record` has no foreign key to cascade through, and SQLite reassigns
-        // the deleted id to the next node created: without the sweep in
-        // `delete_node` the new machine would draw the old one's chart.
+        // A deleted id is not issued again, and a node created after it starts
+        // with no history.
         let fresh = node(&db, 1);
-        assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
+        assert_ne!(fresh, id, "a deleted node's id is not issued again");
         db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
         assert!(
             db.ping_records(fresh, Span::minutes(0, 60)).unwrap().0.is_empty(),
@@ -3423,10 +3441,7 @@ mod tests {
         );
     }
 
-    /// The mirror of the sweep above, on the other key of the same table. SQLite
-    /// reuses a deleted probe's id as well, and the chart selects on a node's
-    /// assignments, so the removed probe's samples would reappear under the new
-    /// probe's name with its timeouts folded into the new loss figure.
+    /// The mirror of the sweep above, on the other key of the same table.
     #[test]
     fn deleting_a_probe_takes_its_history_with_it() {
         let db = db();
@@ -3444,7 +3459,7 @@ mod tests {
         db.delete_ping_task(old).unwrap();
 
         let fresh = db.save_ping_task(&probe("singapore")).unwrap();
-        assert_eq!(fresh, old, "the id is reused, which is what makes this reachable");
+        assert_ne!(fresh, old, "a deleted probe's id is not issued again");
         assert!(
             db.ping_records(id, Span::minutes(0, 60)).unwrap().0.is_empty(),
             "and it starts with no history"
