@@ -683,6 +683,8 @@ pub struct Reading {
     epoch: String,
     counters: (i64, i64),
     arrival: Arrival,
+    /// When the machine booted, from the uptime reported with the counters.
+    booted: Option<i64>,
     /// Whether this reading has been booked into the traffic row.
     booked: bool,
 }
@@ -724,7 +726,7 @@ impl Reading {
 /// while another node's booking waits on the database. Per-node locks if a slow
 /// query ever holds reports up behind one.
 fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
-    let book = |r: &Reading| app.db.accumulate(node_id, &r.epoch, r.counters, r.arrival.at);
+    let book = |r: &Reading| app.db.accumulate(node_id, &r.epoch, r.counters, r.arrival.at, r.booted);
     let mut held = app.readings.lock().unwrap_or_else(|e| e.into_inner());
     // Whether the held reading, then this one, is booked.
     let (book_last, book_this) = match held.get(&node_id) {
@@ -749,7 +751,7 @@ fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
 pub fn book_held(app: &App, node: Option<i64>) {
     let mut held = app.readings.lock().unwrap_or_else(|e| e.into_inner());
     for (id, reading) in held.iter_mut().filter(|(id, r)| !r.booked && node.is_none_or(|n| n == **id)) {
-        match app.db.accumulate(*id, &reading.epoch, reading.counters, reading.arrival.at) {
+        match app.db.accumulate(*id, &reading.epoch, reading.counters, reading.arrival.at, reading.booted) {
             Ok(_) => reading.booked = true,
             Err(e) => warn!("node {id}: booking its last reading failed: {e:#}"),
         }
@@ -783,7 +785,10 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
         .and_then(|v| v.as_str())
         .filter(|e| !e.is_empty())
         .zip(counter("net_rx_total").zip(counter("net_tx_total")))
-        .map(|(epoch, counters)| Reading { epoch: epoch.to_owned(), counters, arrival, booked: false });
+        .map(|(epoch, counters)| {
+            let booted = metrics.get("uptime").and_then(|v| v.as_i64()).map(|up| arrival.at.timestamp() - up);
+            Reading { epoch: epoch.to_owned(), counters, arrival, booted, booked: false }
+        });
     let span = reading.as_ref().map(|r| (r.epoch.clone(), r.counters));
     if let Some(reading) = reading {
         file(app, node_id, reading)?;
@@ -1003,6 +1008,31 @@ mod tests {
         }
         send(&app, id, &mut session, 60, &report_json("boot", 2_000, 600)).unwrap();
         assert_eq!(total_rx(&app, id), 1_000);
+    }
+
+    /// The hub stopped at 60 s and, back at 3600 s, finds the node rebooted at
+    /// 1800 s: the bytes since that boot are booked, not discarded.
+    #[test]
+    fn a_reboot_while_the_hub_was_down_keeps_the_bytes_since_boot() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let report = |boot: &str, rx: i64, uptime: i64| {
+            json!({
+                "jsonrpc": "2.0", "method": "report",
+                "params": {"boot_id": boot, "cpu": 1, "load": [0, 0, 0], "mem_used": 1,
+                           "uptime": uptime, "net_rx_total": rx, "net_tx_total": 0}
+            })
+            .to_string()
+        };
+        let mut session = Session::default();
+        send(&app, id, &mut session, 0, &report("k1/d", 900_000, 50_000)).unwrap();
+        send(&app, id, &mut session, 60, &report("k1/d", 901_000, 50_060)).unwrap();
+        assert_eq!(total_rx(&app, id), 1_000);
+
+        app.readings.lock().unwrap().clear();
+        let mut session = Session::default();
+        send(&app, id, &mut session, 3_600, &report("k2/d", 5_000, 1_800)).unwrap();
+        assert_eq!(total_rx(&app, id), 6_000);
     }
 
     /// The lifetime total must never decrease, and must never book bytes nobody
@@ -1250,9 +1280,13 @@ mod tests {
 
         for (second, epoch, rx, tx) in readings {
             let arrival = at(second);
-            file(&app, held, Reading { epoch: epoch.into(), counters: (rx, tx), arrival, booked: false })
-                .unwrap();
-            app.db.accumulate(every, epoch, (rx, tx), arrival.at).unwrap();
+            file(
+                &app,
+                held,
+                Reading { epoch: epoch.into(), counters: (rx, tx), arrival, booted: None, booked: false },
+            )
+            .unwrap();
+            app.db.accumulate(every, epoch, (rx, tx), arrival.at, None).unwrap();
         }
         book_held(&app, Some(held));
 
@@ -1315,8 +1349,13 @@ mod tests {
         let app = app();
         let (a, b) = (node(&app), node(&app));
         for (id, rx) in [(a, 1_000), (b, 5_000)] {
-            let reading =
-                |rx, secs| Reading { epoch: "e".into(), counters: (rx, 0), arrival: at(secs), booked: false };
+            let reading = |rx, secs| Reading {
+                epoch: "e".into(),
+                counters: (rx, 0),
+                arrival: at(secs),
+                booted: None,
+                booked: false,
+            };
             file(&app, id, reading(rx, 0)).unwrap();
             file(&app, id, reading(rx + 700, 5)).unwrap();
         }

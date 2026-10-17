@@ -1447,12 +1447,16 @@ impl Db {
     /// The billing reset day is read here rather than passed in: it is one join
     /// from a row this already reads, and fetching it separately would cost every
     /// booking a second acquisition of the single write connection.
+    ///
+    /// `booted` is when the machine started, by the hub's clock: the arrival
+    /// less the reported uptime.
     pub fn accumulate(
         &self,
         node_id: i64,
         boot_id: &str,
         (rx, tx): (i64, i64),
         at: DateTime<Local>,
+        booted: Option<i64>,
     ) -> Result<Traffic> {
         let conn = self.conn();
         let (
@@ -1468,10 +1472,11 @@ impl Db {
             mut day_tx,
             day_start,
             reset_day,
+            last_seen,
         ) = conn
             .prepare_cached(
                 "SELECT t.boot_id, t.last_rx, t.last_tx, t.total_rx, t.total_tx, t.month_rx, t.month_tx,
-                    t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
+                    t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day, n.last_seen
                  FROM traffic t JOIN node n ON n.id = t.node_id WHERE t.node_id=?1",
             )?
             .query_row([node_id], |r| {
@@ -1488,6 +1493,7 @@ impl Db {
                     r.get::<_, i64>(9)?,
                     r.get::<_, String>(10)?,
                     r.get::<_, u32>(11)?,
+                    r.get::<_, i64>(12)?,
                 ))
             })?;
 
@@ -1502,10 +1508,25 @@ impl Db {
         // twice. A changed boot_id means the counters restarted, that the agent
         // now sums a different set of interfaces (it appends a digest of them,
         // so a device joining the sum is caught as well as one leaving it), or,
-        // indistinguishably from here, that a second machine shares the token.
-        // Realigning costs the seconds since the reboot; the alternative costs
-        // hundreds of gigabytes against a total that only increases.
-        let (d_rx, d_tx) = if prev_boot.is_empty() || prev_boot != boot_id {
+        // indistinguishably from the epoch alone, that a second machine shares
+        // the token. Booking the reading would cost hundreds of gigabytes
+        // against a total that only increases.
+        //
+        // Except for a machine that booted after the hub last heard from this
+        // token: its counters started from zero while unobserved, so the reading
+        // is exactly the bytes since boot -- a reboot during a hub outage would
+        // otherwise lose the whole outage. A second machine sharing the token
+        // booted before the other's last report, and an epoch whose kernel part
+        // is unchanged is a different set of interfaces, not a restart. The
+        // bytes between the last booking and the reboot remain lost.
+        let kernel = |epoch: &str| epoch.split('/').next().unwrap_or_default().to_owned();
+        let unseen_boot = !prev_boot.is_empty()
+            && kernel(&prev_boot) != kernel(boot_id)
+            && booted.is_some_and(|b| last_seen > 0 && b > last_seen);
+        let (d_rx, d_tx) = if unseen_boot {
+            info!("node {node_id} restarted after it was last seen; booking its counters since boot");
+            (rx, tx)
+        } else if prev_boot.is_empty() || prev_boot != boot_id {
             // Logged in either case: on a healthy node this is a reboot or the
             // agent summing a different set of interfaces, while one every few
             // seconds indicates two machines sharing a token or counted
@@ -3152,20 +3173,20 @@ mod tests {
         let id = node(&db, 1);
 
         // The first report only establishes the baseline.
-        let t = db.accumulate(id, "boot-a", (5_000, 3_000), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (5_000, 3_000), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (0, 0));
 
-        let t = db.accumulate(id, "boot-a", (9_000, 6_000), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (9_000, 6_000), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000));
 
         // Reboot: a new boot_id with counters restarting near zero. The total must
         // not fall back to the fresh value, and the 700 bytes moved before the
         // first report are not booked, nothing having measured them.
-        let t = db.accumulate(id, "boot-b", (700, 400), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-b", (700, 400), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (4_000, 3_000), "a reboot must not reset the total");
 
         // Counting resumes from the new baseline.
-        let t = db.accumulate(id, "boot-b", (1_700, 900), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-b", (1_700, 900), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (5_000, 3_500));
         assert_eq!((t.month_rx, t.month_tx), (5_000, 3_500));
     }
@@ -3180,45 +3201,64 @@ mod tests {
         let id = node(&db, 1);
         let (a, b) = (100_000_000_000, 80_000_000_000); // two lifetime counters
 
-        db.accumulate(id, "boot-a", (a, a), Local::now()).unwrap();
-        let t = db.accumulate(id, "boot-a", (a + 1_000, a + 1_000), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (a, a), Local::now(), None).unwrap();
+        let t = db.accumulate(id, "boot-a", (a + 1_000, a + 1_000), Local::now(), None).unwrap();
         assert_eq!(t.total_rx, 1_000, "the real machine's own traffic still counts");
 
         // Every swap presents a boot_id with no baseline, so every swap books
         // nothing.
         for round in 0..3 {
-            db.accumulate(id, "boot-b", (b + round, b + round), Local::now()).unwrap();
-            db.accumulate(id, "boot-a", (a + 1_000 + round, a + 1_000 + round), Local::now()).unwrap();
+            db.accumulate(id, "boot-b", (b + round, b + round), Local::now(), None).unwrap();
+            db.accumulate(id, "boot-a", (a + 1_000 + round, a + 1_000 + round), Local::now(), None).unwrap();
         }
         let t = db.all_traffic()[&id].clone();
         assert!(t.total_rx < 10_000, "six swaps booked {} bytes, not a lifetime counter", t.total_rx);
+    }
+
+    /// A machine that rebooted while the hub was not hearing from it books its
+    /// counters since boot; a second machine on the token, booted before the
+    /// last report, and a change of interfaces alone do not.
+    #[test]
+    fn a_reboot_after_the_node_was_last_seen_books_the_counters_since_boot() {
+        let db = db();
+        let id = node(&db, 1);
+        let now = Local::now();
+        let total = |epoch: &str, counters: i64, booted: i64| {
+            db.accumulate(id, epoch, (counters, counters), now, Some(booted)).unwrap().total_rx
+        };
+        assert_eq!(total("k1/a", 500_000_000_000, 0), 0, "a first reading is a baseline");
+        db.touch_seen(id, 1_000, &serde_json::Value::Null).unwrap();
+        assert_eq!(total("k1/b", 600_000_000_000, 2_000), 0, "the interfaces changed, the kernel did not");
+        assert_eq!(total("k2/b", 80_000_000_000, 900), 0, "booted before the node was last seen");
+        assert_eq!(total("k3/b", 7_000, 2_000), 7_000, "booted after it, from zero");
+        assert_eq!(total("k3/b", 7_500, 2_000), 7_500);
     }
 
     #[test]
     fn a_shrinking_reading_re_aligns_instead_of_re_counting_history() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", (10_000, 10_000), Local::now()).unwrap();
-        let t = db.accumulate(id, "boot-a", (12_000, 12_000), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (10_000, 10_000), Local::now(), None).unwrap();
+        let t = db.accumulate(id, "boot-a", (12_000, 12_000), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // The same boot with a reduced reading: an interface included in the sum
         // has gone, so this is the remainder of the machine's history rather than
         // new bytes.
-        let t = db.accumulate(id, "boot-a", (500, 500), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (500, 500), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_000, 2_000));
 
         // Aligned to the smaller baseline, counting resumes from there.
-        let t = db.accumulate(id, "boot-a", (900, 900), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (900, 900), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // A new boot realigns identically, for the same reason: it has no baseline
         // either.
-        let t = db.accumulate(id, "boot-b", (300, 300), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-b", (300, 300), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 2_400));
 
         // One direction shrinking does not deprive the other of its increment.
-        let t = db.accumulate(id, "boot-b", (100, 900), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-b", (100, 900), Local::now(), None).unwrap();
         assert_eq!((t.total_rx, t.total_tx), (2_400, 3_000));
     }
 
@@ -3229,21 +3269,21 @@ mod tests {
     fn day_and_month_restart_independently_while_the_total_keeps_climbing() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
-        let t = db.accumulate(id, "boot-a", (8_000, 4_000), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now(), None).unwrap();
+        let t = db.accumulate(id, "boot-a", (8_000, 4_000), Local::now(), None).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (8_000, 4_000));
         assert_eq!((t.month_rx, t.month_tx), (8_000, 4_000));
 
         // Midnight passes, forced through the stored date the rollover reads.
         db.conn().execute("UPDATE traffic SET day_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", (9_500, 4_600), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (9_500, 4_600), Local::now(), None).unwrap();
         assert_eq!((t.day_rx, t.day_tx), (1_500, 600), "a new day counts only this report's delta");
         assert_eq!(t.month_rx, 9_500, "the month is not a day");
         assert_eq!(t.total_rx, 9_500, "and the total is neither");
 
         // The billing period then rolls over, partway through that same day.
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
-        let t = db.accumulate(id, "boot-a", (10_000, 4_700), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (10_000, 4_700), Local::now(), None).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (500, 100), "a new period counts only this report's delta");
         assert_eq!((t.day_rx, t.day_tx), (2_000, 700), "the day carries on across a billing rollover");
         assert_eq!(t.total_rx, 10_000, "lifetime total is untouched by either rollover");
@@ -3260,28 +3300,29 @@ mod tests {
         let db = db();
         let id = node(&db, 20);
         let on = |d: u32| Local.with_ymd_and_hms(2026, 9, d, 12, 0, 0).unwrap();
-        db.accumulate(id, "boot-a", (1_000, 0), on(24)).unwrap();
-        db.accumulate(id, "boot-a", (3_000, 0), on(24)).unwrap();
-        let t = db.accumulate(id, "boot-a", (3_500, 0), on(23)).unwrap();
+        db.accumulate(id, "boot-a", (1_000, 0), on(24), None).unwrap();
+        db.accumulate(id, "boot-a", (3_000, 0), on(24), None).unwrap();
+        let t = db.accumulate(id, "boot-a", (3_500, 0), on(23), None).unwrap();
         assert_eq!(t.day_rx, 2_500, "a reading dated the day before does not restart today");
         assert_eq!(t.month_start, "2026-09-20");
 
         // The reset day moves to the 1st: the period now starts earlier, and a
         // reading dated after the stamp still switches to it.
         db.update_node(id, &NodePatch { traffic_reset_day: Some(1), ..Default::default() }).unwrap();
-        let t = db.accumulate(id, "boot-a", (4_000, 0), on(24)).unwrap();
+        let t = db.accumulate(id, "boot-a", (4_000, 0), on(24), None).unwrap();
         assert_eq!((t.month_start.as_str(), t.month_rx), ("2026-09-01", 500));
 
         // A correction stamps the current period; a reading from the one before,
         // held over the boundary, lands on top of it rather than discarding it.
         db.set_traffic(id, &TrafficPatch { month_rx: Some(10_000), ..Default::default() }).unwrap();
-        let t = db.accumulate(id, "boot-a", (4_500, 0), Local::now() - chrono::Duration::days(40)).unwrap();
+        let t =
+            db.accumulate(id, "boot-a", (4_500, 0), Local::now() - chrono::Duration::days(40), None).unwrap();
         assert_eq!(t.month_rx, 10_500, "the correction survives a reading dated before it");
 
         // A clock a year ahead stamps its own day and period. Once it is stepped
         // back, the next reading returns the row to today.
-        db.accumulate(id, "boot-a", (5_000, 0), Local::now() + chrono::Duration::days(365)).unwrap();
-        db.accumulate(id, "boot-a", (5_200, 0), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (5_000, 0), Local::now() + chrono::Duration::days(365), None).unwrap();
+        db.accumulate(id, "boot-a", (5_200, 0), Local::now(), None).unwrap();
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.day_rx, t.month_rx), (200, 200), "today reads what moved today, not zero");
     }
@@ -3293,8 +3334,8 @@ mod tests {
     fn a_node_that_went_quiet_before_a_boundary_reads_as_zero_this_period() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
-        db.accumulate(id, "boot-a", (8_000, 4_000), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now(), None).unwrap();
+        db.accumulate(id, "boot-a", (8_000, 4_000), Local::now(), None).unwrap();
         assert_eq!(db.all_traffic()[&id].day_rx, 8_000, "still today, so it still counts");
 
         // Offline across both boundaries, with no report to restart either.
@@ -3347,7 +3388,7 @@ mod tests {
             ..Default::default()
         };
         let task = db.save_ping_task(&probe(vec![id])).unwrap();
-        db.accumulate(id, "b", (10, 10), Local::now()).unwrap();
+        db.accumulate(id, "b", (10, 10), Local::now(), None).unwrap();
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_pings(id, &[(task, 1, 42)]).unwrap();
         db.delete_node(id).unwrap();
@@ -3548,7 +3589,7 @@ mod tests {
     fn a_month_correction_is_stamped_with_the_period_it_was_made_in() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "boot-a", (0, 0), Local::now()).unwrap();
+        db.accumulate(id, "boot-a", (0, 0), Local::now(), None).unwrap();
         // A node silent since before its reset day still holds the old period.
         db.conn().execute("UPDATE traffic SET month_start='1999-01-01' WHERE node_id=?1", [id]).unwrap();
 
@@ -3565,7 +3606,7 @@ mod tests {
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (300, 100), "the correction reads back as this period's");
 
-        let t = db.accumulate(id, "boot-a", (500, 50), Local::now()).unwrap();
+        let t = db.accumulate(id, "boot-a", (500, 50), Local::now(), None).unwrap();
         assert_eq!((t.month_rx, t.month_tx), (800, 150), "and the next report adds to it");
         assert_eq!((t.total_rx, t.total_tx), (4_500, 2_050));
     }
@@ -3591,8 +3632,8 @@ mod tests {
         assert_eq!(n.price, 0.0);
         assert_eq!(n.expires_at, None);
 
-        db.accumulate(id, "boot", (0, 0), Local::now()).unwrap();
-        db.accumulate(id, "boot", (120_000, 10_000), Local::now()).unwrap();
+        db.accumulate(id, "boot", (0, 0), Local::now(), None).unwrap();
+        db.accumulate(id, "boot", (120_000, 10_000), Local::now(), None).unwrap();
         db.set_traffic(id, &TrafficPatch { month_tx: Some(3_000), ..Default::default() }).unwrap();
         let t = db.all_traffic().remove(&id).unwrap();
         assert_eq!((t.total_rx, t.total_tx, t.month_rx, t.month_tx), (120_000, 10_000, 120_000, 3_000));
@@ -3820,8 +3861,8 @@ mod tests {
     fn prune_drops_history_but_never_traffic_totals() {
         let db = db();
         let id = node(&db, 1);
-        db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
-        db.accumulate(id, "b", (900, 900), Local::now()).unwrap();
+        db.accumulate(id, "b", (100, 100), Local::now(), None).unwrap();
+        db.accumulate(id, "b", (900, 900), Local::now(), None).unwrap();
         let old = Utc::now().timestamp() - 40 * 86_400;
         db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();

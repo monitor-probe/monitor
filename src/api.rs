@@ -3675,8 +3675,8 @@ mod tests {
     fn a_node_view_carries_traffic_even_while_offline() {
         let app = app();
         let id = node(&app, "n", true);
-        app.db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
-        app.db.accumulate(id, "b", (900, 500), Local::now()).unwrap();
+        app.db.accumulate(id, "b", (100, 100), Local::now(), None).unwrap();
+        app.db.accumulate(id, "b", (900, 500), Local::now(), None).unwrap();
         app.db.touch_seen(id, 1_700_000_000, &serde_json::Value::Null).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
