@@ -786,7 +786,10 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
         .filter(|e| !e.is_empty())
         .zip(counter("net_rx_total").zip(counter("net_tx_total")))
         .map(|(epoch, counters)| {
-            let booted = metrics.get("uptime").and_then(|v| v.as_i64()).map(|up| arrival.at.timestamp() - up);
+            // The agent reports 0 where /proc/uptime cannot be read, which is
+            // no boot time: taken as one, every epoch change would book.
+            let uptime = metrics.get("uptime").and_then(|v| v.as_i64()).filter(|up| *up > 0);
+            let booted = uptime.map(|up| arrival.at.timestamp() - up);
             Reading { epoch: epoch.to_owned(), counters, arrival, booted, booked: false }
         });
     let span = reading.as_ref().map(|r| (r.epoch.clone(), r.counters));
@@ -1033,10 +1036,22 @@ mod tests {
         let mut session = Session::default();
         send(&app, id, &mut session, 3_600, &report("k2/d", 5_000, 1_800)).unwrap();
         assert_eq!(total_rx(&app, id), 6_000);
+
+        // A second machine on the token, one with no uptime to report among
+        // them: each swap only realigns.
+        for (i, (epoch, uptime)) in
+            [("k3/d", 900_000), ("k4/d", 0), ("k2/d", 1_900), ("k4/d", 0)].iter().enumerate()
+        {
+            let mut session = Session::default();
+            let secs = 3_660 + i as u64 * 30;
+            send(&app, id, &mut session, secs, &report(epoch, 80_000_000_000, *uptime)).unwrap();
+        }
+        assert_eq!(total_rx(&app, id), 6_000);
     }
 
     /// The lifetime total must never decrease, and must never book bytes nobody
-    /// moved. The two figures behind it arrive from another repository's binary
+    /// moved. The counters behind it, and the uptime that decides whether a new
+    /// epoch's reading is booked whole, arrive from another repository's binary
     /// and are the only report fields that mutate state outliving the
     /// connection.
     #[test]

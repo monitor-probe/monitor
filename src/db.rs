@@ -1519,9 +1519,12 @@ impl Db {
         // booted before the other's last report, and an epoch whose kernel part
         // is unchanged is a different set of interfaces, not a restart. The
         // bytes between the last booking and the reboot remain lost.
-        let kernel = |epoch: &str| epoch.split('/').next().unwrap_or_default().to_owned();
+        // `last_seen` trails the last report by up to a minute, so a machine
+        // booted within it books its own bytes since boot, once; the next
+        // report from the other moves `last_seen` past both boots.
         let unseen_boot = !prev_boot.is_empty()
-            && kernel(&prev_boot) != kernel(boot_id)
+            && prev_boot != boot_id
+            && prev_boot.split('/').next() != boot_id.split('/').next()
             && booted.is_some_and(|b| last_seen > 0 && b > last_seen);
         let (d_rx, d_tx) = if unseen_boot {
             info!("node {node_id} restarted after it was last seen; booking its counters since boot");
