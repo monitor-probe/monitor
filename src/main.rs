@@ -171,7 +171,8 @@ async fn install_script() -> Response {
 ///
 /// This URL is fetched on an anonymous request, so setting it redirects that
 /// path. It remains within the bounds `agent_binary` already enforces: four
-/// concurrent transfers, a 120-second timeout, a capped body and a signature.
+/// concurrent transfers, a response within [`RELAY_HEAD`], a capped body and a
+/// signature.
 fn release_url(app: &App, arch: &str) -> String {
     proxied(
         app,
@@ -218,7 +219,12 @@ static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RE
 /// transfer, four slots drain some 120 queued machines within it.
 const RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Longest a relay may hold its permit.
+/// Longest a request may take to produce its response head, the wait for a
+/// slot included: below the 60 s nginx allows. The binary is verified whole
+/// before the head is sent, so the download from GitHub falls within it.
+const RELAY_HEAD: std::time::Duration = std::time::Duration::from_secs(55);
+
+/// Longest a relay may hold its permit once the response is under way.
 ///
 /// Deliberately generous, since a node on a slow link must still transfer
 /// 1.8 MB; what it rules out is a transfer that never completes.
@@ -284,23 +290,37 @@ fn signed(key: &[u8], binary: &[u8], signature: &[u8]) -> bool {
     UnparsedPublicKey::new(&ED25519, key).verify(binary, signature).is_ok()
 }
 
+/// Whether `binary` is an ELF executable for `arch`. A signature covers the
+/// bytes alone, so a mirror could answer one architecture's request with the
+/// other's signed binary, and `install.sh` would replace a running agent with
+/// one that cannot start.
+fn built_for(binary: &[u8], arch: &str) -> bool {
+    let machine: u16 = if arch == "aarch64" { 183 } else { 62 };
+    binary.get(18..20).is_some_and(|m| u16::from_le_bytes([m[0], m[1]]) == machine)
+}
+
 /// One GET of a release asset, whole, refused past `max` bytes.
-async fn fetch_asset(app: &App, url: &str, max: usize) -> Result<Vec<u8>, String> {
+async fn fetch_asset(app: &App, url: &str, what: &str, max: usize) -> Result<Vec<u8>, String> {
     let who = if url.starts_with("https://github.com/") { "GitHub" } else { "the GitHub proxy" };
-    // The default client timeout is sized for API calls, not a 1.8 MB download.
-    let mut res =
-        app.http.get(url).timeout(std::time::Duration::from_secs(120)).send().await.map_err(|e| {
-            warn!("fetching {url} failed: {e:#}");
-            "the hub could not reach GitHub or its GitHub proxy; its log has the details".to_owned()
-        })?;
+    // The default client timeout is sized for API calls; the caller bounds the
+    // download as a whole.
+    let mut res = app.http.get(url).timeout(RELAY_HEAD).send().await.map_err(|e| {
+        warn!("fetching {url} failed: {e:#}");
+        "the hub could not reach GitHub or its GitHub proxy; its log has the details".to_owned()
+    })?;
     if !res.status().is_success() {
-        return Err(format!("{who} answered {} for the agent release", res.status()));
+        return Err(format!("{who} answered {} for the {what}", res.status()));
     }
-    let mut body = Vec::new();
+    let too_large = || format!("{who} sent more than {max} bytes for the {what}");
+    let declared = res.content_length().unwrap_or(0);
+    if declared > max as u64 {
+        return Err(too_large());
+    }
+    let mut body = Vec::with_capacity(declared as usize);
     loop {
         match res.chunk().await {
             Ok(Some(chunk)) if body.len() + chunk.len() <= max => body.extend_from_slice(&chunk),
-            Ok(Some(_)) => return Err(format!("{who} sent more than {max} bytes for the agent release")),
+            Ok(Some(_)) => return Err(too_large()),
             Ok(None) => return Ok(body),
             Err(e) => {
                 warn!("reading {url} failed: {e:#}");
@@ -339,23 +359,35 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
     }
+    let asked = tokio::time::Instant::now();
     let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
         return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
     };
     let url = release_url(&app, &arch);
+    let sig = format!("{url}.sig");
     // English, as `install.sh` prints it after its own English line.
     let fetched = async {
-        let binary = fetch_asset(&app, &url, MAX_AGENT_BINARY).await?;
-        let signature = fetch_asset(&app, &format!("{url}.sig"), 64).await?;
-        if !signed(&AGENT_SIGNING_KEY, &binary, &signature) {
-            warn!("{url} does not match its signature; not relayed");
+        let (binary, signature) = tokio::try_join!(
+            fetch_asset(&app, &url, "agent binary", MAX_AGENT_BINARY),
+            fetch_asset(&app, &sig, "agent signature", 64),
+        )?;
+        if !signed(&AGENT_SIGNING_KEY, &binary, &signature) || !built_for(&binary, &arch) {
+            warn!("{url} does not match its signature or architecture; not relayed");
             return Err(
                 "the agent binary failed its signature check, so the hub refused to relay it".to_owned()
             );
         }
         Ok(binary)
     };
-    match fetched.await {
+    let budget = RELAY_HEAD.saturating_sub(asked.elapsed());
+    let Ok(fetched) = tokio::time::timeout(budget, fetched).await else {
+        warn!("fetching {url} took longer than {} s; not relayed", RELAY_HEAD.as_secs());
+        return api::answer(
+            StatusCode::BAD_GATEWAY,
+            "GitHub or the GitHub proxy was too slow to deliver the agent before the response deadline",
+        );
+    };
+    match fetched {
         Ok(binary) => (
             [(header::CONTENT_TYPE, "application/octet-stream")],
             axum::body::Body::from_stream(metered(Once(Some(binary.into())), permit)),
@@ -930,6 +962,8 @@ fn compressible() -> impl Predicate {
 mod tests {
     use super::*;
 
+    use axum::http::{StatusCode, Uri};
+
     #[test]
     fn only_a_binary_signed_with_the_key_is_relayed() {
         use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -944,8 +978,10 @@ mod tests {
         assert!(!signed(key, &swapped, signature.as_ref()), "a replaced binary");
         assert!(!signed(&AGENT_SIGNING_KEY, &binary, signature.as_ref()), "another key's signature");
         assert!(!signed(key, &binary, &[]), "no signature");
+        let mut elf = vec![0u8; 64];
+        elf[18] = 62;
+        assert!(built_for(&elf, "x86_64") && !built_for(&elf, "aarch64"), "the other architecture's binary");
     }
-    use axum::http::{StatusCode, Uri};
 
     /// The limit only moves up, so raising it here cannot disturb another test.
     #[test]
