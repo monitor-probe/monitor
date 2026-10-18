@@ -1006,6 +1006,12 @@ impl Db {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
+        // A file from a release that kept no high marks gets them now, from its
+        // rows. Otherwise deleting the newest node or probe before the next one
+        // is created would lose its id, and `next_id` would issue it again.
+        for table in ID_TABLES {
+            put_setting(&conn, &format!("{table}_id_issued"), &issued(&conn, table)?.to_string())?;
+        }
         let reader = match main_file(&conn) {
             file if file.is_empty() => None,
             file => Some(Mutex::new(read_only(&file)?)),
@@ -3487,6 +3493,39 @@ mod tests {
         assert_ne!(fresh, old, "a deleted probe's id is not issued again");
     }
 
+    /// A database from a release without high marks: the newest node and probe
+    /// deleted before anything is created keep their ids out of circulation.
+    #[test]
+    fn an_upgraded_database_does_not_reissue_the_newest_ids() {
+        let file = std::env::temp_dir().join(format!("monitor-marks-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+        let db = Db::open(path).unwrap();
+        let (_, newest) = (node(&db, 1), node(&db, 1));
+        let probe = |name: &str| PingTask {
+            name: name.into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![newest],
+            ..Default::default()
+        };
+        let task = db.save_ping_task(&probe("tokyo")).unwrap();
+        // As the release before the marks left it.
+        db.conn().execute("DELETE FROM setting WHERE key LIKE '%_id_issued'", []).unwrap();
+        drop(db);
+
+        let db = Db::open(path).unwrap();
+        db.delete_ping_task(task).unwrap();
+        db.delete_node(newest).unwrap();
+        assert!(node(&db, 1) > newest, "the newest node's id is issued again");
+        assert!(db.save_ping_task(&probe("osaka")).is_err(), "the probe names a deleted node");
+        let other = node(&db, 1);
+        let fresh = db.save_ping_task(&PingTask { nodes: vec![other], ..probe("osaka") }).unwrap();
+        assert!(fresh > task, "the newest probe's id is issued again");
+        drop(db);
+        std::fs::remove_file(&file).unwrap();
+    }
+
     /// An earlier build deleting a node or a probe runs only its own statements,
     /// those of v1.3.1 below, and knows nothing of `ping_hour`. Rows it leaves
     /// would stay behind under an id no node or probe holds, once the newer
@@ -4031,7 +4070,12 @@ mod tests {
             );
         }
         let upgraded = dump(&db.conn());
-        assert_eq!(upgraded.len(), TABLES.len() - HOURLY_TABLES.len(), "every row survives: {upgraded:#?}");
+        // One row per table, plus the id high marks `open` records.
+        assert_eq!(
+            upgraded.len(),
+            TABLES.len() - HOURLY_TABLES.len() + ID_TABLES.len(),
+            "every row survives: {upgraded:#?}"
+        );
 
         // An earlier build opening the file stamps its own version, so the next
         // upgrade runs every migration again.
