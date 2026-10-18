@@ -1523,7 +1523,6 @@ impl Db {
         // booted within it books its own bytes since boot, once; the next
         // report from the other moves `last_seen` past both boots.
         let unseen_boot = !prev_boot.is_empty()
-            && prev_boot != boot_id
             && prev_boot.split('/').next() != boot_id.split('/').next()
             && booted.is_some_and(|b| last_seen > 0 && b > last_seen);
         let (d_rx, d_tx) = if unseen_boot {
