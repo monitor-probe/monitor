@@ -685,7 +685,7 @@ mod tests {
         // observation at the tail; reading the head would let a caller choose its
         // own throttle bucket each request, or claim the operator's address.
         let forged = xff("10.0.0.2, 198.51.100.9");
-        for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
+        for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1", "fe80::1"] {
             assert_eq!(client_ip(&app, &forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
         }
 

@@ -129,20 +129,27 @@ impl App {
 
     /// Whether a session cookie may be marked Secure. With `--site` this follows
     /// its scheme; without one the hub does not know the address it was reached
-    /// on and must rely on the request: a TLS-terminating proxy sets
-    /// `X-Forwarded-Proto`, while a hub answering plain HTTP directly has no such
-    /// header. Marking the cookie Secure over plain HTTP would cause the browser
-    /// to discard the session.
+    /// on and must rely on the request, where three headers can say https: the
+    /// browser's `Origin`, a TLS-terminating proxy's `X-Forwarded-Proto`, and
+    /// Cloudflare's `CF-Visitor`. A hub answering plain HTTP directly sees none.
+    /// Marking the cookie Secure over plain HTTP would cause the browser to
+    /// discard the session.
     ///
-    /// The header is supplied by the trusted reverse proxy, so the listener must
-    /// remain publicly unreachable for a caller not to set its own. A proxy that
-    /// sends none leaves the flag off, which costs the flag rather than the
-    /// session; `--site https://...` sets it regardless.
+    /// Any one of them suffices. A false https costs only the sender's own
+    /// session, while a missed one leaves the cookie in the clear -- and each
+    /// header alone misses a common shape: a proxy behind a TLS edge rewrites
+    /// `X-Forwarded-Proto` to its own `http` hop, `CF-Visitor` exists only behind
+    /// Cloudflare, and `Origin` is absent from the navigation that ends GitHub
+    /// sign-in. Only that last case still depends on the proxies; `--site
+    /// https://...` sets the flag regardless.
     pub fn secure_cookies(&self, headers: &HeaderMap) -> bool {
         if !self.site.is_empty() {
             return !self.site.starts_with("http://");
         }
-        forwarded_proto(headers) == Some("https")
+        let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+        header("origin").is_some_and(|o| o.starts_with("https://"))
+            || forwarded_proto(headers) == Some("https")
+            || header("cf-visitor").is_some_and(|v| v.contains(r#""scheme":"https""#))
     }
 }
 
@@ -455,9 +462,9 @@ fn parse_args() -> Result<Args> {
                      reverse proxy is already right. It is needed where agents reach the\n\
                      hub by another name than the panel's; where the panel is opened\n\
                      through an SSH tunnel, whose loopback address no node can reach and\n\
-                     which adds no node without it; and where the proxy sends no\n\
-                     X-Forwarded-Proto, since it then sets the session cookie's Secure\n\
-                     flag. A value that is not an https:// domain disables adding nodes.\n\
+                     which adds no node without it; and where GitHub sign-in sits behind\n\
+                     a proxy that sends no X-Forwarded-Proto, since it then sets the\n\
+                     session cookie's Secure flag. A value that is not an https:// domain disables adding nodes.\n\
                      --reset-password replaces the emergency password, signs every session\n\
                      out, prints the new password and exits. The database must exist.",
                     env!("CARGO_PKG_VERSION")
@@ -1137,6 +1144,20 @@ mod tests {
         // Chained proxies append, so the browser's own hop is the first value.
         assert!(bare.secure_cookies(&proto(Some("https, http"))));
         assert!(!bare.secure_cookies(&proto(Some("http, https"))));
+
+        // A TLS edge ahead of nginx's `X-Forwarded-Proto $scheme`: the header
+        // reads http, yet the browser is on https. Its own Origin says so on
+        // every write, Cloudflare's CF-Visitor on every request.
+        let with = |name: &str, value: &str| {
+            let mut headers = proto(Some("http"));
+            headers.insert(name.parse::<header::HeaderName>().unwrap(), value.parse().unwrap());
+            headers
+        };
+        assert!(bare.secure_cookies(&with("origin", "https://hub.example.com")));
+        assert!(bare.secure_cookies(&with("cf-visitor", r#"{"scheme":"https"}"#)));
+        assert!(!bare.secure_cookies(&with("origin", "http://hub.example.com")));
+        assert!(!bare.secure_cookies(&with("cf-visitor", r#"{"scheme":"http"}"#)));
+        assert!(!bare.secure_cookies(&with("origin", "null")));
     }
 
     /// A hub serving in the clear must report it, and a wildcard listener is not
