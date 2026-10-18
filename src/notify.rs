@@ -587,7 +587,15 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let percent = number(app, "notify_traffic");
     let mut metered = Vec::new();
     let traffic = if percent > 0 && armed { app.db.all_traffic() } else { HashMap::new() };
-    let stored = app.db.get(TRAFFIC_ALERTED);
+    // A failed read skips the section: taken for "nothing stored", it would
+    // record this sweep's crossings without announcing them.
+    let stored = match app.db.lookup(TRAFFIC_ALERTED) {
+        Ok(stored) => stored,
+        Err(e) => {
+            warn!("reading the traffic steps announced failed: {e:#}");
+            return Ok(notes);
+        }
+    };
     // None when nothing was stored: a hub upgraded from a release that kept the
     // steps in memory, or a database restored from one, records the steps
     // already reached rather than announcing every one again. Ordered, so that
@@ -631,13 +639,16 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
         );
         metered.push((node.name.as_str(), detail));
     }
-    notes.extend(batch("traffic", "⚠️", "流量提醒", metered));
+    // Announced only once recorded: unrecorded, the next sweep would announce
+    // the same step again, every 30 seconds while writes fail.
     let state = serde_json::to_string(&alerted)?;
     if stored.as_ref() != Some(&state) {
         if let Err(e) = app.db.set(TRAFFIC_ALERTED, &state) {
             warn!("saving the traffic steps announced failed: {e:#}");
+            return Ok(notes);
         }
     }
+    notes.extend(batch("traffic", "⚠️", "流量提醒", metered));
     Ok(notes)
 }
 
