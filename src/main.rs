@@ -149,7 +149,9 @@ impl App {
         let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
         header("origin").is_some_and(|o| o.starts_with("https://"))
             || forwarded_proto(headers) == Some("https")
-            || header("cf-visitor").is_some_and(|v| v.contains(r#""scheme":"https""#))
+            || header("cf-visitor")
+                .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+                .is_some_and(|v| v["scheme"] == "https")
     }
 }
 
@@ -463,8 +465,10 @@ fn parse_args() -> Result<Args> {
                      hub by another name than the panel's; where the panel is opened\n\
                      through an SSH tunnel, whose loopback address no node can reach and\n\
                      which adds no node without it; and where GitHub sign-in sits behind\n\
-                     a proxy that sends no X-Forwarded-Proto, since it then sets the\n\
-                     session cookie's Secure flag. A value that is not an https:// domain disables adding nodes.\n\
+                     proxies that do not report https -- no X-Forwarded-Proto, or a CDN\n\
+                     other than Cloudflare ahead of an nginx that rewrites it to http --\n\
+                     since it then sets the session cookie's Secure flag. A value that is\n\
+                     not an https:// domain disables adding nodes.\n\
                      --reset-password replaces the emergency password, signs every session\n\
                      out, prints the new password and exits. The database must exist.",
                     env!("CARGO_PKG_VERSION")
@@ -582,13 +586,11 @@ async fn main() -> Result<()> {
     // advertises. This one derives from the socket actually open, and the two
     // diverge in the deployment that needs it most: `--site https://...` with
     // --listen left at its wildcard default prints nothing while the port answers
-    // plain HTTP to anyone who finds it. The X-Forwarded-Proto cookie flag
-    // assumes the proxy cannot be bypassed.
+    // plain HTTP to anyone who finds it.
     else if !args.listen.ip().is_loopback() {
         warn!(
             "listening on {} in the clear. If a TLS proxy fronts this hub, callers can still reach \
-             this port directly and set their own X-Forwarded-Proto. Close it so the proxy is the \
-             only way in: {close}",
+             this port directly, without TLS. Close it so the proxy is the only way in: {close}",
             args.listen
         );
     }
@@ -1112,11 +1114,11 @@ mod tests {
         assert_eq!(spa("/node/7").await.status(), StatusCode::OK);
     }
 
-    /// What determines the Secure flag: `--site` when set, otherwise the proxy in
-    /// front -- the default ip:port deployment, where the hub does not know its
-    /// own address.
+    /// What determines the Secure flag: `--site` when set, otherwise the request
+    /// -- the default ip:port deployment, where the hub does not know its own
+    /// address.
     #[test]
-    fn the_cookie_flag_follows_site_when_it_is_set_and_the_proxy_when_it_is_not() {
+    fn the_cookie_flag_follows_site_when_it_is_set_and_the_request_when_it_is_not() {
         // Local development: no Secure flag, or the browser discards the cookie
         // entirely.
         for local in ["http://127.0.0.1:28080", "http://localhost:28080", "http://[::1]:28080"] {
@@ -1137,7 +1139,7 @@ mod tests {
         assert!(exposed_over_plain_http("http://127.0.0.1:28080@hub.example.com"));
         assert!(!app("http://127.0.0.1:28080@hub.example.com").secure_cookies(&proto(None)));
 
-        // Without --site the proxy's header is the only indication of scheme.
+        // Without --site the request's headers are the only indication of scheme.
         let bare = app("");
         assert!(!bare.secure_cookies(&proto(None)), "plain HTTP, answered directly");
         assert!(bare.secure_cookies(&proto(Some("https"))));
@@ -1157,6 +1159,7 @@ mod tests {
         assert!(bare.secure_cookies(&with("cf-visitor", r#"{"scheme":"https"}"#)));
         assert!(!bare.secure_cookies(&with("origin", "http://hub.example.com")));
         assert!(!bare.secure_cookies(&with("cf-visitor", r#"{"scheme":"http"}"#)));
+        assert!(bare.secure_cookies(&with("cf-visitor", r#"{ "scheme": "https" }"#)), "re-serialized");
         assert!(!bare.secure_cookies(&with("origin", "null")));
     }
 
