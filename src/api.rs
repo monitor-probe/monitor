@@ -1274,7 +1274,8 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     }
     // The token is checked only at the handshake, so deleting the row does not
     // end a connection already open on it; dropping the sender does. Dropped
-    // after the delete, so the reconnect that follows finds no token to accept. The same reasoning applies in `reset_token` below.
+    // after the delete, so the reconnect that follows finds no token to accept.
+    // The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     // Its held reading as well, which no node would book.
     app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
