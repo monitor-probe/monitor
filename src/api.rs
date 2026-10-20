@@ -209,9 +209,8 @@ fn node_view(
     full: bool,
     now: DateTime<Local>,
 ) -> Value {
-    // The three capacities arrive twice: once in `Facts`, sent at the handshake,
-    // and again in every `Metrics`. The stored figure follows the reports a
-    // minute at a time and as the session ends, so it lags a disk mounted while
+    // The three capacities arrive in every `Metrics`. The stored figure follows
+    // the reports a minute at a time and as the session ends, so it lags a disk mounted while
     // the agent runs -- the agent re-reads its mount table every sample so that
     // it appears -- by up to a minute. Using the report while a node is connected
     // keeps every consumer of this view on one number: the card reads the live
@@ -3713,22 +3712,20 @@ mod tests {
         assert_eq!(visible_nodes(&app, true).unwrap()[1]["last_seen_ago"], Value::Null, "never seen");
     }
 
-    /// A capacity arrives twice -- once in the facts stored at the handshake, and
-    /// again in every report -- and the two diverge as soon as a disk is mounted
-    /// on a running machine, which the agent detects by re-reading its mount table
-    /// every sample. Drawn from the stored copy, the card and the detail page
-    /// would show the same host two different sizes until it reconnected.
+    /// The stored capacities trail the reports by up to a minute, and a disk is
+    /// mounted on a running machine at any moment, which the agent detects by
+    /// re-reading its mount table every sample. Drawn from the stored copy, the
+    /// card and the detail page would show the same host two different sizes.
     #[test]
-    fn a_capacity_that_changed_since_the_handshake_is_the_reported_one() {
+    fn a_capacity_that_changed_since_the_last_write_is_the_reported_one() {
         let app = app();
         let id = node(&app, "n", true);
-        // What the handshake stored: 30 GB of disk, 1 GB of swap.
+        // What the last write stored: 30 GB of disk, 1 GB of swap.
         app.db
-            .save_facts(
+            .touch_seen(
                 id,
+                1,
                 &json!({"mem_total": 1_000, "swap_total": 1i64 << 30, "disk_total": 30i64 << 30}),
-                "ip",
-                "",
             )
             .unwrap();
 
@@ -3739,8 +3736,7 @@ mod tests {
             "with nobody connected the stored facts are all there is"
         );
 
-        // A 5 GB volume is mounted and swap is disabled. The same session, with no
-        // second hello, so the stored facts do not change.
+        // A 5 GB volume is mounted and swap is disabled, before the next write.
         let _held = connect(
             &app,
             id,

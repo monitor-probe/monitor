@@ -32,6 +32,12 @@ const SILENCE: Duration = Duration::from_secs(120);
 /// second; half of it leaves room for two reports the network has bunched.
 const REPORT_SPACING: Duration = Duration::from_millis(500);
 
+/// Hellos closer together than this are dropped. The agent sends one as it
+/// connects and another when its facts change, which it checks once a minute;
+/// half of that keeps a hello the network delayed from being taken for excess,
+/// since the agent does not repeat one it has sent.
+const HELLO_SPACING: Duration = Duration::from_secs(30);
+
 /// Probe results admitted per window: twice what the busiest honest node sends
 /// in one -- every probe it may run, each at the shortest interval -- since a
 /// window can straddle two rounds.
@@ -216,7 +222,7 @@ impl Minute {
 /// most are written: unbounded, 34,209 reports over one connection in ten
 /// seconds would have the hub write 93 MB (measured). The agent's own pace is
 /// known, so what exceeds it is dropped: reports faster than its one-second
-/// floor, a second hello, and results beyond [`Db::MAX_PROBES_PER_NODE`]
+/// floor, hellos within [`HELLO_SPACING`] of the last, and results beyond [`Db::MAX_PROBES_PER_NODE`]
 /// probes each run every [`Db::MIN_PROBE_INTERVAL`] seconds.
 ///
 /// ponytail: the caps start afresh with each connection, so a token reconnecting
@@ -224,9 +230,19 @@ impl Minute {
 /// report's `last_seen` -- rather than a few per minute. An honest agent cannot
 /// do this, as it doubles its wait after a short session. A per-node limit on
 /// handshakes if it is ever observed; reissuing the token ends it meanwhile.
+/// Whether a frame at `tick` keeps `spacing` from the last admitted, which it
+/// then becomes.
+fn spaced(last: &mut Option<Instant>, tick: Instant, spacing: Duration) -> bool {
+    if last.is_some_and(|last| tick.saturating_duration_since(last) < spacing) {
+        return false;
+    }
+    *last = Some(tick);
+    true
+}
+
 #[derive(Debug, Default)]
 struct Session {
-    greeted: bool,
+    last_hello: Option<Instant>,
     last_report: Option<Instant>,
     /// Start of the current result window and the results admitted in it.
     window: Option<(Instant, u32)>,
@@ -239,11 +255,11 @@ struct Session {
 
 impl Session {
     fn admit_report(&mut self, tick: Instant) -> bool {
-        if self.last_report.is_some_and(|last| tick.saturating_duration_since(last) < REPORT_SPACING) {
-            return false;
-        }
-        self.last_report = Some(tick);
-        true
+        spaced(&mut self.last_report, tick, REPORT_SPACING)
+    }
+
+    fn admit_hello(&mut self, tick: Instant) -> bool {
+        spaced(&mut self.last_hello, tick, HELLO_SPACING)
     }
 
     fn admit_result(&mut self, tick: Instant) -> bool {
@@ -497,8 +513,11 @@ fn dispatch(
     }
     match rpc.method.as_str() {
         "hello" => {
-            if std::mem::replace(&mut session.greeted, true) {
-                session.complain(node_id, "a second hello on one connection was ignored");
+            if !session.admit_hello(arrival.tick) {
+                session.complain(
+                    node_id,
+                    format_args!("a hello within {HELLO_SPACING:?} of the last was ignored"),
+                );
                 return Ok(None);
             }
             let field = |k: &str| rpc.params.get(k).and_then(|v| v.as_str()).unwrap_or("");
@@ -1388,9 +1407,12 @@ mod tests {
         let hello = |name: &str| {
             json!({"jsonrpc": "2.0", "method": "hello", "params": {"hostname": name}}).to_string()
         };
+        let hostname = || app.db.node(id).unwrap().unwrap().hostname;
         send(&app, id, &mut session, 0, &hello("first")).unwrap();
         send(&app, id, &mut session, 1, &hello("second")).unwrap();
-        assert_eq!(app.db.node(id).unwrap().unwrap().hostname, "first", "one hello per connection");
+        assert_eq!(hostname(), "first", "a hello a second after the last is dropped");
+        send(&app, id, &mut session, 60, &hello("renamed")).unwrap();
+        assert_eq!(hostname(), "renamed", "facts that changed a minute later are taken");
 
         let cpu =
             |value: f64| json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": value}}).to_string();
@@ -1424,6 +1446,7 @@ mod tests {
         assert_eq!(n.hostname, "vps-1");
         assert_eq!(n.cpu_cores, 4);
         assert_eq!(n.ip, "198.51.100.4");
+        assert_eq!(n.mem_total, 0, "capacities are the reports' to store, not an older agent's hello");
     }
 
     /// The country follows the machine rather than whatever stands in front of

@@ -1276,10 +1276,13 @@ impl Db {
         Ok(self.conn().query_row("SELECT id FROM node WHERE token = ?1", [token], |r| r.get(0)).optional()?)
     }
 
-    /// Stores the slow-changing facts an agent sends on connect, and reports
+    /// Stores the facts an agent sends on connect and again whenever they change,
+    /// and reports
     /// whether the node still requires a country lookup for `source`, the address
     /// `agent_ws::country_source` chose. An empty `source` has no country and is
-    /// never owed one.
+    /// never owed one. Capacities are not among them, even where an agent still
+    /// sends them: they change with every mount, and [`Db::touch_seen`] keeps
+    /// them from the reports.
     ///
     /// A new source invalidates the previous country, so the two move together in
     /// one statement: `SET` reads the row as it was, so the comparison is against
@@ -1297,13 +1300,12 @@ impl Db {
         let conn = self.conn();
         conn.execute(
             "UPDATE node SET hostname=?2, os=?3, kernel=?4, arch=?5, virt=?6, cpu_name=?7,
-                             cpu_cores=?8, mem_total=?9, swap_total=?10, disk_total=?11,
-                             agent_version=?12, ip=?13, ipv4=?14, ipv6=?15, country_ip=?16,
-                             country=CASE WHEN country_ip=?16 THEN country
-                                          WHEN country_prev_ip=?16 THEN country_prev ELSE '' END,
-                             country_prev_ip=CASE WHEN country_ip=?16 OR country='' THEN country_prev_ip
+                             cpu_cores=?8, agent_version=?9, ip=?10, ipv4=?11, ipv6=?12, country_ip=?13,
+                             country=CASE WHEN country_ip=?13 THEN country
+                                          WHEN country_prev_ip=?13 THEN country_prev ELSE '' END,
+                             country_prev_ip=CASE WHEN country_ip=?13 OR country='' THEN country_prev_ip
                                                   ELSE country_ip END,
-                             country_prev=CASE WHEN country_ip=?16 OR country='' THEN country_prev
+                             country_prev=CASE WHEN country_ip=?13 OR country='' THEN country_prev
                                                ELSE country END
              WHERE id=?1",
             params![
@@ -1315,9 +1317,6 @@ impl Db {
                 s("virt"),
                 s("cpu_name"),
                 n("cpu_cores"),
-                n("mem_total"),
-                n("swap_total"),
-                n("disk_total"),
                 s("agent_version"),
                 ip,
                 s("ipv4"),
