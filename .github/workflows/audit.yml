@@ -1,0 +1,22 @@
+name: audit
+
+on:
+  push:
+    branches: [main]
+    paths: ["Cargo.lock"]
+  pull_request:
+    paths: ["Cargo.lock"]
+  # Advisories are published without any commit here; a failed scheduled run
+  # emails whoever last edited this schedule.
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-audit
+      - run: cargo audit
