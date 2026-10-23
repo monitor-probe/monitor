@@ -1002,8 +1002,8 @@ mod tests {
         assert!(!selectable(&app, "aurora"), "a theme that is not installed is not selectable");
     }
 
-    /// Only a directory of the themes directory itself is deleted, never one a
-    /// symlink placed there leads to.
+    /// A symlink in the themes directory that leads out of it is refused, and
+    /// what it leads to survives.
     #[test]
     fn removing_a_theme_stays_inside_the_themes_directory() {
         let base = std::env::temp_dir().join(format!("monitor-remove-{}", std::process::id()));

@@ -2672,6 +2672,8 @@ mod tests {
         app.db.backup_into(&copy).unwrap();
         let bytes = std::fs::read(&copy).unwrap();
         std::fs::remove_file(&copy).unwrap();
+        // Not in the backup: it stays until the last chunk has arrived.
+        node(&app, "added", true);
 
         // In two chunks, as the panel sends any backup larger than one.
         let (total, half) = (bytes.len() as u64, bytes.len() / 2);
@@ -2688,7 +2690,8 @@ mod tests {
                 )
                 .await,
             );
-            assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing is restored before the last chunk");
+            let expected = if offset == 0 { 2 } else { 1 };
+            assert_eq!(app.db.nodes().unwrap().len(), expected, "restored on the last chunk alone");
         }
         assert_eq!(done.unwrap().status(), StatusCode::OK);
         assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");

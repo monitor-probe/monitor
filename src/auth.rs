@@ -596,9 +596,6 @@ mod tests {
         assert_eq!(held(), 0);
     }
 
-    /// The gate must refuse rather than queue: a queue admits the same flood,
-    /// and each attempt that lands costs 19 MiB which remains in a thread's
-    /// arena for the life of the process.
     /// Taken by every test that passes through `PASSWORD_GATE`, which is
     /// process-wide: one holding every permit would refuse a parallel login.
     static GATE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -662,6 +659,9 @@ mod tests {
         }
     }
 
+    /// The gate must refuse rather than queue: a queue admits the same flood,
+    /// and each attempt that lands costs 19 MiB which remains in a thread's
+    /// arena for the life of the process.
     #[tokio::test]
     async fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
         let _gate = GATE_TESTS.lock().await;

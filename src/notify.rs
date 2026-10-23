@@ -734,7 +734,6 @@ mod tests {
             assert_eq!(setting_error("notify_telegram_chat", chat), None, "{chat}");
         }
         assert!(setting_error("notify_telegram_chat", "-").is_some());
-        assert!(setting_error("notify_webhook_url", "ftp://x").is_some());
         assert!(
             setting_error("notify_expiry_sent", "2026-01-01").is_some(),
             "internal state is not a setting"

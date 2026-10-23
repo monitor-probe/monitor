@@ -2985,22 +2985,23 @@ mod tests {
         let _ = std::fs::remove_file(&copy);
     }
 
-    /// The upload behind restore is an externally supplied file. Each case here
-    /// is a way for it not to be a hub backup, and every one must be caught
-    /// before a single page is copied over live data.
     /// An unknown pragma is a silent no-op in SQLite, so only reading it back
     /// shows the setting took.
     #[test]
     fn temporary_files_go_beside_the_database() {
-        let dir = std::env::temp_dir();
-        temp_files_beside(&dir.join("monitor.db").to_string_lossy()).unwrap();
+        let database = std::env::temp_dir().join("monitor.db");
+        temp_files_beside(&database.to_string_lossy()).unwrap();
         let set: String = Connection::open_in_memory()
             .unwrap()
             .query_row("PRAGMA temp_store_directory", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(set, dir.to_string_lossy());
+        // The parent, not `temp_dir()` itself, which keeps a trailing slash from TMPDIR.
+        assert_eq!(set, database.parent().unwrap().to_string_lossy());
     }
 
+    /// The upload behind restore is an externally supplied file. Each case here
+    /// is a way for it not to be a hub backup, and every one must be caught
+    /// before a single page is copied over live data.
     #[test]
     fn restore_refuses_anything_that_is_not_a_backup_of_this_hub() {
         let scratch = Scratch::new();
