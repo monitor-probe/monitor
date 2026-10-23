@@ -10,6 +10,7 @@ on:
   # emails whoever last edited this schedule.
   schedule:
     - cron: "17 3 * * *"
+  workflow_dispatch:
 
 jobs:
   audit:
@@ -20,3 +21,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install --locked cargo-audit
       - run: cargo audit
+
+  # A fix merged to main protects no one until it ships, so the scheduled run
+  # also audits the latest release and stays red until a release carries it.
+  # Advisories on crates that are in Cargo.lock but not compiled in, such as an
+  # optional feature left off, are listed without failing.
+  released:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: git checkout "$(gh release view --json tagName -q .tagName)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-audit
+      - run: |
+          cargo audit --json > audit.json || true
+          jq -e '.vulnerabilities.list' audit.json > /dev/null
+          failed=0
+          while read -r crate id; do
+            if [ -n "$(cargo tree -q -i "$crate" -e normal --target all 2>/dev/null)" ]; then
+              echo "::error::$crate ($id) ships in the latest release"
+              failed=1
+            else
+              echo "$crate ($id) is in Cargo.lock but not compiled in"
+            fi
+          done < <(jq -r '.vulnerabilities.list[] | "\(.package.name)@\(.package.version) \(.advisory.id)"' audit.json)
+          exit "$failed"
