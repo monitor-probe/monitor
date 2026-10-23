@@ -1043,10 +1043,8 @@ impl Db {
     fn reader(&self) -> MutexGuard<'_, Connection> {
         let Some(reader) = &self.reader else { return self.conn() };
         let reader = reader.lock().unwrap_or_else(|e| e.into_inner());
-        // Skipped while the writer is held: during a VACUUM or a restore,
-        // waiting would stall this chart and every one queued behind its reader.
-        let wal = bytes_of(&format!("{}-wal", reader.path().unwrap_or_default()));
-        if let (true, Ok(conn)) = (wal > 4 << 20, self.conn.try_lock()) {
+        if bytes_of(&format!("{}-wal", reader.path().unwrap_or_default())) > 4 << 20 {
+            let conn = self.conn();
             let _ = conn.busy_timeout(std::time::Duration::ZERO);
             let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
             let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
