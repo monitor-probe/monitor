@@ -259,7 +259,9 @@ pub async fn github_callback(
         return sign_in_failed(
             &app,
             &headers,
-            anyhow!("GitHub returned {error}: {reason}").context(Shown(shown.into())),
+            // Quoted: anyone can send this query string, and a newline in it
+            // would print a line of their own into the hub's log.
+            anyhow!("GitHub returned {error:?}: {reason:?}").context(Shown(shown.into())),
         );
     }
     // Reject a callback the browser did not initiate.

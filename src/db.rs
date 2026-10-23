@@ -1043,8 +1043,10 @@ impl Db {
     fn reader(&self) -> MutexGuard<'_, Connection> {
         let Some(reader) = &self.reader else { return self.conn() };
         let reader = reader.lock().unwrap_or_else(|e| e.into_inner());
-        if bytes_of(&format!("{}-wal", reader.path().unwrap_or_default())) > 4 << 20 {
-            let conn = self.conn();
+        // Skipped while the writer is held: during a VACUUM or a restore,
+        // waiting would stall this chart and every one queued behind its reader.
+        let wal = bytes_of(&format!("{}-wal", reader.path().unwrap_or_default()));
+        if let (true, Ok(conn)) = (wal > 4 << 20, self.conn.try_lock()) {
             let _ = conn.busy_timeout(std::time::Duration::ZERO);
             let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
             let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
@@ -2402,15 +2404,20 @@ impl Db {
     /// reads the whole file, so the caller runs it off the runtime -- every other
     /// statement here is sub-millisecond, this one is not.
     pub fn backup_into(&self, dest: &str) -> Result<()> {
+        // The copy is the credential store in one portable file: node tokens in
+        // the clear, the GitHub secret, the password hash. SQLite would create
+        // it under the umask, world-readable at the usual 022 for as long as the
+        // copy takes; it writes into an empty file that already exists instead.
+        let mut empty = std::fs::OpenOptions::new();
+        empty.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut empty, 0o600);
+        empty.open(dest)?;
         // A connection of its own. `VACUUM INTO` only reads, and WAL allows it to
         // read a consistent snapshot while the agents continue writing through
         // the first -- exporting is the one heavy operation here that need not
         // block them. Not the charts' reader, which it would hold throughout.
         read_only(&self.file())?.execute("VACUUM INTO ?1", [dest])?;
-        // The copy is the credential store in one portable file: node tokens in
-        // the clear, the GitHub secret, the password hash. SQLite creates it
-        // under the umask, which at the usual 022 is world-readable.
-        own_only(dest);
         Ok(())
     }
 
@@ -2957,6 +2964,11 @@ mod tests {
         let kept =
             db.create_node(&Node { name: "backed-up".into(), ..Default::default() }, "token-kept").unwrap();
         db.backup_into(&copy).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for file in [scratch.0.clone(), format!("{}-wal", scratch.0), copy.clone()] {
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{file} holds the node tokens");
+        }
 
         // Everything after the copy must disappear on restore.
         db.delete_node(kept).unwrap();

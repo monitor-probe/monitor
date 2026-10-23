@@ -460,6 +460,9 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
     }
     fs::create_dir(into)?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive).take(MAX_STREAM));
+    // Modes come from the packer's machine: a theme packed under umask 000
+    // would otherwise leave scripts the panel runs writable by every local user.
+    archive.set_mask(0o022);
     let entries = unpack_entries(&mut archive, into);
     let mut rest = archive.into_inner();
     // Read to the end, where gzip keeps its checksum. The entries stop at tar's
@@ -484,6 +487,10 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
 
 fn unpack_entries<R: Read>(archive: &mut tar::Archive<R>, into: &Path) -> Result<()> {
     let mut expanded = 0u64;
+    // Every directory the entries create, named or not: unpacking a file
+    // creates each missing parent, so one entry 1000 levels deep writes 1000
+    // directories.
+    let (mut files, mut dirs) = (0, std::collections::HashSet::new());
     for (seen, entry) in archive.entries()?.enumerate() {
         // Only reading happens here, so every failure is the archive's.
         let mut entry = entry.context(crate::Shown(DAMAGED.into()))?;
@@ -513,6 +520,16 @@ fn unpack_entries<R: Read>(archive: &mut tar::Archive<R>, into: &Path) -> Result
         expanded += size;
         if metadata {
             continue;
+        }
+        let path = entry.path()?.into_owned();
+        files += usize::from(kind.is_file());
+        let mut dir = if kind.is_dir() { Some(path.as_path()) } else { path.parent() };
+        // A directory already counted brings its parents with it.
+        while let Some(d) = dir.filter(|d| d.file_name().is_some() && dirs.insert(d.to_path_buf())) {
+            dir = d.parent();
+        }
+        if files + dirs.len() > MAX_ENTRIES {
+            refuse!("主题包里的文件和目录超过 {MAX_ENTRIES} 个");
         }
         // Rejects an entry whose path escapes `into` -- absolute, `..`, or via
         // a symlinked parent -- reporting `false` rather than an error.
@@ -710,7 +727,8 @@ mod tests {
             for (name, data) in files {
                 let mut header = tar::Header::new_gnu();
                 header.set_size(data.len() as u64);
-                header.set_mode(0o644);
+                // As packed under umask 000; installed, the files are 0644.
+                header.set_mode(0o666);
                 builder.append_data(&mut header, name, *data).unwrap();
             }
             if let Some((name, target)) = link {
@@ -729,6 +747,9 @@ mod tests {
             .unwrap();
         assert_eq!(theme.short, "aurora");
         assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v1");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(base.join("aurora/dist/index.html")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "the packer's mode is masked");
 
         // The same name again: replaced wholesale, not merged.
         install(
@@ -741,6 +762,9 @@ mod tests {
         assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v3");
         assert!(!base.join("aurora/dist/old.js").exists(), "the replaced theme must not leave files behind");
 
+        let deep: Vec<(String, &[u8])> =
+            (0..100).map(|i| (format!("d{i}/{}f", "a/".repeat(20)), &b"x"[..])).collect();
+        let deep: Vec<(&str, &[u8])> = deep.iter().map(|(n, d)| (n.as_str(), *d)).collect();
         // A file where a directory must go, a theme the hub cannot serve, a name
         // that cannot be a directory, and a symlink -- the entry type that
         // writes where the path check cannot look.
@@ -750,6 +774,11 @@ mod tests {
             pack(&[("theme.json", r#"{"name":"x","short":"../evil","description":"","version":"1","author":"a","url":""}"#.as_bytes()), ("dist/index.html", b"x")], None),
             pack(&[("theme.json", manifest), ("dist/index.html", b"x")], Some(("dist/link", "/etc/passwd"))),
             pack(&[("dist/index.html", b"x")], None),
+            // 100 files, but 2100 directories implied by their paths.
+            pack(
+                &[&[("theme.json", manifest), ("dist/index.html", &b"x"[..])][..], &deep].concat(),
+                None,
+            ),
         ] {
             // A reason for the panel, never the 500 of a failure on this machine.
             let Err(e) = install(&base, bad, None) else { panic!("a bad package installed") };

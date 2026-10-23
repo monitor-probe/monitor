@@ -300,9 +300,21 @@ impl Session {
     /// Files the probe results gathered so far. Taken rather than kept on a
     /// failure, so a database that refuses them cannot grow the buffer.
     fn file_results(&mut self, app: &App, node_id: i64) -> Result<()> {
-        let results = std::mem::take(&mut self.results);
+        let mut results = std::mem::take(&mut self.results);
         if results.is_empty() {
             return Ok(());
+        }
+        // Results held back by a stalled link arrive in one read and share its
+        // second; on the `(node, ts, task)` key all but the last would replace
+        // one another, and the probes lost during the stall would go uncounted.
+        // Each therefore lands at least a second before the next result of the
+        // same probe.
+        let mut next = HashMap::new();
+        for (task, ts, _) in results.iter_mut().rev() {
+            if let Some(&later) = next.get(task) {
+                *ts = (*ts).min(later - 1);
+            }
+            next.insert(*task, *ts);
         }
         app.db.insert_pings(node_id, &results)
     }
@@ -1582,6 +1594,20 @@ mod tests {
             vec![(one, 42), (two, 15)],
             "each real task keeps its own result, and only those"
         );
+    }
+
+    #[test]
+    fn results_bunched_into_one_second_keep_a_row_each() {
+        let app = app();
+        let id = node(&app);
+        let mut session = Session::default();
+        let one = probe(&app, id, "one");
+        for latency in [-1, -1, 30] {
+            send(&app, id, &mut session, 0, &result_json(one, latency)).unwrap();
+        }
+        send(&app, id, &mut session, 60, r#"{"method":"whatever"}"#).unwrap();
+        let loss = app.db.ping_records(id, Span::minutes(0, 60)).unwrap().1;
+        assert_eq!(loss[one.to_string()], 200.0 / 3.0, "the two timeouts before the reply count");
     }
 
     #[test]

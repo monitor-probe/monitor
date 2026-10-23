@@ -1587,7 +1587,7 @@ async fn append(
 
 /// A scratch file beside the database, so the copy lands on the same filesystem
 /// the database has room on. The random component keeps two concurrent calls
-/// apart, since `VACUUM INTO` refuses an existing file.
+/// apart, since `VACUUM INTO` refuses a file that is not empty.
 fn scratch_path(app: &App, kind: &str) -> String {
     format!("{}.{kind}-{}.tmp", app.db.file(), &random_token()[..16])
 }
@@ -1860,7 +1860,8 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
 fn fresh_enough(cached: &crate::Releases, now: i64) -> bool {
     let holds =
         if cached.hub.is_empty() || cached.agent.is_empty() { RELEASES_RETRY } else { RELEASES_FRESH };
-    cached.read_at != 0 && now - cached.read_at < holds
+    // A negative age is a clock set back since the lookup, not a fresh one.
+    cached.read_at != 0 && (0..holds).contains(&(now - cached.read_at))
 }
 
 /// The tag of a repository's latest release, without its leading `v`, or None
@@ -2397,6 +2398,10 @@ mod tests {
         assert!(!fresh_enough(&read(now - 7 * 3600, "1.2.0", "1.1.0"), now));
         assert!(fresh_enough(&read(now - 300, "", ""), now), "a failure is held briefly");
         assert!(!fresh_enough(&read(now - 1200, "1.2.0", ""), now), "half an answer is a failure");
+        assert!(
+            !fresh_enough(&read(now + 3600, "1.2.0", "1.1.0"), now),
+            "read before the clock was set back"
+        );
     }
 
     fn app_with_site(site: &str) -> App {
