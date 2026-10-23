@@ -143,8 +143,9 @@ fi
 if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
 # The scheme in lowercase, as every check below matches it: a hand-typed
 # HTTP:// would otherwise pass the plaintext refusal.
+lower_scheme() { printf '%s://%s' "$(printf '%s' "${1%%://*}" | tr 'A-Z' 'a-z')" "${1#*://}"; }
 case "$SERVER" in
-*://*) SERVER="$(printf '%s' "${SERVER%%://*}" | tr 'A-Z' 'a-z')://${SERVER#*://}" ;;
+*://*) SERVER=$(lower_scheme "$SERVER") ;;
 *) SERVER="$SCHEME://$SERVER" ;;
 esac
 # The agent already refuses plaintext ws:// to a remote hub, since the token
@@ -192,6 +193,7 @@ localhost | ::1) LOCAL=1 ;;
 *) LOCAL="" ;;
 esac
 case "$SERVER" in
+https://*) ;;
 http://*)
 	if [ -z "$LOCAL" ]; then
 		[ -n "$INSECURE" ] || {
@@ -202,6 +204,12 @@ http://*)
 		echo "         the token and every report travel in the clear, and the binary" >&2
 		echo "         installed below is fetched over the same unverified channel" >&2
 	fi
+	;;
+# Anything else is refused rather than left to curl: ftp:// or the agent's own
+# ws:// would fetch the binary in the clear while escaping the test above.
+*)
+	echo "server URL must start with https:// or http://, not: $SERVER" >&2
+	exit 2
 	;;
 esac
 if command -v systemctl >/dev/null; then
@@ -285,8 +293,9 @@ if [ -z "$TOKEN" ]; then
 	#
 	# Only for the same hub: a token issued by hub A means nothing to hub B.
 	HELD=""
+	# An env file written before the scheme was lowercased may hold HTTP://.
 	CACHED=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
-	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
+	if [ "$(lower_scheme "${CACHED%/}")" = "${SERVER%/}" ]; then
 		HELD=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 	fi
 	# --name as given, which the hub trims and bounds. The hostname is not sent
@@ -296,8 +305,9 @@ if [ -z "$TOKEN" ]; then
 	echo "registering ${NAME:-this machine} with the hub"
 	# curl sends no header at all for an empty $HELD. The status follows the body
 	# on a line of its own, so a refusal shows the hub's own reason: a closed
-	# window, a lockout and a database error share one exit status under --fail. A request that got no response
-	# stops here, with curl's own message. The name travels on stdin: as an
+	# window, a lockout and a database error share one exit status under --fail.
+	# A request that got no response stops here, with curl's own message. The
+	# name travels on stdin: as an
 	# argument, one beginning with @ would be read as a file to send.
 	REPLY=$(printf '%s' "$NAME" | curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
 		-H "X-Node-Token: $HELD" --data-binary @- "${SERVER%/}/api/agent/register") || exit 1
