@@ -97,15 +97,18 @@ export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
 }
 
 /**
- * Sorted by name within each group, numbers by value ("HK-2" before "HK-10"),
- * the groups, ungrouped included, kept where they first appear: the node order
- * also decides the group order, which a plain sort by name would reshuffle.
+ * By group name, the ungrouped last, then by name within each group; numbers
+ * by value ("HK-2" before "HK-10"), names starting in Chinese after the rest
+ * and by pinyin, whatever the browser's language (the zh-CN collation alone
+ * would put them before Latin). The result does not depend on the order it
+ * starts from, so sorting twice gives the same list.
  */
 export function byName<T extends Pick<Node, "name" | "group">>(nodes: T[]): T[] {
-  const { compare } = new Intl.Collator(undefined, { numeric: true })
-  const groups = new Map<string, T[]>()
-  for (const n of nodes) groups.set(n.group ?? "", [...(groups.get(n.group ?? "") ?? []), n])
-  return [...groups.values()].flatMap((group) => group.sort((a, b) => compare(a.name, b.name)))
+  const collator = new Intl.Collator("zh-CN", { numeric: true })
+  const han = (s: string) => Number(/^\p{Script=Han}/u.test(s))
+  const compare = (a = "", b = "") => han(a) - han(b) || collator.compare(a, b)
+  return [...nodes].sort((a, b) =>
+    Number(!a.group) - Number(!b.group) || compare(a.group, b.group) || compare(a.name, b.name))
 }
 
 /** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */

@@ -130,14 +130,17 @@ assert.deepEqual(
   [["通用", ["a"]], ["外观", ["b"]]],
 )
 
-
-assert.deepEqual(
-  byName([
-    { name: "HK-10", group: "香港" },
-    { name: "solo", group: "" },
-    { name: "JP-1", group: "日本" },
-    { name: "HK-2", group: "香港" },
-    { name: "alpha" },
-  ]).map((n) => n.name),
-  ["HK-2", "HK-10", "alpha", "solo", "JP-1"],
-)
+// The same list from any starting order: 日本 (ri) before 香港 (xiang) by
+// pinyin, Latin before Chinese.
+const named = [
+  { name: "HK-10", group: "香港" },
+  { name: "solo", group: "" },
+  { name: "JP-1", group: "日本" },
+  { name: "香港 · 甲", group: "香港" },
+  { name: "备用机" },
+  { name: "HK-2", group: "香港" },
+  { name: "alpha" },
+]
+for (const start of [named, [...named].reverse()]) {
+  assert.deepEqual(byName(start).map((n) => n.name), ["JP-1", "HK-2", "HK-10", "香港 · 甲", "alpha", "solo", "备用机"])
+}

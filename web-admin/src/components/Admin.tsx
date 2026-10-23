@@ -1788,7 +1788,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   <button
                     type="button"
                     className="-mx-1 inline-flex items-center gap-1 rounded px-1 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-                    title={groupsOf(nodes).length ? "按名称排序，分组先后不变" : "按名称排序"}
+                    title={groupsOf(nodes).length ? "按分组名、再按名称排序" : "按名称排序"}
                     onClick={() => {
                       const ids = drag.order.map((n) => n.id).join()
                       if (byName(drag.order).map((n) => n.id).join() === ids) toast("已经是按名称排的顺序")
@@ -1936,7 +1936,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {sorting && (
         <ConfirmDialog
           title="按名称重新排序？"
-          description={`全部 ${nodes.length} 台节点将按名称重排${groupsOf(nodes).length ? "，分组先后不变" : ""}。当前的顺序会被替换，公开页同步变化；排序后 15 秒内可在提示里撤销。`}
+          description={`全部 ${nodes.length} 台节点将${groupsOf(nodes).length ? "先按分组名、组内再按名称" : "按名称"}重排${groupsOf(nodes).length ? "，未分组的排在最后" : ""}。当前的顺序会被替换，公开页同步变化；排序后 15 秒内可在提示里撤销。`}
           confirmLabel="排序"
           onClose={() => setSorting(false)}
           onConfirm={sortByName}
