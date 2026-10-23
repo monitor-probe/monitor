@@ -1754,8 +1754,9 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             screen, so a filter or a search does not move them. Each width holds
             its column's widest content (a 22-character address, a duration
             under the status pill); the name takes the rest, and the minimum
-            is what leaves it 144px. */}
-        <Table className="min-w-189 table-fixed xl:min-w-222">
+            is what leaves it 144px. From xl the widths carry some of the spare
+            room, which would otherwise all open up after the names. */}
+        <Table className="min-w-189 table-fixed xl:min-w-240">
           <TableHeader>
             <TableRow>
               <TableHead>
@@ -1772,13 +1773,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   "名称"
                 )}
               </TableHead>
-              <TableHead className="w-48">IP</TableHead>
-              <TableHead className="w-20">状态</TableHead>
+              <TableHead className="w-48 xl:w-50">IP</TableHead>
+              <TableHead className="w-20 xl:w-22">状态</TableHead>
               {/* Two lines below xl, one above. */}
-              <TableHead className="w-21 xl:w-28">流量</TableHead>
+              <TableHead className="w-21 xl:w-40">流量</TableHead>
               {/* Below xl the expiry date moves under the price: seven
                   columns leave a 1024px window no room for names. */}
-              <TableHead className="w-24">价格<span className="xl:hidden"> / 到期</span></TableHead>
+              <TableHead className="w-24 xl:w-26">价格<span className="xl:hidden"> / 到期</span></TableHead>
               <TableHead className="hidden w-26 xl:table-cell">到期</TableHead>
               <TableHead className="w-40 text-right">操作</TableHead>
             </TableRow>
