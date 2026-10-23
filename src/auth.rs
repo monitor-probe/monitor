@@ -599,8 +599,72 @@ mod tests {
     /// The gate must refuse rather than queue: a queue admits the same flood,
     /// and each attempt that lands costs 19 MiB which remains in a thread's
     /// arena for the life of the process.
-    #[test]
-    fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+    /// Taken by every test that passes through `PASSWORD_GATE`, which is
+    /// process-wide: one holding every permit would refuse a parallel login.
+    static GATE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn shared() -> crate::Shared {
+        std::sync::Arc::new(crate::App::for_test(crate::db::Db::open(":memory:").unwrap()))
+    }
+
+    fn peer() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("198.51.100.7:40000".parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_password_signs_in_only_when_it_matches_and_signing_out_ends_the_session() {
+        let _gate = GATE_TESTS.lock().await;
+        let app = shared();
+        app.db.replace_password(&hash_password("the-right-password").unwrap()).unwrap();
+        let attempt = |password: &str| {
+            let body = Json(LoginBody { password: password.into() });
+            login(State(app.clone()), peer(), HeaderMap::new(), body)
+        };
+
+        let wrong = attempt("a-wrong-password").await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert!(wrong.headers().get(header::SET_COOKIE).is_none(), "a wrong password earns no session");
+
+        let right = attempt("the-right-password").await;
+        assert_eq!(right.status(), StatusCode::OK);
+        let cookie = right.headers()[header::SET_COOKIE].to_str().unwrap().to_owned();
+        assert!(cookie.contains(&format!("Max-Age={}", SESSION_DAYS * 86_400)), "{cookie}");
+        let token = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        assert!(app.db.session_valid(&sha256(token)));
+        let issued = issued_at(app.db.sessions().unwrap()[0].1);
+        assert!((Utc::now().timestamp() - issued).abs() < 60, "valid for {SESSION_DAYS} days from now");
+
+        let mut signed_in = HeaderMap::new();
+        signed_in.insert(header::COOKIE, format!("{COOKIE}={token}").parse().unwrap());
+        logout(State(app.clone()), signed_in).await;
+        assert!(!app.db.session_valid(&sha256(token)), "signing out ends the session server-side");
+    }
+
+    /// The state check precedes any request to GitHub, so a callback the
+    /// browser did not start is turned back with that reason and nothing else.
+    #[tokio::test]
+    async fn a_callback_the_browser_did_not_start_signs_nobody_in() {
+        let app = shared();
+        for (state, cookie) in
+            [(Some("abc"), None), (Some("abc"), Some("xyz")), (None, Some("abc")), (Some(""), Some(""))]
+        {
+            let mut headers = HeaderMap::new();
+            if let Some(cookie) = cookie {
+                headers.insert(header::COOKIE, format!("{STATE_COOKIE}={cookie}").parse().unwrap());
+            }
+            let query =
+                Callback { code: Some("code".into()), state: state.map(Into::into), ..Default::default() };
+            let res = github_callback(State(app.clone()), peer(), headers, Query(query)).await;
+            let to = res.headers()[header::LOCATION].to_str().unwrap();
+            assert!(to.ends_with(&urlencode("登录已过期，请从登录页重新开始")), "{state:?} {cookie:?}: {to}");
+            let sessions = res.headers().get_all(header::SET_COOKIE).iter();
+            assert!(!sessions.into_iter().any(|c| c.to_str().unwrap().starts_with(&format!("{COOKIE}="))));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+        let _gate = GATE_TESTS.lock().await;
         let held: Vec<_> =
             (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
         assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");

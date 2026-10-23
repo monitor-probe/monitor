@@ -308,6 +308,11 @@ fn built_for(binary: &[u8], arch: &str) -> bool {
     binary.get(18..20).is_some_and(|m| u16::from_le_bytes([m[0], m[1]]) == machine)
 }
 
+/// Whether the hub may hand `binary` to `install.sh` on an `arch` machine.
+fn relayable(key: &[u8], binary: &[u8], signature: &[u8], arch: &str) -> bool {
+    signed(key, binary, signature) && built_for(binary, arch)
+}
+
 /// One GET of a release asset, whole, refused past `max` bytes.
 async fn fetch_asset(app: &App, url: &str, what: &str, max: usize) -> Result<Vec<u8>, String> {
     let who = if url.starts_with("https://github.com/") { "GitHub" } else { "the GitHub proxy" };
@@ -380,7 +385,7 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
             fetch_asset(&app, &url, "agent binary", MAX_AGENT_BINARY),
             fetch_asset(&app, &sig, "agent signature", 64),
         )?;
-        if !signed(&AGENT_SIGNING_KEY, &binary, &signature) || !built_for(&binary, &arch) {
+        if !relayable(&AGENT_SIGNING_KEY, &binary, &signature, &arch) {
             warn!("{url} does not match its signature or architecture; not relayed");
             return Err(
                 "the agent binary failed its signature check, so the hub refused to relay it".to_owned()
@@ -990,6 +995,13 @@ mod tests {
         let mut elf = vec![0u8; 64];
         elf[18] = 62;
         assert!(built_for(&elf, "x86_64") && !built_for(&elf, "aarch64"), "the other architecture's binary");
+
+        // Relayed only with both: the signature alone passes the other
+        // architecture's signed binary, the architecture alone a replaced one.
+        let elf_signature = pair.sign(&elf);
+        assert!(relayable(key, &elf, elf_signature.as_ref(), "x86_64"));
+        assert!(!relayable(key, &elf, elf_signature.as_ref(), "aarch64"));
+        assert!(!relayable(key, &elf, signature.as_ref(), "x86_64"));
     }
 
     /// The limit only moves up, so raising it here cannot disturb another test.
@@ -1065,6 +1077,32 @@ mod tests {
         // Not yet due, and one-off billing: both left unchanged.
         assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
         assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
+    }
+
+    /// Only a node still reporting has evidently been paid for; one that is down
+    /// may have been let go, and rolling it would hide that.
+    #[test]
+    fn only_an_online_node_is_renewed() {
+        let app = app("");
+        let yesterday = (Local::now().date_naive() - chrono::Days::new(1)).to_string();
+        let mut ids = Vec::new();
+        for name in ["up", "down"] {
+            let id = app
+                .db
+                .create_node(
+                    &db::Node { name: name.into(), billing_cycle: "monthly".into(), ..Default::default() },
+                    name,
+                )
+                .unwrap();
+            app.db.set_expiry(id, &yesterday).unwrap();
+            ids.push(id);
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        app.agents.write().unwrap().insert(ids[0], Agent::new(1, tx));
+        renew_online_nodes(&app).unwrap();
+        let expiry = |id| app.db.node(id).unwrap().unwrap().expires_at.unwrap();
+        assert!(expiry(ids[0]) > yesterday, "the online node rolls forward");
+        assert_eq!(expiry(ids[1]), yesterday, "the offline one is left to lapse");
     }
 
     /// The hour is the local one, which in a half-hour zone is not UTC's.

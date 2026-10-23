@@ -788,6 +788,26 @@ mod tests {
         assert!(sweep(&app, &mut restarted, now + 930).unwrap().is_empty());
     }
 
+    #[test]
+    fn a_webhook_url_is_http_or_https() {
+        assert_eq!(setting_error("notify_webhook_url", "https://example.com/hook"), None);
+        assert_eq!(setting_error("notify_webhook_url", "http://10.0.0.2:8080/"), None, "a relay nearby");
+        assert!(setting_error("notify_webhook_url", "ftp://example.com/").is_some());
+        assert!(setting_error("notify_webhook_url", "example.com/hook").is_some());
+    }
+
+    #[test]
+    fn an_absence_within_the_grace_period_is_not_an_outage() {
+        let app = app();
+        with_channel(&app);
+        let now = 1_000_000;
+        node(&app, "n", true, now - 600);
+        let mut watch = Watch::default();
+        assert!(sweep(&app, &mut watch, now).unwrap().is_empty(), "the grace period starts when seen absent");
+        assert!(sweep(&app, &mut watch, now + 150).unwrap().is_empty(), "inside the default three minutes");
+        assert_eq!(sweep(&app, &mut watch, now + 210).unwrap().len(), 1);
+    }
+
     /// `last_seen` is written once a minute at best, and once per report for an
     /// agent reporting less often. Measured from it, a restart of an agent on a
     /// five-minute interval would be past the grace period the moment a sweep
@@ -939,6 +959,12 @@ mod tests {
         used(100 * gb).unwrap();
         assert_eq!(titles(&mut watch), ["⚠️ t 流量提醒 已用 100%"]);
         assert!(titles(&mut watch).is_empty());
+
+        app.db.set("notify_traffic", "0").unwrap();
+        used(10 * gb).unwrap();
+        titles(&mut watch);
+        used(100 * gb).unwrap();
+        assert!(titles(&mut watch).is_empty(), "0 turns the reminder off");
     }
 
     #[test]
@@ -985,9 +1011,9 @@ mod tests {
             let id = node(&app, name, false, 0);
             app.db.set_expiry(id, date).unwrap();
         }
-        assert!(expiry_digest(&app, at(8)).unwrap().is_none(), "not before nine");
         assert!(expiry_digest(&app, at(9)).unwrap().is_none(), "no channel, and the day is not spent");
         with_channel(&app);
+        assert!(expiry_digest(&app, at(8)).unwrap().is_none(), "not before nine");
         let note = expiry_digest(&app, at(9)).unwrap().unwrap();
         assert_eq!(note.title, "⏳ 2 台节点即将到期");
         assert_eq!(note.message, "today · 2026-09-15 今天到期\nsoon · 2026-09-20 还剩 5 天");

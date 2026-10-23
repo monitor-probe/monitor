@@ -2988,6 +2988,19 @@ mod tests {
     /// The upload behind restore is an externally supplied file. Each case here
     /// is a way for it not to be a hub backup, and every one must be caught
     /// before a single page is copied over live data.
+    /// An unknown pragma is a silent no-op in SQLite, so only reading it back
+    /// shows the setting took.
+    #[test]
+    fn temporary_files_go_beside_the_database() {
+        let dir = std::env::temp_dir();
+        temp_files_beside(&dir.join("monitor.db").to_string_lossy()).unwrap();
+        let set: String = Connection::open_in_memory()
+            .unwrap()
+            .query_row("PRAGMA temp_store_directory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(set, dir.to_string_lossy());
+    }
+
     #[test]
     fn restore_refuses_anything_that_is_not_a_backup_of_this_hub() {
         let scratch = Scratch::new();
@@ -3045,6 +3058,13 @@ mod tests {
         refused("from a newer hub");
 
         newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
+        // Every table right, and SQL of the file's own that every later write
+        // would run.
+        newer
+            .execute_batch("CREATE TRIGGER t AFTER INSERT ON session BEGIN UPDATE node SET remark = 'x'; END")
+            .unwrap();
+        refused("a trigger beside the right tables");
+        newer.execute_batch("DROP TRIGGER t").unwrap();
         db.check_backup(&bad).unwrap();
     }
 
@@ -3945,12 +3965,19 @@ mod tests {
         let old = Utc::now().timestamp() - 40 * 86_400;
         db.insert_metric(id, old, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_metric(id, Utc::now().timestamp(), &serde_json::json!({"cpu": 2.0})).unwrap();
+        let detailed = Utc::now().timestamp() / 60 * 60 - 6 * 86_400;
+        db.insert_metric(id, detailed, &serde_json::json!({"cpu": 3.0})).unwrap();
 
         db.prune(30).unwrap();
-        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 2, "unfolded minutes are kept");
+        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 3, "unfolded minutes are kept");
         db.roll_up(Utc::now().timestamp(), 30).unwrap();
         db.prune(30).unwrap();
-        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 1);
+        assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 2);
+        let kept: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM metric WHERE ts = ?1", [detailed], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "a folded minute within the week of detail stays");
         assert_eq!(db.all_traffic()[&id].total_rx, 800);
     }
 

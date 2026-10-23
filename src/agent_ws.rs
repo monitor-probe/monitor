@@ -1584,6 +1584,29 @@ mod tests {
         );
     }
 
+    /// A panel edit reaches the agents it concerns, carrying their own list.
+    #[test]
+    fn a_probe_edit_is_pushed_to_the_nodes_it_names() {
+        let app = app();
+        let (a, b) = (node(&app), node(&app));
+        let task = probe(&app, a, "p");
+        let (ta, mut to_a) = mpsc::channel(4);
+        let (tb, mut to_b) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(a, Agent::new(1, ta));
+        app.agents.write().unwrap().insert(b, Agent::new(2, tb));
+
+        push_ping_tasks(&app, Some(a));
+        let sent: serde_json::Value = serde_json::from_str(&to_a.try_recv().unwrap()).unwrap();
+        assert_eq!(sent["method"], "ping.tasks");
+        assert_eq!(sent["params"][0]["id"], task);
+        assert!(to_b.try_recv().is_err(), "an edit of one node is pushed to that node alone");
+
+        push_ping_tasks(&app, None);
+        assert!(to_a.try_recv().is_ok());
+        let sent: serde_json::Value = serde_json::from_str(&to_b.try_recv().unwrap()).unwrap();
+        assert_eq!(sent["params"], json!([]), "a node without probes is told so");
+    }
+
     #[test]
     fn the_token_is_read_from_the_authorization_header_only() {
         let mut h = HeaderMap::new();
