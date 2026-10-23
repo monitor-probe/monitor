@@ -94,6 +94,18 @@ export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
   return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]
 }
 
+/**
+ * Sorted by name within each group, numbers by value ("HK-2" before "HK-10"),
+ * the groups, ungrouped included, kept where they first appear: the node order
+ * also decides the group order, which a plain sort by name would reshuffle.
+ */
+export function byName<T extends Pick<Node, "name" | "group">>(nodes: T[]): T[] {
+  const { compare } = new Intl.Collator(undefined, { numeric: true })
+  const groups = new Map<string, T[]>()
+  for (const n of nodes) groups.set(n.group ?? "", [...(groups.get(n.group ?? "") ?? []), n])
+  return [...groups.values()].flatMap((group) => group.sort((a, b) => compare(a.name, b.name)))
+}
+
 /** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */
 export function inGroup<T extends Pick<Node, "group">>(nodes: T[], filter: string): T[] {
   if (filter === "all") return nodes

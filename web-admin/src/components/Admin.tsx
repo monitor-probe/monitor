@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowDownAZ, ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -178,6 +178,17 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     setDragging(null)
     const before = orderBeforeDrag.current
     if (!before.length || next.join() === before.join()) return
+    commit(next)
+  }
+
+  // The whole order at once, as sorting it or undoing a sort sets it.
+  function arrange(next: number[], rows: HTMLTableSectionElement | null) {
+    body.current = rows
+    slide(rows, () => setManualOrder(next))
+    commit(next)
+  }
+
+  function commit(next: number[]) {
     orderBeforeDrag.current = next
     const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
     // A refusal falls back to whatever the hub holds, which a save queued
@@ -191,6 +202,7 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
 
   return {
     order,
+    arrange,
     row: (id: number) => ({
       "data-id": id,
       "data-dragging": dragging === id || undefined,
@@ -1636,6 +1648,16 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const searching = query.trim() !== "" || group !== "all"
   const uninstall = refusal ? "" : uninstallCommand(site)
 
+  // Saved at once, with an undo in the toast rather than a confirmation: the
+  // result is seen before it is kept, and taking it back is one click.
+  function sortByName(rows: HTMLTableSectionElement) {
+    const before = drag.order.map((n) => n.id)
+    const next = byName(drag.order).map((n) => n.id)
+    if (next.join() === before.join()) return toast("已经是按名称排的顺序")
+    drag.arrange(next, rows)
+    toast.success("已按名称排序", { action: { label: "撤销", onClick: () => drag.arrange(before, rows) } })
+  }
+
   async function remove() {
     if (!deleting) return
     setRemoving(true)
@@ -1678,7 +1700,20 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             {/* Percentages, or the address column swallows every spare pixel
                 and pushes status across the table. */}
             <TableRow>
-              <TableHead className="w-[26%]">名称</TableHead>
+              <TableHead className="w-[26%]">
+                {nodes.length > 1 ? (
+                  <button
+                    type="button"
+                    className="-mx-1 inline-flex items-center gap-1 rounded px-1 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                    title={groupsOf(nodes).length ? "按名称排序，分组先后不变" : "按名称排序"}
+                    onClick={(e) => sortByName(e.currentTarget.closest("table")!.tBodies[0])}
+                  >
+                    名称 <ArrowDownAZ className="size-3.5" />
+                  </button>
+                ) : (
+                  "名称"
+                )}
+              </TableHead>
               <TableHead className="w-[18%]">IP</TableHead>
               <TableHead className="w-[12%]">状态</TableHead>
               <TableHead className="w-[16%]">流量</TableHead>

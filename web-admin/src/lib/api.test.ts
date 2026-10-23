@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -130,3 +130,14 @@ assert.deepEqual(
   [["通用", ["a"]], ["外观", ["b"]]],
 )
 
+
+assert.deepEqual(
+  byName([
+    { name: "HK-10", group: "香港" },
+    { name: "solo", group: "" },
+    { name: "JP-1", group: "日本" },
+    { name: "HK-2", group: "香港" },
+    { name: "alpha" },
+  ]).map((n) => n.name),
+  ["HK-2", "HK-10", "alpha", "solo", "JP-1"],
+)
