@@ -34,9 +34,10 @@ const REPORT_SPACING: Duration = Duration::from_millis(500);
 
 /// Facts are written at most this often. The agent sends a hello as it
 /// connects and another when its facts change, which it checks once a minute.
-/// One arriving sooner is held until the next report past the spacing rather
-/// than dropped: the agent does not repeat a hello, and a stalled link can
-/// deliver two of them together.
+/// One arriving sooner is held until the first heartbeat past the spacing
+/// rather than dropped: the agent does not repeat a hello, and a stalled link
+/// can deliver two of them together. The heartbeat rather than the next
+/// report, which `--interval` can put an hour away.
 const HELLO_SPACING: Duration = Duration::from_secs(30);
 
 /// Probe results admitted per window: twice what the busiest honest node sends
@@ -267,6 +268,15 @@ impl Session {
         spaced(&mut self.last_hello, tick, HELLO_SPACING)
     }
 
+    /// The held hello, once the spacing allows it to be written.
+    fn held_hello_due(&mut self, tick: Instant) -> Option<serde_json::Value> {
+        if self.held_hello.is_some() && self.admit_hello(tick) {
+            self.held_hello.take()
+        } else {
+            None
+        }
+    }
+
     fn admit_result(&mut self, tick: Instant) -> bool {
         let (start, admitted) = self.window.get_or_insert((tick, 0));
         if tick.saturating_duration_since(*start) >= RESULT_WINDOW {
@@ -411,6 +421,13 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 if quiet > SILENCE {
                     break Err(anyhow::anyhow!("silent for {}s", quiet.as_secs()));
                 }
+                if let Some(facts) = session.held_hello_due(Instant::now()) {
+                    match tokio::task::block_in_place(|| save_facts(&app, node_id, &ip, &facts)) {
+                        Ok(Some(source)) => owed = Some(source),
+                        Ok(None) => {}
+                        Err(e) => session.complain(node_id, format_args!("storing held facts failed: {e:#}")),
+                    }
+                }
                 if let Some(source) = &owed {
                     match tokio::task::block_in_place(|| app.db.country_owed(node_id, source)) {
                         Ok(true) => locate(app.clone(), node_id, source.clone()),
@@ -530,15 +547,7 @@ fn dispatch(
         "report" if !session.admit_report(arrival.tick) => {
             debug!("node {node_id}: a report within {REPORT_SPACING:?} of the last was dropped")
         }
-        "report" => {
-            report(app, node_id, rpc.params, arrival)?;
-            if let Some(facts) = session.held_hello.take() {
-                if session.admit_hello(arrival.tick) {
-                    return save_facts(app, node_id, ip, &facts);
-                }
-                session.held_hello = Some(facts);
-            }
-        }
+        "report" => report(app, node_id, rpc.params, arrival)?,
         "ping.result" if !session.admit_result(arrival.tick) => session.complain(
             node_id,
             format_args!(
@@ -1440,17 +1449,25 @@ mod tests {
         send(&app, id, &mut session, 25, &result_json(task, 1)).unwrap();
         assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize + 1, "the next window admits again");
 
+        let due = |session: &mut Session, secs| {
+            session.held_hello_due(at(secs).tick).map(|f| f["hostname"].clone())
+        };
         send(&app, id, &mut session, 100, &hello("first")).unwrap();
         send(&app, id, &mut session, 101, &hello("second")).unwrap();
         send(&app, id, &mut session, 102, &hello("third")).unwrap();
-        send(&app, id, &mut session, 129, &cpu(1.0)).unwrap();
         assert_eq!(hostname(), "first", "facts are written at most once per spacing");
-        send(&app, id, &mut session, 130, &cpu(1.0)).unwrap();
-        assert_eq!(hostname(), "third", "the latest held hello is written once the spacing passes");
+        assert_eq!(due(&mut session, 129), None);
+        assert_eq!(
+            due(&mut session, 130),
+            Some(json!("third")),
+            "the latest held hello is due once the spacing passes"
+        );
+        assert_eq!(due(&mut session, 131), None, "and only once");
         send(&app, id, &mut session, 150, &hello("renamed")).unwrap();
-        assert_eq!(hostname(), "third", "the spacing runs from the held hello's write");
-        send(&app, id, &mut session, 160, &cpu(1.0)).unwrap();
-        assert_eq!(hostname(), "renamed");
+        assert_eq!(due(&mut session, 159), None, "the spacing runs from the held hello's write");
+        send(&app, id, &mut session, 160, &hello("again")).unwrap();
+        assert_eq!(hostname(), "again", "a hello written directly supersedes the held one");
+        assert_eq!(due(&mut session, 300), None);
     }
 
     #[test]
