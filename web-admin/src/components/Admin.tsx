@@ -1665,6 +1665,33 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     reveal.current = null
   })
   const searching = query.trim() !== "" || group !== "all" || status !== "all"
+
+  // The columns as the whole list lays them out, taken as a search or a filter
+  // begins, while that list is still on screen. The narrowed table is laid out
+  // by these shares, so the columns stay where they were rather than refit the
+  // rows left. Shares rather than pixels, so it still follows the window.
+  const head = useRef<HTMLTableRowElement>(null)
+  const [layout, setLayout] = useState<{ width: number; shares: number[] } | null>(null)
+  function narrow<T>(set: (v: T) => void) {
+    return (v: T) => {
+      const row = head.current
+      if (!searching && row) {
+        const width = row.getBoundingClientRect().width
+        setLayout({ width, shares: [...row.cells].map((c) => c.getBoundingClientRect().width / width) })
+      }
+      set(v)
+    }
+  }
+  const frozen = searching ? layout : null
+  // A resize lays the page out afresh: the shares were taken at another width,
+  // and the narrowed rows are left to size the columns.
+  useEffect(() => {
+    if (!frozen) return
+    const thaw = () => setLayout(null)
+    addEventListener("resize", thaw)
+    return () => removeEventListener("resize", thaw)
+  }, [frozen])
+  const col = (i: number) => frozen?.shares[i] ? { width: `${frozen.shares[i] * 100}%` } : undefined
   const uninstall = refusal ? "" : uninstallCommand(site)
 
   // Under a filter the rows on screen are not the order, so a handle cannot
@@ -1711,8 +1738,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <div className="mr-auto flex w-full gap-2 sm:w-auto">
-          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
-          <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={narrow(setQuery)} />
+          <GroupFilter nodes={nodes} value={group} onChange={narrow(setGroup)} className="w-32" />
         </div>
         <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
           <Layers /> 分组
@@ -1740,7 +1767,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 key={a.key}
                 type="button"
                 aria-pressed={status === a.key}
-                onClick={() => setStatus(status === a.key ? "all" : a.key)}
+                onClick={() => narrow(setStatus)(status === a.key ? "all" : a.key)}
                 className={`rounded-md px-3 py-1 text-sm transition-colors ${status === a.key ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
               >
                 {a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span>
@@ -1750,16 +1777,12 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       )}
 
       <Card className="overflow-x-auto p-0">
-        {/* Fixed layout: column widths follow the table, not the rows on
-            screen, so a filter or a search does not move them. Each width holds
-            its column's widest content (a 22-character address, a duration
-            under the status pill); the name takes the rest, and the minimum
-            is what leaves it 144px. From xl the widths carry some of the spare
-            room, which would otherwise all open up after the names. */}
-        <Table className="min-w-189 table-fixed xl:min-w-240">
+        <Table className={frozen ? "table-fixed" : ""} style={frozen ? { minWidth: frozen.width } : undefined}>
           <TableHeader>
-            <TableRow>
-              <TableHead>
+            {/* Percentages, or the address column swallows every spare pixel
+                and pushes status across the table. */}
+            <TableRow ref={head}>
+              <TableHead className="w-[26%]" style={col(0)}>
                 {nodes.length > 1 ? (
                   <button
                     type="button"
@@ -1773,15 +1796,14 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   "名称"
                 )}
               </TableHead>
-              <TableHead className="w-48 xl:w-50">IP</TableHead>
-              <TableHead className="w-20 xl:w-22">状态</TableHead>
-              {/* Two lines below xl, one above. */}
-              <TableHead className="w-21 xl:w-40">流量</TableHead>
+              <TableHead className="w-[18%]" style={col(1)}>IP</TableHead>
+              <TableHead className="w-[12%]" style={col(2)}>状态</TableHead>
+              <TableHead className="w-[16%]" style={col(3)}>流量</TableHead>
               {/* Below xl the expiry date moves under the price: seven
                   columns leave a 1024px window no room for names. */}
-              <TableHead className="w-24 xl:w-26">价格<span className="xl:hidden"> / 到期</span></TableHead>
-              <TableHead className="hidden w-26 xl:table-cell">到期</TableHead>
-              <TableHead className="w-40 text-right">操作</TableHead>
+              <TableHead className="w-[10%]" style={col(4)}>价格<span className="xl:hidden"> / 到期</span></TableHead>
+              <TableHead className="hidden w-[12%] xl:table-cell" style={col(5)}>到期</TableHead>
+              <TableHead className="text-right" style={col(6)}>操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1798,9 +1820,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                       title={searching ? "清空搜索和筛选后可拖动排序" : undefined}
                     />
                     <div className="min-w-24">
-                      {/* Lines are balanced, so none ends on a character or two;
-                          a word wider than the column still breaks. */}
-                      <div className="font-medium text-balance break-keep wrap-anywhere">
+                      {/* Lines are balanced, so none ends on a character or two. */}
+                      <div className="font-medium text-balance break-keep">
                         {nameText(n.name)}
                         {/* In the name's flow, a fixed gap after its last word.
                             Beside the block it would sit at the cell's edge
