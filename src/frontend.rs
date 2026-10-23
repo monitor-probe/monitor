@@ -522,6 +522,12 @@ fn unpack_entries<R: Read>(archive: &mut tar::Archive<R>, into: &Path) -> Result
             continue;
         }
         let path = entry.path()?.into_owned();
+        // Beyond what Linux takes in one call, so unpacking would fail anyway.
+        // Refused before counting, which copies the path of every parent: a
+        // name tens of KiB of `a/` long would otherwise take gigabytes.
+        if path.as_os_str().len() > 4096 {
+            refuse!("主题包里的路径过长");
+        }
         files += usize::from(kind.is_file());
         let mut dir = if kind.is_dir() { Some(path.as_path()) } else { path.parent() };
         // A directory already counted brings its parents with it.
@@ -784,6 +790,16 @@ mod tests {
             let Err(e) = install(&base, bad, None) else { panic!("a bad package installed") };
             assert!(e.downcast_ref::<crate::Shown>().is_some(), "{e:#}");
         }
+        // Named as such, not left to the filesystem's refusal.
+        let long = format!("dist/{}", "a".repeat(5000));
+        let Err(e) = install(&base, pack(&[("theme.json", manifest), (&long, b"x")], None), None) else {
+            panic!("a path too long installed")
+        };
+        assert_eq!(
+            e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()),
+            Some("主题包里的路径过长"),
+            "{e:#}"
+        );
         // A download cut short says so, rather than quoting the decoder.
         pack(&[("theme.json", manifest), ("dist/index.html", b"v9")], None);
         let whole = fs::read(&archive).unwrap();

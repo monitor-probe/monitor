@@ -728,9 +728,7 @@ fn restrict(path: &str) {
     }
 }
 
-/// One file, owner-only. Also applied to the backup copy `VACUUM INTO` writes,
-/// which is the entire credential store in one portable file, created under the
-/// umask like any other.
+/// One file, owner-only.
 fn own_only(file: &str) {
     #[cfg(unix)]
     {
@@ -2963,7 +2961,9 @@ mod tests {
             db.create_node(&Node { name: "backed-up".into(), ..Default::default() }, "token-kept").unwrap();
         db.backup_into(&copy).unwrap();
         use std::os::unix::fs::PermissionsExt;
-        for file in [scratch.0.clone(), format!("{}-wal", scratch.0), copy.clone()] {
+        for file in
+            [scratch.0.clone(), format!("{}-wal", scratch.0), format!("{}-shm", scratch.0), copy.clone()]
+        {
             let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{file} holds the node tokens");
         }
