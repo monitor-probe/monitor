@@ -2327,6 +2327,12 @@ pub async fn save_settings(
         if let Err(e) = app.db.set(key, value) {
             return fail(e);
         }
+        if key == "github_allowed_users" {
+            let ids = app.db.get(crate::auth::GITHUB_IDS).unwrap_or_default();
+            if let Err(e) = app.db.set(crate::auth::GITHUB_IDS, &crate::auth::keep_listed(&ids, value)) {
+                return fail(e);
+            }
+        }
     }
     with_cookies(Json(json!({"ok": true})), [reissued])
 }

@@ -347,9 +347,7 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
     else {
         refuse!("没有配置 GitHub 登录");
     };
-    let allowed = app.db.get("github_allowed_users").unwrap_or_default();
-    let allowed: Vec<String> =
-        allowed.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+    let allowed = allowed_logins(&app.db.get("github_allowed_users").unwrap_or_default());
     if allowed.is_empty() {
         // Without an allow list, any GitHub account could sign in.
         refuse!("没有设置允许登录的 GitHub 用户");
@@ -381,6 +379,7 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct GithubUser {
         login: String,
+        id: i64,
     }
     let response = app
         .http
@@ -405,8 +404,51 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
         warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
         refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
     }
+    let login = user.login.to_lowercase();
+    let ids = app.db.get(GITHUB_IDS).unwrap_or_default();
+    match bound_id(&ids, &login) {
+        Some(id) if id != user.id.to_string() => {
+            warn!(
+                "GitHub user {} is account {}, but the name first signed in as account {id}",
+                user.login, user.id
+            );
+            refuse!(
+                "GitHub 用户 {} 已经不是第一次登录时的那个账号。如果账号确实重建过，先把它从允许名单里删掉并保存，再加回来",
+                user.login
+            );
+        }
+        Some(_) => {}
+        None => {
+            let pair = format!("{login}:{}", user.id);
+            app.db.set(GITHUB_IDS, &if ids.is_empty() { pair } else { format!("{ids},{pair}") })?;
+        }
+    }
     info!("GitHub sign-in accepted for {}", user.login);
     Ok(user.login)
+}
+
+/// The GitHub account each listed login belonged to when it first signed in,
+/// as `login:id` pairs. The list names logins, and a renamed or deleted
+/// account leaves its login free for anyone to register.
+pub const GITHUB_IDS: &str = "github_user_ids";
+
+/// The logins of the allow list, in the case GitHub ignores.
+pub fn allowed_logins(list: &str) -> Vec<String> {
+    list.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+}
+
+fn bound_id<'a>(ids: &'a str, login: &str) -> Option<&'a str> {
+    ids.split(',').filter_map(|pair| pair.split_once(':')).find(|(l, _)| *l == login).map(|(_, id)| id)
+}
+
+/// `ids` without the logins `list` no longer allows, so a login removed and
+/// added back binds afresh on its next sign-in.
+pub fn keep_listed(ids: &str, list: &str) -> String {
+    let allowed = allowed_logins(list);
+    ids.split(',')
+        .filter(|pair| pair.split_once(':').is_some_and(|(l, _)| allowed.iter().any(|a| a == l)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
@@ -541,6 +583,16 @@ mod tests {
         ] {
             assert_eq!(entry(written), ip.map(|ip| ip.parse().unwrap()), "{written}");
         }
+    }
+
+    #[test]
+    fn an_allowed_login_stays_bound_to_the_account_it_first_signed_in_as() {
+        assert_eq!(allowed_logins(" Alice, ,bob,"), ["alice", "bob"], "case, spaces and empty items");
+        let ids = "alice:1,bob:2";
+        assert_eq!(bound_id(ids, "alice"), Some("1"));
+        assert_eq!(bound_id(ids, "carol"), None, "a login that never signed in binds on its first");
+        assert_eq!(keep_listed(ids, "Bob, carol"), "bob:2", "a removed login is forgotten");
+        assert_eq!(keep_listed(ids, ""), "");
     }
 
     #[test]
