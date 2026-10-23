@@ -769,8 +769,9 @@ async fn serve(listener: tokio::net::TcpListener, router: Router) {
     let _ = tokio::time::timeout(DRAIN, stop_tx.closed()).await;
 }
 
-/// How long a connection may go without the peer taking any data. The push
-/// stream gives up on a send after 10 s of its own; this bounds the rest.
+/// How long the peer's receive window may stay shut, or data go unacknowledged,
+/// before the kernel drops the connection. The push stream gives up on a send
+/// after 10 s of its own; this bounds the rest.
 const STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a stop waits for in-flight requests.
