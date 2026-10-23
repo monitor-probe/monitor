@@ -1647,6 +1647,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [group, setGroup] = useGroupFilter(nodes)
   const [status, setStatus] = useState("all")
   const [grouping, setGrouping] = useState(false)
+  const [sorting, setSorting] = useState(false)
   // A row to bring into view once the list shows it: a new node, which lands
   // last, a hundred rows down on a large fleet; or the one whose handle was
   // pressed under a filter, once the filter is cleared. A filter hiding it
@@ -1708,14 +1709,14 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     })
   }
 
-  // Saved at once, with an undo in the toast rather than a confirmation: the
-  // result is seen before it is kept, and taking it back is one click.
-  function sortByName(rows: HTMLTableSectionElement) {
+  // Confirmed first, since it replaces an order that may have taken many
+  // drags; the toast then keeps an undo long enough to think it over.
+  function sortByName() {
+    setSorting(false)
+    const rows = head.current!.closest("table")!.tBodies[0]
     const before = drag.order.map((n) => n.id)
-    const next = byName(drag.order).map((n) => n.id)
-    if (next.join() === before.join()) return toast("已经是按名称排的顺序")
-    drag.arrange(next, rows)
-    toast.success("已按名称排序", { action: { label: "撤销", onClick: () => drag.arrange(before, rows) } })
+    drag.arrange(byName(drag.order).map((n) => n.id), rows)
+    toast.success("已按名称排序", { duration: 15_000, action: { label: "撤销", onClick: () => drag.arrange(before, rows) } })
   }
 
   async function remove() {
@@ -1788,7 +1789,11 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                     type="button"
                     className="-mx-1 inline-flex items-center gap-1 rounded px-1 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                     title={groupsOf(nodes).length ? "按名称排序，分组先后不变" : "按名称排序"}
-                    onClick={(e) => sortByName(e.currentTarget.closest("table")!.tBodies[0])}
+                    onClick={() => {
+                      const ids = drag.order.map((n) => n.id).join()
+                      if (byName(drag.order).map((n) => n.id).join() === ids) toast("已经是按名称排的顺序")
+                      else setSorting(true)
+                    }}
                   >
                     名称 <ArrowDownAZ className="size-3.5" />
                   </button>
@@ -1926,6 +1931,15 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           nodes={nodes}
           onClose={() => setEditing(null)}
           onSaved={refresh}
+        />
+      )}
+      {sorting && (
+        <ConfirmDialog
+          title="按名称重新排序？"
+          description={`全部 ${nodes.length} 台节点将按名称重排${groupsOf(nodes).length ? "，分组先后不变" : ""}。当前的顺序会被替换，公开页同步变化；排序后 15 秒内可在提示里撤销。`}
+          confirmLabel="排序"
+          onClose={() => setSorting(false)}
+          onConfirm={sortByName}
         />
       )}
       {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={refresh} />}
