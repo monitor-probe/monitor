@@ -1277,10 +1277,9 @@ impl Db {
     }
 
     /// Stores the facts an agent sends on connect and again whenever they change,
-    /// and reports
-    /// whether the node still requires a country lookup for `source`, the address
-    /// `agent_ws::country_source` chose. An empty `source` has no country and is
-    /// never owed one. Capacities are not among them, even where an agent still
+    /// and reports whether the node still requires a country lookup for `source`,
+    /// the address `agent_ws::country_source` chose. An empty `source` has no
+    /// country and is never owed one. Capacities are not among them, even where an agent still
     /// sends them: they change with every mount, and [`Db::touch_seen`] keeps
     /// them from the reports.
     ///

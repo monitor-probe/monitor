@@ -209,16 +209,16 @@ fn node_view(
     full: bool,
     now: DateTime<Local>,
 ) -> Value {
-    // The three capacities arrive in every `Metrics`. The stored figure follows
-    // the reports a minute at a time and as the session ends, so it lags a disk mounted while
-    // the agent runs -- the agent re-reads its mount table every sample so that
-    // it appears -- by up to a minute. Using the report while a node is connected
-    // keeps every consumer of this view on one number: the card reads the live
-    // metrics and the detail page reads these, which would otherwise show the
-    // same machine two different capacities. Offline, the stored figure is the
-    // last one reported. No floor is applied: a host whose swap has just been
-    // disabled reports zero and means it. A node connected but not yet reporting
-    // holds `Null`, where `get` returns nothing and the stored figure stands.
+    // The three capacities arrive in every `Metrics`. The stored figure follows the
+    // reports a minute at a time and as the session ends, so it lags a disk mounted
+    // while the agent runs -- the agent re-reads its mount table every sample so
+    // that it appears -- by up to a minute. Using the report while a node is
+    // connected keeps every consumer of this view on one number: the card reads the
+    // live metrics and the detail page reads these, which would otherwise show the
+    // same machine two different capacities. Offline, the stored figure is the last
+    // one reported. No floor is applied: a host whose swap has just been disabled
+    // reports zero and means it. A node connected but not yet reporting holds
+    // `Null`, where `get` returns nothing and the stored figure stands.
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
