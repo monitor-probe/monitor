@@ -1615,6 +1615,15 @@ function nameText(name: string) {
 // Traffic turns a subdued orange at the alert threshold and a subdued red once
 // the allowance is used up, so the table agrees with the alerts. With alerts
 // off, the threshold's default of 80 % still marks a node running short.
+// Quick filters over the node list, each gathering the rows already marked for
+// it: the traffic tint, and the window the expiry reminder covers.
+const ATTENTION: [key: string, label: string, test: (n: Node, warnAt: number, expiryDays: number) => boolean][] = [
+  ["offline", "离线", (n) => !n.online],
+  ["traffic", "流量预警", (n, warnAt) => trafficTone(n, warnAt) !== ""],
+  ["expiring", "即将到期", (n, _, days) => n.expires_in !== null && n.expires_in <= days],
+  ["private", "不公开", (n) => !n.public],
+]
+
 function trafficTone(n: Node, warnAt: number) {
   if (n.traffic_limit <= 0) return ""
   if (n.month_used >= n.traffic_limit) return "text-over"
@@ -1622,7 +1631,9 @@ function trafficTone(n: Node, warnAt: number) {
 }
 
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
-  const warnAt = Number(useSettings().s?.notify_traffic) || 80
+  const settings = useSettings().s
+  const warnAt = Number(settings?.notify_traffic) || 80
+  const expiryDays = Number(settings?.notify_expiry) || 7
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -1633,19 +1644,25 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [removing, setRemoving] = useState(false)
   const [query, setQuery] = useState("")
   const [group, setGroup] = useGroupFilter(nodes)
+  const [status, setStatus] = useState("all")
   const [grouping, setGrouping] = useState(false)
   // A new node lands last, a hundred rows down on a large fleet, so it is
   // brought into view once the list carries it. A filter hiding it cancels the
   // scroll rather than leaving one to fire when the filter is cleared.
   const added = useRef<number | null>(null)
   const drag = useDragOrder(nodes, "nodes", refresh)
-  const visible = inGroup(searchNodes(drag.order, query), group)
+  // Counted within the search and the group, so each count is what its filter
+  // would then show.
+  const found = inGroup(searchNodes(drag.order, query), group)
+  const attention = ATTENTION.map(([key, label, test]) => ({ key, label, rows: found.filter((n) => test(n, warnAt, expiryDays)) }))
+  const picked = attention.find((a) => a.key === status)
+  const visible = picked?.rows ?? found
   useEffect(() => {
     if (added.current === null || !nodes.some((n) => n.id === added.current)) return
     document.querySelector(`tbody tr[data-id="${added.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
     added.current = null
   })
-  const searching = query.trim() !== "" || group !== "all"
+  const searching = query.trim() !== "" || group !== "all" || status !== "all"
   const uninstall = refusal ? "" : uninstallCommand(site)
 
   // Saved at once, with an undo in the toast rather than a confirmation: the
@@ -1694,6 +1711,28 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
         </Button>
       </div>
 
+      {/* A filter with nothing to show is left out unless picked: the row then
+          reads at a glance whether anything needs attention. Picked, it stays
+          when its count drops to zero, so the list does not change under the
+          reader. */}
+      {nodes.length > 0 && (
+        <div role="group" aria-label="按状态筛选" className="flex w-fit max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
+          {[{ key: "all", label: "全部", rows: found }, ...attention]
+            .filter((a) => a.key === "all" || a.key === status || a.rows.length)
+            .map((a) => (
+              <button
+                key={a.key}
+                type="button"
+                aria-pressed={status === a.key}
+                onClick={() => setStatus(status === a.key ? "all" : a.key)}
+                className={`rounded-md px-3 py-1 text-sm transition-colors ${status === a.key ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+              >
+                {a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span>
+              </button>
+            ))}
+        </div>
+      )}
+
       <Card className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
@@ -1735,7 +1774,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                       {...drag.handle(n.id)}
                       name={n.name}
                       disabled={searching}
-                      title={searching ? "清空搜索和分组筛选后可拖动排序" : undefined}
+                      title={searching ? "清空搜索和筛选后可拖动排序" : undefined}
                     />
                     <div className="min-w-24">
                       {/* Lines are balanced, so none ends on a character or two. */}
@@ -1831,7 +1870,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             {searching && nodes.length > 0 && !visible.length && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  没有匹配的节点
+                  {picked && found.length ? `当前没有${picked.label}的节点` : "没有匹配的节点"}
                 </TableCell>
               </TableRow>
             )}
