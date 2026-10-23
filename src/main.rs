@@ -702,14 +702,73 @@ async fn main() -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     info!("listening on {} ({url})", listener.local_addr()?);
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    serve(listener, router).await;
     // The readings held back from the traffic rows. Unbooked, they cost nothing
     // to a node that reports again under the same boot, but a node rebooting
     // while the hub is down would take them with it.
     agent_ws::book_held(&held, None);
     Ok(())
+}
+
+/// Serves HTTP/1 until a stop signal, then lets in-flight requests finish.
+///
+/// `axum::serve` gives hyper no timer, and without one hyper enforces no
+/// header read timeout: a connection that sends nothing, half a request head,
+/// or idles between keep-alive requests holds its descriptor indefinitely, and
+/// 1100 such connections stopped a hub limited to 1024 descriptors. With the
+/// timer every wait for a request head ends after hyper's default 30 s. A
+/// WebSocket has left hyper once upgraded and is bounded by its own heartbeat.
+async fn serve(listener: tokio::net::TcpListener, router: Router) {
+    use axum::extract::ConnectInfo;
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+    use tower::ServiceExt;
+
+    let mut http1 = hyper::server::conn::http1::Builder::new();
+    http1.timer(TokioTimer::new());
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+    let mut stop = std::pin::pin!(shutdown());
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    accept_failed(e).await;
+                    continue;
+                }
+            },
+            () = &mut stop => break,
+        };
+        let service = router.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        });
+        let conn = http1.serve_connection(TokioIo::new(stream), TowerToHyperService::new(service));
+        let mut stop_rx = stop_rx.clone();
+        tokio::spawn(async move {
+            let mut conn = std::pin::pin!(conn.with_upgrades());
+            tokio::select! {
+                _ = conn.as_mut() => return,
+                _ = stop_rx.changed() => conn.as_mut().graceful_shutdown(),
+            }
+            let _ = conn.await;
+        });
+    }
+    drop((listener, stop_rx));
+    let _ = stop_tx.send(());
+    // Every connection task holds a receiver until its connection ends.
+    stop_tx.closed().await;
+}
+
+/// An accept that failed for want of a descriptor would fail again at once,
+/// so the loop pauses rather than spin while connections close.
+async fn accept_failed(e: std::io::Error) {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    if !matches!(e.kind(), ConnectionAborted | ConnectionRefused | ConnectionReset) {
+        warn!("accept failed: {e}");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 /// Waits for whichever stop signal arrives first. SIGTERM is the significant
