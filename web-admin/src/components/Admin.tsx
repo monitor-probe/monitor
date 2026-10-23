@@ -240,9 +240,10 @@ function DragHandle({ name, disabled, title = "拖动排序", ...events }: React
   return (
     <button
       type="button"
-      disabled={disabled}
+      // Not `disabled`: a press on a locked handle is answered by the caller.
+      aria-disabled={disabled}
       // A larger target for a finger, and no text selection from a press.
-      className="cursor-grab touch-none rounded p-1 text-muted-foreground select-none hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent pointer-coarse:p-2"
+      className="cursor-grab touch-none rounded p-1 text-muted-foreground select-none hover:bg-muted hover:text-foreground active:cursor-grabbing aria-disabled:cursor-default aria-disabled:opacity-40 aria-disabled:hover:bg-transparent pointer-coarse:p-2"
       title={title}
       aria-label={`拖动 ${name} 排序`}
       {...events}
@@ -1646,10 +1647,11 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [group, setGroup] = useGroupFilter(nodes)
   const [status, setStatus] = useState("all")
   const [grouping, setGrouping] = useState(false)
-  // A new node lands last, a hundred rows down on a large fleet, so it is
-  // brought into view once the list carries it. A filter hiding it cancels the
-  // scroll rather than leaving one to fire when the filter is cleared.
-  const added = useRef<number | null>(null)
+  // A row to bring into view once the list shows it: a new node, which lands
+  // last, a hundred rows down on a large fleet; or the one whose handle was
+  // pressed under a filter, once the filter is cleared. A filter hiding it
+  // cancels the scroll rather than leaving one to fire when it is cleared.
+  const reveal = useRef<number | null>(null)
   const drag = useDragOrder(nodes, "nodes", refresh)
   // Counted within the search and the group, so each count is what its filter
   // would then show.
@@ -1658,12 +1660,26 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const picked = attention.find((a) => a.key === status)
   const visible = picked?.rows ?? found
   useEffect(() => {
-    if (added.current === null || !nodes.some((n) => n.id === added.current)) return
-    document.querySelector(`tbody tr[data-id="${added.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
-    added.current = null
+    if (reveal.current === null || !nodes.some((n) => n.id === reveal.current)) return
+    document.querySelector(`tbody tr[data-id="${reveal.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
+    reveal.current = null
   })
   const searching = query.trim() !== "" || group !== "all" || status !== "all"
   const uninstall = refusal ? "" : uninstallCommand(site)
+
+  // Under a filter the rows on screen are not the order, so a handle cannot
+  // move one. A press says why and offers the way out, which a disabled
+  // button would not: it takes no press, and a touch screen shows no title.
+  const locked = (id: number) => ({
+    onPointerDown: () => hintLocked(id),
+    onKeyDown: (e: React.KeyboardEvent) => (e.key === "ArrowUp" || e.key === "ArrowDown") && hintLocked(id),
+  })
+  function hintLocked(id: number) {
+    toast("筛选时不能拖动排序", {
+      id: "drag-locked",
+      action: { label: "清除筛选", onClick: () => { reveal.current = id; setQuery(""); setGroup("all"); setStatus("all") } },
+    })
+  }
 
   // Saved at once, with an undo in the toast rather than a confirmation: the
   // result is seen before it is kept, and taking it back is one click.
@@ -1771,7 +1787,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 <TableCell className="whitespace-normal">
                   <div className="flex items-center gap-2">
                     <DragHandle
-                      {...drag.handle(n.id)}
+                      {...(searching ? locked(n.id) : drag.handle(n.id))}
                       name={n.name}
                       disabled={searching}
                       title={searching ? "清空搜索和筛选后可拖动排序" : undefined}
@@ -1881,7 +1897,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {creating && (
         <CreateNode
           onClose={() => setCreating(false)}
-          onSaved={(id) => { added.current = id; refresh() }}
+          onSaved={(id) => { reveal.current = id; refresh() }}
         />
       )}
       {editing && (
