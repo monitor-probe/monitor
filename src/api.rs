@@ -2324,14 +2324,12 @@ pub async fn save_settings(
             }
             continue;
         }
-        if let Err(e) = app.db.set(key, value) {
+        let saved = match key.as_str() {
+            "github_allowed_users" => app.db.set_github_allowed(value),
+            _ => app.db.set(key, value),
+        };
+        if let Err(e) = saved {
             return fail(e);
-        }
-        if key == "github_allowed_users" {
-            let ids = app.db.get(crate::auth::GITHUB_IDS).unwrap_or_default();
-            if let Err(e) = app.db.set(crate::auth::GITHUB_IDS, &crate::auth::keep_listed(&ids, value)) {
-                return fail(e);
-            }
         }
     }
     with_cookies(Json(json!({"ok": true})), [reissued])

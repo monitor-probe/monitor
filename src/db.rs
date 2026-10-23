@@ -1061,14 +1061,50 @@ impl Db {
     /// As [`Db::get`], with a failed read kept apart from an absent key, for a
     /// caller that would otherwise act on "nothing saved".
     pub fn lookup(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn()
-            .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0))
-            .optional()?)
+        setting(&self.conn(), key)
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
         put_setting(&self.conn(), key, value)
+    }
+
+    /// Stores the GitHub allow list and drops the bindings of the logins it no
+    /// longer names, both or neither: a removal stored without its prune would
+    /// leave the old account bound when the name is added back.
+    pub fn set_github_allowed(&self, list: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let ids = setting(&tx, crate::auth::GITHUB_IDS)?.unwrap_or_default();
+        put_setting(&tx, "github_allowed_users", list)?;
+        put_setting(&tx, crate::auth::GITHUB_IDS, &crate::auth::keep_listed(&ids, list))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The GitHub account id `login` is bound to, binding it to `id` when it has
+    /// none; `None` when the allow list no longer names it. The list is read
+    /// again under the writer lock: a save that removed the name during the
+    /// OAuth exchange would otherwise be followed by a binding the removal was
+    /// meant to clear.
+    pub fn bind_github(&self, login: &str, id: &str) -> Result<Option<String>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let list = setting(&tx, "github_allowed_users")?.unwrap_or_default();
+        if !crate::auth::allowed_logins(&list).iter().any(|l| l == login) {
+            return Ok(None);
+        }
+        let ids = setting(&tx, crate::auth::GITHUB_IDS)?.unwrap_or_default();
+        if let Some(bound) = crate::auth::bound_id(&ids, login) {
+            return Ok(Some(bound.to_owned()));
+        }
+        let pair = format!("{login}:{id}");
+        put_setting(
+            &tx,
+            crate::auth::GITHUB_IDS,
+            &if ids.is_empty() { pair } else { format!("{ids},{pair}") },
+        )?;
+        tx.commit()?;
+        Ok(Some(id.to_owned()))
     }
 
     // ---- nodes ----
@@ -2687,6 +2723,10 @@ fn issued(conn: &Connection, table: &str) -> Result<i64> {
 /// The tables whose ids [`next_id`] issues.
 const ID_TABLES: [&str; 2] = ["node", "ping_task"];
 
+fn setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+}
+
 fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO setting (key, value) VALUES (?1, ?2)
@@ -2769,6 +2809,29 @@ mod tests {
 
     fn db() -> Db {
         Db::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn an_allowed_login_stays_bound_to_the_account_it_first_signed_in_as() {
+        let db = db();
+        db.set_github_allowed(" Alice, ,bob,").unwrap();
+        assert_eq!(db.bind_github("alice", "1").unwrap().as_deref(), Some("1"), "first sign-in binds");
+        assert_eq!(
+            db.bind_github("alice", "2").unwrap().as_deref(),
+            Some("1"),
+            "another account under the name"
+        );
+        assert_eq!(db.bind_github("bob", "3").unwrap().as_deref(), Some("3"));
+        assert_eq!(db.bind_github("carol", "4").unwrap(), None, "a login the list does not name");
+        db.set_github_allowed("ALICE ").unwrap();
+        assert_eq!(db.get(crate::auth::GITHUB_IDS).as_deref(), Some("alice:1"), "case and spaces keep it");
+        db.set_github_allowed("bob").unwrap();
+        db.set_github_allowed("alice,bob").unwrap();
+        assert_eq!(
+            db.bind_github("alice", "2").unwrap().as_deref(),
+            Some("2"),
+            "removed and re-added binds afresh"
+        );
     }
 
     /// One worker, as on a one-core hub: a task waiting for the writer must not
