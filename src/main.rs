@@ -740,6 +740,11 @@ async fn serve(listener: tokio::net::TcpListener, router: Router) {
             },
             () = &mut stop => break,
         };
+        // hyper has no write timeout, so a client that stops reading would park
+        // its response on a closed window and hold the descriptor indefinitely.
+        // The kernel aborts a window that stays closed, or data that nobody
+        // acknowledges, after this long.
+        let _ = rustix::net::sockopt::set_tcp_user_timeout(&stream, STALL.as_millis() as u32);
         let service = router.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
             req.extensions_mut().insert(ConnectInfo(peer));
             req
@@ -763,6 +768,10 @@ async fn serve(listener: tokio::net::TcpListener, router: Router) {
     // would go with the killed process.
     let _ = tokio::time::timeout(DRAIN, stop_tx.closed()).await;
 }
+
+/// How long a connection may go without the peer taking any data. The push
+/// stream gives up on a send after 10 s of its own; this bounds the rest.
+const STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a stop waits for in-flight requests.
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(5);

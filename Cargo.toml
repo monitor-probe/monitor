@@ -39,9 +39,10 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 # tar.
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# The open-file limit, raised at startup. Pure Rust on Linux, so the cross-built
-# musl binary gains no C dependency.
-rustix = { version = "1", features = ["process"] }
+# The open-file limit raised at startup, and `TCP_USER_TIMEOUT` on accepted
+# connections. Pure Rust on Linux, so the cross-built musl binary gains no C
+# dependency.
+rustix = { version = "1", features = ["process", "net"] }
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
