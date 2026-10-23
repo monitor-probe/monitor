@@ -714,9 +714,9 @@ async fn main() -> Result<()> {
 ///
 /// `axum::serve` gives hyper no timer, and without one hyper enforces no
 /// header read timeout: a connection that sends nothing, half a request head,
-/// or idles between keep-alive requests holds its descriptor indefinitely, and
-/// 1100 such connections stopped a hub limited to 1024 descriptors. With the
-/// timer every wait for a request head ends after hyper's default 30 s. A
+/// or idles between keep-alive requests would hold its descriptor indefinitely,
+/// and 1100 such connections would stop a hub limited to 1024 descriptors. With
+/// the timer every wait for a request head ends after hyper's default 30 s. A
 /// WebSocket has left hyper once upgraded and is bounded by its own heartbeat.
 async fn serve(listener: tokio::net::TcpListener, router: Router) {
     use axum::extract::ConnectInfo;
@@ -757,9 +757,15 @@ async fn serve(listener: tokio::net::TcpListener, router: Router) {
     }
     drop((listener, stop_rx));
     let _ = stop_tx.send(());
-    // Every connection task holds a receiver until its connection ends.
-    stop_tx.closed().await;
+    // Every connection task holds a receiver until its connection ends. A
+    // client that stops reading, or sits on half a request head, would hold the
+    // drain open past `docker stop`'s 10 s, and the readings booked after it
+    // would go with the killed process.
+    let _ = tokio::time::timeout(DRAIN, stop_tx.closed()).await;
 }
+
+/// How long a stop waits for in-flight requests.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// An accept that failed for want of a descriptor would fail again at once,
 /// so the loop pauses rather than spin while connections close.
@@ -1272,6 +1278,28 @@ mod tests {
             _: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<()>> {
             std::task::Poll::Ready(None)
+        }
+    }
+
+    /// Without a timer hyper would wait for a request head forever, both on a
+    /// fresh connection and between keep-alive requests.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_without_a_request_head_is_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, Router::new()));
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut kept = tokio::net::TcpStream::connect(addr).await.unwrap();
+        kept.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut answer = [0; 12];
+        kept.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"HTTP/1.1 404");
+        for (name, conn) in [("silent", &mut silent), ("kept alive", &mut kept)] {
+            let mut rest = Vec::new();
+            let closed =
+                tokio::time::timeout(std::time::Duration::from_secs(31), conn.read_to_end(&mut rest)).await;
+            assert!(matches!(closed, Ok(Ok(_))), "the {name} connection is still open");
         }
     }
 
