@@ -141,7 +141,12 @@ fi
 # defaults a scheme-less URL to http://, fetching over plaintext the binary about
 # to run as root.
 if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
-case "$SERVER" in *://*) ;; *) SERVER="$SCHEME://$SERVER" ;; esac
+# The scheme in lowercase, as every check below matches it: a hand-typed
+# HTTP:// would otherwise pass the plaintext refusal.
+case "$SERVER" in
+*://*) SERVER="$(printf '%s' "${SERVER%%://*}" | tr 'A-Z' 'a-z')://${SERVER#*://}" ;;
+*) SERVER="$SCHEME://$SERVER" ;;
+esac
 # The agent already refuses plaintext ws:// to a remote hub, since the token
 # would travel in the clear. The same address fetches the binary about to run as
 # root here, so the same rule applies: over plain HTTP anyone on the path can
@@ -291,8 +296,7 @@ if [ -z "$TOKEN" ]; then
 	echo "registering ${NAME:-this machine} with the hub"
 	# curl sends no header at all for an empty $HELD. The status follows the body
 	# on a line of its own, so a refusal shows the hub's own reason: a closed
-	# window, a lockout, an entry that is not an https domain and a database
-	# error share one exit status under --fail. A request that got no response
+	# window, a lockout and a database error share one exit status under --fail. A request that got no response
 	# stops here, with curl's own message. The name travels on stdin: as an
 	# argument, one beginning with @ would be read as a file to send.
 	REPLY=$(printf '%s' "$NAME" | curl -sS --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer $REGISTER" \
