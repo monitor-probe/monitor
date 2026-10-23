@@ -15,11 +15,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["ws", "macros"] }
-rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 argon2 = "0.5"
 rand = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 futures-core = "0.3"
 # Already built for rustls; verifies the agent binaries the hub relays.
