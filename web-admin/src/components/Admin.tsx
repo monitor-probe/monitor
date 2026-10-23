@@ -1750,12 +1750,15 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       )}
 
       <Card className="overflow-x-auto p-0">
-        <Table>
+        {/* Fixed layout: column widths follow the table, not the rows on
+            screen, so a filter or a search does not move them. Each width holds
+            its column's widest content (a 22-character address, a duration
+            under the status pill); the name takes the rest, and the minimum
+            is what leaves it 144px. */}
+        <Table className="min-w-189 table-fixed xl:min-w-222">
           <TableHeader>
-            {/* Percentages, or the address column swallows every spare pixel
-                and pushes status across the table. */}
             <TableRow>
-              <TableHead className="w-[26%]">
+              <TableHead>
                 {nodes.length > 1 ? (
                   <button
                     type="button"
@@ -1769,14 +1772,15 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   "名称"
                 )}
               </TableHead>
-              <TableHead className="w-[18%]">IP</TableHead>
-              <TableHead className="w-[12%]">状态</TableHead>
-              <TableHead className="w-[16%]">流量</TableHead>
+              <TableHead className="w-48">IP</TableHead>
+              <TableHead className="w-20">状态</TableHead>
+              {/* Two lines below xl, one above. */}
+              <TableHead className="w-21 xl:w-28">流量</TableHead>
               {/* Below xl the expiry date moves under the price: seven
                   columns leave a 1024px window no room for names. */}
-              <TableHead className="w-[10%]">价格<span className="xl:hidden"> / 到期</span></TableHead>
-              <TableHead className="hidden w-[12%] xl:table-cell">到期</TableHead>
-              <TableHead className="text-right">操作</TableHead>
+              <TableHead className="w-24">价格<span className="xl:hidden"> / 到期</span></TableHead>
+              <TableHead className="hidden w-26 xl:table-cell">到期</TableHead>
+              <TableHead className="w-40 text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1793,8 +1797,9 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                       title={searching ? "清空搜索和筛选后可拖动排序" : undefined}
                     />
                     <div className="min-w-24">
-                      {/* Lines are balanced, so none ends on a character or two. */}
-                      <div className="font-medium text-balance break-keep">
+                      {/* Lines are balanced, so none ends on a character or two;
+                          a word wider than the column still breaks. */}
+                      <div className="font-medium text-balance break-keep wrap-anywhere">
                         {nameText(n.name)}
                         {/* In the name's flow, a fixed gap after its last word.
                             Beside the block it would sit at the cell's edge
@@ -1876,22 +1881,15 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 </TableCell>
               </TableRow>
             ))}
-            {nodes.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有节点，右上角添加
-                </TableCell>
-              </TableRow>
-            )}
-            {searching && nodes.length > 0 && !visible.length && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  {picked && found.length ? `当前没有${picked.label}的节点` : "没有匹配的节点"}
-                </TableCell>
-              </TableRow>
-            )}
           </TableBody>
         </Table>
+        {/* Below the table rather than a row spanning it: below xl the span
+            would count the hidden expiry column and add a column of its own. */}
+        {!visible.length && (
+          <p className="py-10 text-center text-sm text-muted-foreground">
+            {!nodes.length ? "还没有节点，右上角添加" : picked && found.length ? `当前没有${picked.label}的节点` : "没有匹配的节点"}
+          </p>
+        )}
       </Card>
 
       {creating && (
@@ -2141,7 +2139,8 @@ function PingByNode({ nodes, tasks, reload }: { nodes: Node[]; tasks: PingTask[]
             <TableRow>
               <TableHead className="w-[30%]">节点</TableHead>
               <TableHead>监控</TableHead>
-              <TableHead className="w-0 text-right">操作</TableHead>
+              {/* Sized for its one button, which an empty list would not hold. */}
+              <TableHead className="w-13 text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
