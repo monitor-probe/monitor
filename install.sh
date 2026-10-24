@@ -270,19 +270,22 @@ else
 	# which is retried here rather than failing the machine. Any other refusal is
 	# final and shown with the hub's own reason, which --fail would discard.
 	#
-	# A connection reset or cut short on the way to the hub is retried too: some
-	# networks reset a share of TLS handshakes to a CDN, which a second attempt
-	# usually gets through. Exit codes 18, 35, 52, 55 and 56 are those cuts; a
-	# refused connection, an unresolved name, a bad certificate or the 300 s limit
-	# would fail the same way again and stop at once. The download precedes the
-	# registration, so a retry spends nothing.
+	# A connection cut before any byte arrived is retried too: some networks
+	# reset a share of TLS handshakes to a CDN, which a second attempt usually
+	# gets through, and such a cut costs about a second. Exit codes 18, 35, 52,
+	# 55 and 56 are those cuts. One that breaks off mid-transfer means a link too
+	# slow for the binary, where each retry would wait minutes for the same end,
+	# so it stops with a pointer to --binary. A refused connection, an unresolved
+	# name, a bad certificate or the 300 s limit stop at once as well. The
+	# download precedes the registration, so a retry spends nothing.
 	TRIES=0
 	while :; do
 		RC=0
-		CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || RC=$?
-		case "$RC:$CODE" in
-		0:503) WHY="the hub is busy relaying to other machines" ;;
-		18:* | 35:* | 52:* | 55:* | 56:*) WHY="the connection to the hub was cut" ;;
+		OUT=$(curl -sSL --max-time 300 -w '%{http_code} %{size_download}' "$URL" -o "$TMP") || RC=$?
+		CODE=${OUT% *} GOT=${OUT#* }
+		case "$RC:$CODE:$GOT" in
+		0:503:*) WHY="the hub is busy relaying to other machines" ;;
+		18:*:0 | 35:*:0 | 52:*:0 | 55:*:0 | 56:*:0) WHY="the connection to the hub was cut" ;;
 		*) break ;;
 		esac
 		[ "$TRIES" -lt 5 ] || break
@@ -290,7 +293,10 @@ else
 		echo "$WHY; retrying in 5 seconds"
 		sleep 5
 	done
-	[ "$RC" = 0 ] || exit 1
+	if [ "$RC" != 0 ]; then
+		[ "$GOT" = 0 ] || echo "the download broke off after $GOT bytes; if the link to the hub stays this slow, upload the agent to this machine and rerun with --binary FILE" >&2
+		exit 1
+	fi
 	[ "$CODE" = 200 ] ||
 		{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP" | cut -c1-500)" >&2; exit 1; }
 fi
