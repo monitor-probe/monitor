@@ -2895,26 +2895,15 @@ mod tests {
         assert_eq!(read("busy_timeout"), 5_000);
     }
 
-    /// A real file, for the tests that exercise what happens to one. Removed with
-    /// its companions when dropped.
-    struct Scratch(String);
+    /// A real file, for the tests that exercise what happens to one. It sits alone
+    /// in a [`crate::TempDir`], so its journal and every file a test puts beside it
+    /// go with it.
+    struct Scratch(String, #[expect(dead_code, reason = "held for its Drop")] crate::TempDir);
 
     impl Scratch {
         fn new() -> Self {
-            Self(
-                std::env::temp_dir()
-                    .join(format!("monitor-test-{}.db", rand::random::<u64>()))
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm", ".copy"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
-            }
+            let dir = crate::TempDir::new("test");
+            Self(dir.0.join("monitor.db").to_string_lossy().into_owned(), dir)
         }
     }
 
@@ -3054,8 +3043,6 @@ mod tests {
             SCHEMA_VERSION
         );
         assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
-        drop(conn);
-        let _ = std::fs::remove_file(&copy);
     }
 
     /// An unknown pragma is a silent no-op in SQLite, so only reading it back

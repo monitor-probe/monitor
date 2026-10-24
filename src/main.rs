@@ -1057,7 +1057,7 @@ pub(crate) struct TempDir(pub PathBuf);
 impl TempDir {
     pub fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("monitor-{name}-{:016x}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
         Self(dir)
     }
 }
