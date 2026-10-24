@@ -1047,6 +1047,28 @@ fn compressible() -> impl Predicate {
         })
 }
 
+/// A fresh directory under the temp directory, removed with everything in it
+/// when dropped, so a failing test leaves nothing behind either. A mutation run
+/// fails thousands of them.
+#[cfg(test)]
+pub(crate) struct TempDir(pub PathBuf);
+
+#[cfg(test)]
+impl TempDir {
+    pub fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("monitor-{name}-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -647,11 +647,8 @@ mod tests {
 
     #[test]
     fn theme_files_cannot_escape_their_dist_directory() {
-        let base = std::env::temp_dir().join(format!(
-            "monitor-theme-path-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let tmp = crate::TempDir::new("theme-path-test");
+        let base = tmp.0.clone();
         let dist = base.join("theme/dist");
         fs::create_dir_all(dist.join("assets")).unwrap();
         fs::write(dist.join("index.html"), "index").unwrap();
@@ -667,16 +664,14 @@ mod tests {
             std::os::unix::fs::symlink(base.join("secret"), dist.join("assets/link")).unwrap();
             assert!(read_inside(&dist, "assets/link").is_none());
         }
-
-        fs::remove_dir_all(base).unwrap();
     }
 
     /// The per-file and total ceilings hold at their exact boundary: a file of
     /// [`MAX_FILE`] and a total of [`MAX_EXPANDED`] install, one byte more does not.
     #[test]
     fn a_package_at_the_size_ceilings_installs_and_one_byte_past_does_not() {
-        let base = std::env::temp_dir().join(format!("monitor-ceilings-{}", std::process::id()));
-        fs::create_dir_all(&base).unwrap();
+        let tmp = crate::TempDir::new("ceilings");
+        let base = tmp.0.clone();
         let manifest = r#"{"name":"x","short":"x","description":"","version":"1","author":"a","url":""}"#;
         let pack = |sizes: &[u64]| {
             let mut tar =
@@ -707,19 +702,14 @@ mod tests {
         let full = [MAX_FILE; 7].into_iter().chain([headroom - 7 * MAX_FILE]).collect::<Vec<_>>();
         assert!(!refused(&full));
         assert!(refused(&[full.as_slice(), &[1]].concat()));
-        fs::remove_dir_all(&base).unwrap();
     }
 
     /// Everything an uploaded archive must satisfy before replacing a theme
     /// currently being served.
     #[test]
     fn an_uploaded_theme_is_checked_before_it_replaces_the_one_in_place() {
-        let base = std::env::temp_dir().join(format!(
-            "monitor-install-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        fs::create_dir_all(&base).unwrap();
+        let tmp = crate::TempDir::new("install-test");
+        let base = tmp.0.clone();
         let archive = base.join("upload.tar.gz");
 
         let manifest: &[u8] =
@@ -940,8 +930,6 @@ mod tests {
         assert!(!base.join("aurora").exists());
         assert!(remove(&base, "aurora").is_err(), "already deleted");
         assert!(remove(&base, "../etc").is_err(), "not a name a theme directory can carry");
-
-        fs::remove_dir_all(base).unwrap();
     }
 
     /// The shell changes under a fixed URL -- a new build, or the public page
@@ -1051,7 +1039,8 @@ mod tests {
     /// what it leads to survives.
     #[test]
     fn removing_a_theme_stays_inside_the_themes_directory() {
-        let base = std::env::temp_dir().join(format!("monitor-remove-{}", std::process::id()));
+        let tmp = crate::TempDir::new("remove");
+        let base = tmp.0.clone();
         let (themes, outside) = (base.join("themes"), base.join("outside"));
         fs::create_dir_all(themes.join("aurora")).unwrap();
         fs::create_dir_all(&outside).unwrap();
@@ -1061,6 +1050,5 @@ mod tests {
         assert!(outside.exists(), "the symlink's target survives");
         remove(&themes, "aurora").unwrap();
         assert!(!themes.join("aurora").exists());
-        fs::remove_dir_all(&base).unwrap();
     }
 }

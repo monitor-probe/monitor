@@ -2629,7 +2629,8 @@ mod tests {
     /// has landed, so a piece continues it, restarts it, or is refused.
     #[tokio::test]
     async fn a_chunk_continues_an_upload_only_where_the_last_one_ended() {
-        let path = std::env::temp_dir().join(format!("monitor-chunk-{}", std::process::id()));
+        let tmp = crate::TempDir::new("chunk");
+        let path = tmp.0.join("upload");
         let path = path.to_str().unwrap();
         let piece = |offset, total| Chunk { offset, total };
         let body = |bytes: &'static [u8]| axum::body::Body::from(bytes);
@@ -2654,7 +2655,6 @@ mod tests {
         // Starting over truncates whatever an interrupted attempt left behind.
         assert_eq!(receive(path, &piece(0, 2), 1024, body(b"hi")).await.unwrap(), 2);
         assert_eq!(std::fs::read(path).unwrap(), b"hi");
-        std::fs::remove_file(path).unwrap();
     }
 
     /// Both scratch names a restore uses sit beside the live database, and one left
@@ -2667,8 +2667,8 @@ mod tests {
     /// could silently drop.
     #[tokio::test]
     async fn a_finished_restore_leaves_no_scratch_file_behind() {
-        let dir = std::env::temp_dir().join(format!("monitor-restore-{}", &random_token()[..16]));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = crate::TempDir::new("restore");
+        let dir = tmp.0.clone();
         let live = dir.join("live.db").to_string_lossy().into_owned();
         let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
         node(&app, "kept", true);
@@ -2718,7 +2718,6 @@ mod tests {
             .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
             .collect();
         assert!(left.is_empty(), "left beside the database: {left:?}");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A connected agent holding one report. The receiver is returned because
