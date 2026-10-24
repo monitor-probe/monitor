@@ -257,14 +257,28 @@ echo "downloading monitor-agent ($ARCH)"
 # batch run on more machines than drain in that time is turned away with 503,
 # which is retried here rather than failing the machine. Any other refusal is
 # final and shown with the hub's own reason, which --fail would discard.
+#
+# A connection reset or cut short on the way to the hub is retried too: some
+# networks reset a share of TLS handshakes to a CDN, which a second attempt
+# usually gets through. Exit codes 18, 35, 52, 55 and 56 are those cuts; a
+# refused connection, an unresolved name, a bad certificate or the 300 s limit
+# would fail the same way again and stop at once. The download precedes the
+# registration, so a retry spends nothing.
 TRIES=0
 while :; do
-	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || exit 1
-	[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
+	RC=0
+	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || RC=$?
+	case "$RC:$CODE" in
+	0:503) WHY="the hub is busy relaying to other machines" ;;
+	18:* | 35:* | 52:* | 55:* | 56:*) WHY="the connection to the hub was cut" ;;
+	*) break ;;
+	esac
+	[ "$TRIES" -lt 5 ] || break
 	TRIES=$((TRIES + 1))
-	echo "the hub is busy relaying to other machines; retrying in 5 seconds"
+	echo "$WHY; retrying in 5 seconds"
 	sleep 5
 done
+[ "$RC" = 0 ] || exit 1
 [ "$CODE" = 200 ] ||
 	{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP" | cut -c1-500)" >&2; exit 1; }
 # A relay can answer 200 with something other than the program, such as a
