@@ -28,12 +28,13 @@ INTERVAL=""
 INSECURE=""
 UNINSTALL=""
 UPGRADE=""
+BINARY=""
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --name | --iface | --interval)
+	--server | --token | --register | --name | --iface | --interval | --binary)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
 	--name) NAME="$2"; shift 2 ;;
 	--iface) IFACE="$2"; IFACE_SET=1; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
+	--binary) BINARY="$2"; shift 2 ;;
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
@@ -89,12 +91,14 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
-	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--binary FILE] [--insecure]" >&2
+	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--binary FILE]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates, which is otherwise named after its id. < > \" ' are dropped from it; the panel renames a node freely" >&2
+	echo "--binary FILE installs an agent already placed on this machine instead of downloading it from the hub" >&2
 	exit 2
 }
+[ -z "$BINARY" ] || [ -f "$BINARY" ] || { echo "--binary: no file at $BINARY" >&2; exit 2; }
 # Names the node a registration creates. A token belongs to a node that already
 # has a name, which the panel changes; silently dropping the flag there would
 # read as a rename that never happened.
@@ -252,41 +256,50 @@ URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-echo "downloading monitor-agent ($ARCH)"
-# The hub relays four downloads at once and queues the rest for 30 seconds. A
-# batch run on more machines than drain in that time is turned away with 503,
-# which is retried here rather than failing the machine. Any other refusal is
-# final and shown with the hub's own reason, which --fail would discard.
-#
-# A connection reset or cut short on the way to the hub is retried too: some
-# networks reset a share of TLS handshakes to a CDN, which a second attempt
-# usually gets through. Exit codes 18, 35, 52, 55 and 56 are those cuts; a
-# refused connection, an unresolved name, a bad certificate or the 300 s limit
-# would fail the same way again and stop at once. The download precedes the
-# registration, so a retry spends nothing.
-TRIES=0
-while :; do
-	RC=0
-	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || RC=$?
-	case "$RC:$CODE" in
-	0:503) WHY="the hub is busy relaying to other machines" ;;
-	18:* | 35:* | 52:* | 55:* | 56:*) WHY="the connection to the hub was cut" ;;
-	*) break ;;
-	esac
-	[ "$TRIES" -lt 5 ] || break
-	TRIES=$((TRIES + 1))
-	echo "$WHY; retrying in 5 seconds"
-	sleep 5
-done
-[ "$RC" = 0 ] || exit 1
-[ "$CODE" = 200 ] ||
-	{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP" | cut -c1-500)" >&2; exit 1; }
+# A machine whose link to the hub cannot carry the binary in time installs one
+# uploaded beforehand: registration and the service then need only a few small
+# requests. It is copied, so the file given is left as it was and may be $BIN
+# itself.
+if [ -n "$BINARY" ]; then
+	echo "installing $BINARY instead of downloading"
+	cp "$BINARY" "$TMP"
+else
+	echo "downloading monitor-agent ($ARCH)"
+	# The hub relays four downloads at once and queues the rest for 30 seconds. A
+	# batch run on more machines than drain in that time is turned away with 503,
+	# which is retried here rather than failing the machine. Any other refusal is
+	# final and shown with the hub's own reason, which --fail would discard.
+	#
+	# A connection reset or cut short on the way to the hub is retried too: some
+	# networks reset a share of TLS handshakes to a CDN, which a second attempt
+	# usually gets through. Exit codes 18, 35, 52, 55 and 56 are those cuts; a
+	# refused connection, an unresolved name, a bad certificate or the 300 s limit
+	# would fail the same way again and stop at once. The download precedes the
+	# registration, so a retry spends nothing.
+	TRIES=0
+	while :; do
+		RC=0
+		CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || RC=$?
+		case "$RC:$CODE" in
+		0:503) WHY="the hub is busy relaying to other machines" ;;
+		18:* | 35:* | 52:* | 55:* | 56:*) WHY="the connection to the hub was cut" ;;
+		*) break ;;
+		esac
+		[ "$TRIES" -lt 5 ] || break
+		TRIES=$((TRIES + 1))
+		echo "$WHY; retrying in 5 seconds"
+		sleep 5
+	done
+	[ "$RC" = 0 ] || exit 1
+	[ "$CODE" = 200 ] ||
+		{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP" | cut -c1-500)" >&2; exit 1; }
+fi
 # A relay can answer 200 with something other than the program, such as a
 # mirror's error page. Checked before the running agent is stopped, so a batch
 # run through such a relay leaves each machine on the agent it had, rather than
 # on bytes that cannot start while this script reports success.
 [ "$(head -c 4 "$TMP")" = "$(printf '\177ELF')" ] ||
-	{ echo "the download is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
+	{ echo "${BINARY:-the download} is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
