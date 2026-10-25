@@ -205,8 +205,8 @@ http://*)
 			exit 2
 		}
 		echo "warning: --insecure over plain HTTP to $SERVER" >&2
-		echo "         the token and every report travel in the clear, and the binary" >&2
-		echo "         installed below is fetched over the same unverified channel" >&2
+		echo "         the token and every report travel in the clear" >&2
+		[ -n "$BINARY" ] || echo "         and the binary installed below is fetched over the same unverified channel" >&2
 	fi
 	;;
 # Anything else is refused rather than left to curl: ftp:// or the agent's own
@@ -272,20 +272,22 @@ else
 	#
 	# A connection cut before any byte arrived is retried too: some networks
 	# reset a share of TLS handshakes to a CDN, which a second attempt usually
-	# gets through, and such a cut costs about a second. Exit codes 18, 35, 52,
-	# 55 and 56 are those cuts. One that breaks off mid-transfer means a link too
-	# slow for the binary, where each retry would wait minutes for the same end,
-	# so it stops with a pointer to --binary. A refused connection, an unresolved
-	# name, a bad certificate or the 300 s limit stop at once as well. The
-	# download precedes the registration, so a retry spends nothing.
+	# gets through, and such a cut costs about a second. Exit codes 16, 18, 35,
+	# 52, 55, 56 and 92 are those cuts, 16 and 92 being their HTTP/2 form. One
+	# that breaks off mid-transfer means a link too slow for the binary, where
+	# each retry would wait minutes for the same end, so it stops at once; it and
+	# cuts that outlast the retries both end with a pointer to --binary. A
+	# refused connection, an unresolved name, a bad certificate or the 300 s
+	# limit before any reply stop at once as well. The download precedes the
+	# registration, so a retry spends nothing.
 	TRIES=0
 	while :; do
-		RC=0
+		RC=0 WHY=""
 		OUT=$(curl -sSL --max-time 300 -w '%{http_code} %{size_download}' "$URL" -o "$TMP") || RC=$?
 		CODE=${OUT% *} GOT=${OUT#* }
 		case "$RC:$CODE:$GOT" in
 		0:503:*) WHY="the hub is busy relaying to other machines" ;;
-		18:*:0 | 35:*:0 | 52:*:0 | 55:*:0 | 56:*:0) WHY="the connection to the hub was cut" ;;
+		16:*:0 | 18:*:0 | 35:*:0 | 52:*:0 | 55:*:0 | 56:*:0 | 92:*:0) WHY="the connection to the hub was cut" ;;
 		*) break ;;
 		esac
 		[ "$TRIES" -lt 5 ] || break
@@ -294,7 +296,11 @@ else
 		sleep 5
 	done
 	if [ "$RC" != 0 ]; then
-		[ "$GOT" = 0 ] || echo "the download broke off after $GOT bytes; if the link to the hub stays this slow, upload the agent to this machine and rerun with --binary FILE" >&2
+		# Cut on every try, or broken off after the body began.
+		case "$RC:$CODE:${WHY:+cut}" in
+		*:cut | 16:200: | 18:200: | 28:200: | 56:200: | 92:200:)
+			echo "the link to the hub did not carry the download; upload monitor-agent-$ARCH-unknown-linux-musl from the agent's latest release to this machine and rerun with --binary FILE" >&2 ;;
+		esac
 		exit 1
 	fi
 	[ "$CODE" = 200 ] ||
@@ -306,6 +312,12 @@ fi
 # on bytes that cannot start while this script reports success.
 [ "$(head -c 4 "$TMP")" = "$(printf '\177ELF')" ] ||
 	{ echo "${BINARY:-the download} is not a Linux executable: $(head -n 1 "$TMP" | tr -cd '[:print:]' | cut -c1-200)" >&2; exit 1; }
+# e_machine, as the hub checks what it relays: a file uploaded for the other
+# architecture is refused here, before a key is spent or the old agent stops.
+case "$ARCH:$(od -An -tu2 -j18 -N2 "$TMP" | tr -d ' ')" in
+x86_64:62 | aarch64:183) ;;
+*) echo "${BINARY:-the download} is not built for $ARCH; use monitor-agent-$ARCH-unknown-linux-musl" >&2; exit 1 ;;
+esac
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
