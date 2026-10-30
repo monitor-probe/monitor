@@ -1132,12 +1132,13 @@ impl Db {
         let tx = conn.transaction()?;
         let id = next_id(&tx, "node")?;
         tx.execute(
-            // A new node belongs at the end. The caller sends sort 0, which would
-            // tie with whatever the last reorder placed first.
+            // A new node goes first, where the one who just added it looks. The
+            // caller sends sort 0, which would tie with whatever the last reorder
+            // placed first.
             "INSERT INTO node (id, name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
                                group_name)
-             VALUES (?14,?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?14,?1,?2,(SELECT COALESCE(MIN(sort),1)-1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -2035,7 +2036,7 @@ impl Db {
             }
             t.id
         } else {
-            // At the end, as in `create_node`.
+            // At the end.
             let id = next_id(&tx, "ping_task")?;
             tx.execute(
                 "INSERT INTO ping_task (id, name, target, interval, auto_join, sort)
@@ -3839,10 +3840,10 @@ mod tests {
         assert!(db.reorder_nodes(&[a, b]).is_err(), "a node left out");
         assert!(db.reorder_nodes(&[a, b, 9999]).is_err(), "an id that is not a node");
         assert_eq!(order(), vec![c, a, b]);
-        // A node added afterwards goes to the end rather than wherever sort 0
+        // A node added afterwards goes first rather than wherever sort 0
         // places it.
         let d = node(&db, 1);
-        assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b, d]);
+        assert_eq!(order(), vec![d, c, a, b]);
     }
 
     /// Themes draw probes in the order they first appear in the rows, so the rows

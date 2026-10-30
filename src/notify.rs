@@ -769,7 +769,7 @@ mod tests {
         let notes = sweep(&app, &mut watch, now + 210).unwrap();
         assert_eq!(notes.len(), 1, "two nodes down in one sweep are one alert");
         assert_eq!(notes[0].title, "🔴 2 台节点离线");
-        assert_eq!(notes[0].node, "a, b", "not the opted-out node, nor one back within the grace period");
+        assert_eq!(notes[0].node, "b, a", "not the opted-out node, nor one back within the grace period");
         assert!(sweep(&app, &mut watch, now + 240).unwrap().is_empty(), "announced once");
 
         // A restart forgets nothing that was announced: the state is in the row.
