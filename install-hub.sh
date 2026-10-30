@@ -279,7 +279,10 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_UNIX is what if_nametoindex(3) opens to read a nameserver such as
+# fe80::1%wlan0 in resolv.conf; without it musl skips that nameserver, and when
+# it is the only one every lookup fails with "Try again".
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 MemoryMax=256M
 
 [Install]
