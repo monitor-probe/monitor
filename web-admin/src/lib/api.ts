@@ -47,6 +47,8 @@ export type Node = {
   currency: string
   billing_cycle: string
   expires_at: string | null
+  /** Days left on the hub's calendar; negative once past. */
+  expires_in: number | null
   traffic_limit: number
   traffic_mode: string
   traffic_reset_day: number
@@ -92,6 +94,21 @@ export type PingTask = { id: number; name: string; target: string; interval: num
 /** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
 export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
   return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]
+}
+
+/**
+ * By group name, the ungrouped last, then by name within each group; numbers
+ * by value ("HK-2" before "HK-10"), names starting in Chinese after the rest
+ * and by pinyin, whatever the browser's language (the zh-CN collation alone
+ * would put them before Latin). The result does not depend on the order it
+ * starts from, so sorting twice gives the same list.
+ */
+export function byName<T extends Pick<Node, "name" | "group">>(nodes: T[]): T[] {
+  const collator = new Intl.Collator("zh-CN", { numeric: true })
+  const han = (s: string) => Number(/^\p{Script=Han}/u.test(s))
+  const compare = (a = "", b = "") => han(a) - han(b) || collator.compare(a, b)
+  return [...nodes].sort((a, b) =>
+    Number(!a.group) - Number(!b.group) || compare(a.group, b.group) || compare(a.name, b.name))
 }
 
 /** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */
