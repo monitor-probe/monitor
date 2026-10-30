@@ -1649,7 +1649,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [grouping, setGrouping] = useState(false)
   const [sorting, setSorting] = useState(false)
   // A row to bring into view once the list shows it: a new node, which lands
-  // last, a hundred rows down on a large fleet; or the one whose handle was
+  // first while the list may be scrolled far down; or the one whose handle was
   // pressed under a filter, once the filter is cleared. A filter hiding it
   // cancels the scroll rather than leaving one to fire when it is cleared.
   const reveal = useRef<number | null>(null)
