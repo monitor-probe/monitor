@@ -1132,12 +1132,13 @@ impl Db {
         let tx = conn.transaction()?;
         let id = next_id(&tx, "node")?;
         tx.execute(
-            // A new node belongs at the end. The caller sends sort 0, which would
-            // tie with whatever the last reorder placed first.
+            // A new node goes first, where the one who just added it looks. The
+            // caller sends sort 0, which would tie with whatever the last reorder
+            // placed first.
             "INSERT INTO node (id, name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
                                group_name)
-             VALUES (?14,?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?14,?1,?2,(SELECT COALESCE(MIN(sort),1)-1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -1202,6 +1203,9 @@ impl Db {
     pub fn update_nodes(&self, ids: &[i64], n: &NodePatch) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some(group) = n.group.as_deref().filter(|g| !g.is_empty()) {
+            Self::gather_into_group(&tx, ids, group)?;
+        }
         {
             let mut update = tx.prepare(
                 "UPDATE node SET name=COALESCE(?2,name), public=COALESCE(?3,public),
@@ -1247,6 +1251,33 @@ impl Db {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Moves nodes about to enter `group` behind its last member, or to the end of
+    /// the list when it has none. Themes order groups by first appearance, so a
+    /// node entering from elsewhere in the list would otherwise drag its group's
+    /// tab along. A whole group taking a new name stays where it is.
+    fn gather_into_group(tx: &rusqlite::Transaction, ids: &[i64], group: &str) -> Result<()> {
+        let list = tx
+            .prepare("SELECT id, group_name FROM node ORDER BY sort, id")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let (entering, mut rest): (Vec<_>, Vec<_>) =
+            list.into_iter().partition(|(id, from)| ids.contains(id) && from != group);
+        let Some((_, first)) = entering.first() else { return Ok(()) };
+        let renamed = !first.is_empty()
+            && entering.iter().all(|(_, from)| from == first)
+            && !rest.iter().any(|(_, g)| g == first || g == group);
+        if renamed {
+            return Ok(());
+        }
+        let at = rest.iter().rposition(|(_, g)| g == group).map_or(rest.len(), |last| last + 1);
+        rest.splice(at..at, entering);
+        let mut update = tx.prepare("UPDATE node SET sort=?2 WHERE id=?1")?;
+        for (sort, (id, _)) in rest.iter().enumerate() {
+            update.execute(params![id, sort as i64])?;
+        }
+        Ok(())
     }
 
     pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
@@ -2035,7 +2066,7 @@ impl Db {
             }
             t.id
         } else {
-            // At the end, as in `create_node`.
+            // At the end.
             let id = next_id(&tx, "ping_task")?;
             tx.execute(
                 "INSERT INTO ping_task (id, name, target, interval, auto_join, sort)
@@ -3839,10 +3870,63 @@ mod tests {
         assert!(db.reorder_nodes(&[a, b]).is_err(), "a node left out");
         assert!(db.reorder_nodes(&[a, b, 9999]).is_err(), "an id that is not a node");
         assert_eq!(order(), vec![c, a, b]);
-        // A node added afterwards goes to the end rather than wherever sort 0
+        // A node added afterwards goes first rather than wherever sort 0
         // places it.
         let d = node(&db, 1);
-        assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b, d]);
+        assert_eq!(order(), vec![d, c, a, b]);
+    }
+
+    #[test]
+    fn a_node_entering_a_group_joins_its_block_and_leaves_the_group_order_alone() {
+        let db = db();
+        let ids: Vec<i64> = (0..6).map(|_| node(&db, 1)).collect();
+        let [hk1, hk2, jp, us, x, y] = ids[..] else { unreachable!() };
+        db.reorder_nodes(&ids).unwrap();
+        let group = |ids: &[i64], name: &str| {
+            let patch = NodePatch { group: Some(name.into()), ..Default::default() };
+            assert!(db.update_nodes(ids, &patch).unwrap());
+        };
+        let order = || db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>();
+        group(&[hk1, hk2], "港");
+        group(&[jp], "日");
+        group(&[us], "美");
+        assert_eq!(
+            order(),
+            vec![x, y, hk1, hk2, jp, us],
+            "a new group starts at the end, so its tab comes last"
+        );
+        db.reorder_nodes(&ids).unwrap();
+
+        // A new node from the top of the list, and two at once in list order.
+        let n = node(&db, 1);
+        assert_eq!(order()[0], n);
+        group(&[n], "港");
+        assert_eq!(order(), vec![hk1, hk2, n, jp, us, x, y]);
+        group(&[y, x], "日");
+        assert_eq!(order(), vec![hk1, hk2, n, jp, x, y, us]);
+
+        // Already in it, or a patch not touching the group: nothing moves.
+        db.reorder_nodes(&[n, hk1, hk2, jp, x, y, us]).unwrap();
+        group(&[n], "港");
+        let name = NodePatch { name: Some("m".into()), ..Default::default() };
+        assert!(db.update_node(n, &name).unwrap());
+        assert_eq!(order()[0], n);
+
+        // A whole group renamed keeps its place; part of one starts a new group
+        // at the end, so its tab comes last.
+        group(&[jp, x, y], "东京");
+        assert_eq!(order(), vec![n, hk1, hk2, jp, x, y, us]);
+        group(&[hk1], "澳");
+        assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+        // Leaving every group moves nothing.
+        group(&[jp], "");
+        assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+        // An unknown id still rolls the whole patch back, the move included.
+        let patch = NodePatch { group: Some("港".into()), ..Default::default() };
+        assert!(!db.update_nodes(&[us, 9999], &patch).unwrap());
+        assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
     }
 
     /// Themes draw probes in the order they first appear in the rows, so the rows
