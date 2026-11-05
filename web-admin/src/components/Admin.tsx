@@ -785,7 +785,7 @@ function GroupInput({ nodes, value, onChange }: {
 // of any. Renaming or dissolving a group is the same act: filter the picker to
 // it, tick all, then type the new name or clear it. One request, applied to all
 // of them or none.
-function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: () => void }) {
+function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: (id: number, group: string) => void }) {
   const [name, setName] = useState("")
   const [chosen, setChosen] = useState<Set<number>>(new Set())
   const [saving, setSaving] = useState(false)
@@ -808,7 +808,7 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
       await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { group } }) })
       toast.success(group ? `已把 ${ids.length} 台设为「${group}」` : `已把 ${ids.length} 台移出分组`)
       onClose()
-      onSaved()
+      onSaved(ids[0], group)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -921,7 +921,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
   node: Node
   nodes: Node[]
   onClose: () => void
-  onSaved: () => void
+  onSaved: (group?: string) => void
 }) {
   const [form, setForm] = useState(node)
   const [limitGib, setLimitGib] = useState(String(node.traffic_limit / GIB || ""))
@@ -976,7 +976,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
       }
       toast.success("节点设置已保存")
       onClose()
-      onSaved()
+      onSaved(patch.group)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -1680,10 +1680,11 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [grouping, setGrouping] = useState(false)
   const [sorting, setSorting] = useState(false)
   // A row to bring into view once the list shows it: a new node, which lands
-  // first while the list may be scrolled far down; or the one whose handle was
-  // pressed under a filter, once the filter is cleared. A filter hiding it
-  // cancels the scroll rather than leaving one to fire when it is cleared.
-  const reveal = useRef<number | null>(null)
+  // first while the list may be scrolled far down; one that joined a group, which
+  // the hub moved to the group's rows, once the list carries the move; or the one
+  // whose handle was pressed under a filter, once the filter is cleared. A filter
+  // hiding it cancels the scroll rather than leaving one to fire when it is cleared.
+  const reveal = useRef<{ id: number; group?: string } | null>(null)
   const drag = useDragOrder(nodes, "nodes", refresh)
   // For an undo pressed long after the render that offered it.
   const latest = useRef(drag.order)
@@ -1695,8 +1696,11 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const picked = attention.find((a) => a.key === status)
   const visible = picked?.rows ?? found
   useEffect(() => {
-    if (reveal.current === null || !nodes.some((n) => n.id === reveal.current)) return
-    document.querySelector(`tbody tr[data-id="${reveal.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
+    if (!reveal.current) return
+    const { id, group: joined } = reveal.current
+    const node = nodes.find((n) => n.id === id)
+    if (!node || (joined !== undefined && node.group !== joined)) return
+    document.querySelector(`tbody tr[data-id="${id}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
     reveal.current = null
   })
   const searching = query.trim() !== "" || group !== "all" || status !== "all"
@@ -1745,8 +1749,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   function hintLocked(id: number) {
     toast("筛选时不能拖动排序", {
       id: "drag-locked",
-      action: { label: "清除筛选", onClick: () => { reveal.current = id; setQuery(""); setGroup("all"); setStatus("all") } },
+      action: { label: "清除筛选", onClick: () => { reveal.current = { id }; setQuery(""); setGroup("all"); setStatus("all") } },
     })
+  }
+
+  function followGroup(id: number, group?: string) {
+    if (group) reveal.current = { id, group }
+    refresh()
   }
 
   // Confirmed first, since it replaces an order that may have taken many
@@ -1961,7 +1970,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {creating && (
         <CreateNode
           onClose={() => setCreating(false)}
-          onSaved={(id) => { reveal.current = id; refresh() }}
+          onSaved={(id) => { reveal.current = { id }; refresh() }}
         />
       )}
       {editing && (
@@ -1969,7 +1978,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           node={editing}
           nodes={nodes}
           onClose={() => setEditing(null)}
-          onSaved={refresh}
+          onSaved={(group) => followGroup(editing.id, group)}
         />
       )}
       {sorting && (
@@ -1981,7 +1990,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           onConfirm={sortByName}
         />
       )}
-      {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={refresh} />}
+      {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={followGroup} />}
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
