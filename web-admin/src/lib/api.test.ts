@@ -144,3 +144,9 @@ const named = [
 for (const start of [named, [...named].reverse()]) {
   assert.deepEqual(byName(start).map((n) => n.name), ["JP-1", "HK-2", "HK-10", "香港 · 甲", "alpha", "solo", "备用机"])
 }
+
+// Groups the numeric collation calls equal stay apart.
+const close = [{ name: "b", group: "G1" }, { name: "a", group: "G01" }, { name: "c", group: "G01" }]
+for (const start of [close, [...close].reverse()]) {
+  assert.deepEqual(byName(start).map((n) => n.name), ["a", "c", "b"])
+}

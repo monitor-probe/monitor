@@ -74,7 +74,9 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
 
   // Once the hub lists this order, its list is followed again, so a reorder made
   // in another tab appears here instead of being overwritten by the next drag.
-  if (dragging === null && manualOrder.length && manualOrder.join() === items.map((item) => item.id).join()) {
+  // Rows added or deleted meanwhile do not count: the hub's list places them.
+  if (dragging === null && manualOrder.length
+    && manualOrder.filter((id) => byId.has(id)).join() === items.filter((item) => orderedIds.has(item.id)).map((item) => item.id).join()) {
     setManualOrder([])
   }
 
@@ -183,9 +185,8 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
 
   // The whole order at once, as sorting it or undoing a sort sets it.
   function arrange(next: number[], rows: HTMLTableSectionElement | null) {
-    body.current = rows
     slide(rows, () => setManualOrder(next))
-    commit(next)
+    return commit(next)
   }
 
   function commit(next: number[]) {
@@ -193,11 +194,17 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
     // A refusal falls back to whatever the hub holds, which a save queued
     // behind it may still change.
-    saving.current = saving.current.then(put).then(reload, (e: Error) => {
+    const saved = saving.current.then(put).then(() => {
+      reload()
+      return true
+    }, (e: Error) => {
       setManualOrder([])
       reload()
       toast.error(e.message)
+      return false
     })
+    saving.current = saved
+    return saved
   }
 
   return {
@@ -213,7 +220,7 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     }),
     handle: (id: number) => ({
       onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
-        if (e.currentTarget.disabled || dragging !== null || e.button !== 0) return
+        if (dragging !== null || e.button !== 0) return
         orderBeforeDrag.current = ids()
         body.current = e.currentTarget.closest("tbody")!
         // Captured by the rows' container, which stays put: the handle's row
@@ -250,6 +257,29 @@ function DragHandle({ name, disabled, title = "拖动排序", ...events }: React
     >
       <GripVertical className="size-4" />
     </button>
+  )
+}
+
+function Segments<K extends string>({ label, options, value, onPick }: {
+  label: string
+  options: { key: K; label: React.ReactNode }[]
+  value: K
+  onPick: (key: K) => void
+}) {
+  return (
+    <div role="group" aria-label={label} className="flex w-fit max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.key}
+          type="button"
+          aria-pressed={value === o.key}
+          onClick={() => onPick(o.key)}
+          className={`rounded-md px-3 py-1 text-sm transition-colors ${value === o.key ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
   )
 }
 
@@ -1613,11 +1643,9 @@ function nameText(name: string) {
     })
 }
 
-// Traffic turns a subdued orange at the alert threshold and a subdued red once
-// the allowance is used up, so the table agrees with the alerts. With alerts
-// off, the threshold's default of 80 % still marks a node running short.
 // Quick filters over the node list, each gathering the rows already marked for
-// it: the traffic tint, and the window the expiry reminder covers.
+// it: the traffic tint, and the window the expiry reminder covers plus any date
+// already past, which needs renewing all the more.
 const ATTENTION: [key: string, label: string, test: (n: Node, warnAt: number, expiryDays: number) => boolean][] = [
   ["offline", "离线", (n) => !n.online],
   ["traffic", "流量预警", (n, warnAt) => trafficTone(n, warnAt) !== ""],
@@ -1625,6 +1653,9 @@ const ATTENTION: [key: string, label: string, test: (n: Node, warnAt: number, ex
   ["private", "不公开", (n) => !n.public],
 ]
 
+// Traffic turns a subdued orange at the alert threshold and a subdued red once
+// the allowance is used up, so the table agrees with the alerts. With alerts
+// off, the threshold's default of 80 % still marks a node running short.
 function trafficTone(n: Node, warnAt: number) {
   if (n.traffic_limit <= 0) return ""
   if (n.month_used >= n.traffic_limit) return "text-over"
@@ -1654,6 +1685,9 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   // cancels the scroll rather than leaving one to fire when it is cleared.
   const reveal = useRef<number | null>(null)
   const drag = useDragOrder(nodes, "nodes", refresh)
+  // For an undo pressed long after the render that offered it.
+  const latest = useRef(drag.order)
+  useEffect(() => { latest.current = drag.order })
   // Counted within the search and the group, so each count is what its filter
   // would then show.
   const found = inGroup(searchNodes(drag.order, query), group)
@@ -1684,11 +1718,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     }
   }
   const frozen = searching ? layout : null
-  // A resize lays the page out afresh: the shares were taken at another width,
-  // and the narrowed rows are left to size the columns.
+  // A new width lays the page out afresh: the shares were taken at another, and
+  // the narrowed rows are left to size the columns. A phone's address bar
+  // collapsing resizes only the height.
   useEffect(() => {
     if (!frozen) return
-    const thaw = () => setLayout(null)
+    const width = innerWidth
+    const thaw = () => innerWidth !== width && setLayout(null)
     addEventListener("resize", thaw)
     return () => removeEventListener("resize", thaw)
   }, [frozen])
@@ -1699,8 +1735,12 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   // move one. A press says why and offers the way out, which a disabled
   // button would not: it takes no press, and a touch screen shows no title.
   const locked = (id: number) => ({
-    onPointerDown: () => hintLocked(id),
-    onKeyDown: (e: React.KeyboardEvent) => (e.key === "ArrowUp" || e.key === "ArrowDown") && hintLocked(id),
+    onPointerDown: (e: React.PointerEvent) => e.button === 0 && hintLocked(id),
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return
+      e.preventDefault()
+      hintLocked(id)
+    },
   })
   function hintLocked(id: number) {
     toast("筛选时不能拖动排序", {
@@ -1711,12 +1751,18 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
 
   // Confirmed first, since it replaces an order that may have taken many
   // drags; the toast then keeps an undo long enough to think it over.
-  function sortByName() {
+  async function sortByName() {
     setSorting(false)
     const rows = head.current!.closest("table")!.tBodies[0]
     const before = drag.order.map((n) => n.id)
-    drag.arrange(byName(drag.order).map((n) => n.id), rows)
-    toast.success("已按名称排序", { duration: 15_000, action: { label: "撤销", onClick: () => drag.arrange(before, rows) } })
+    if (!await drag.arrange(byName(drag.order).map((n) => n.id), rows)) return
+    // Against the list as it is by then, which the hub requires in full: a node
+    // added since goes first, where the hub placed it.
+    const undo = () => {
+      const now = latest.current.map((n) => n.id)
+      drag.arrange([...now.filter((id) => !before.includes(id)), ...before.filter((id) => now.includes(id))], rows)
+    }
+    toast.success("已按名称排序", { duration: 15_000, action: { label: "撤销", onClick: undo } })
   }
 
   async function remove() {
@@ -1760,21 +1806,14 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           when its count drops to zero, so the list does not change under the
           reader. */}
       {nodes.length > 0 && (
-        <div role="group" aria-label="按状态筛选" className="flex w-fit max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
-          {[{ key: "all", label: "全部", rows: found }, ...attention]
+        <Segments
+          label="按状态筛选"
+          value={status}
+          onPick={(key) => narrow(setStatus)(status === key ? "all" : key)}
+          options={[{ key: "all", label: "全部", rows: found }, ...attention]
             .filter((a) => a.key === "all" || a.key === status || a.rows.length)
-            .map((a) => (
-              <button
-                key={a.key}
-                type="button"
-                aria-pressed={status === a.key}
-                onClick={() => narrow(setStatus)(status === a.key ? "all" : a.key)}
-                className={`rounded-md px-3 py-1 text-sm transition-colors ${status === a.key ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
-              >
-                {a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span>
-              </button>
-            ))}
-        </div>
+            .map((a) => ({ key: a.key, label: <>{a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span></> }))}
+        />
       )}
 
       <Card className="overflow-x-auto p-0">
@@ -2263,18 +2302,12 @@ function Ping({ nodes }: { nodes: Node[] }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-2">
-        <div role="group" aria-label="视图" className="inline-flex rounded-lg bg-muted p-0.5">
-          {(["task", "node"] as const).map((v) => (
-            <button
-              key={v}
-              aria-pressed={view === v}
-              onClick={() => setView(v)}
-              className={`rounded-md px-3 py-1 text-sm transition-colors ${view === v ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
-            >
-              {v === "task" ? "按监控" : "按节点"}
-            </button>
-          ))}
-        </div>
+        <Segments
+          label="视图"
+          value={view}
+          onPick={setView}
+          options={[{ key: "task", label: "按监控" }, { key: "node", label: "按节点" }]}
+        />
         <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: nodes.map((n) => n.id), auto_join: true })}>
           <Plus /> 添加监控
         </Button>

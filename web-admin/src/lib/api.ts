@@ -106,7 +106,9 @@ export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
 export function byName<T extends Pick<Node, "name" | "group">>(nodes: T[]): T[] {
   const collator = new Intl.Collator("zh-CN", { numeric: true })
   const han = (s: string) => Number(/^\p{Script=Han}/u.test(s))
-  const compare = (a = "", b = "") => han(a) - han(b) || collator.compare(a, b)
+  // Spelled apart last: numeric collation calls "G01" and "G1" equal, and two
+  // groups must not mix.
+  const compare = (a = "", b = "") => han(a) - han(b) || collator.compare(a, b) || Number(a > b) - Number(a < b)
   return [...nodes].sort((a, b) =>
     Number(!a.group) - Number(!b.group) || compare(a.group, b.group) || compare(a.name, b.name))
 }
