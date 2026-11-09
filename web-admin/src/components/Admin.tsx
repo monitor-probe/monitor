@@ -1680,10 +1680,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [grouping, setGrouping] = useState(false)
   const [sorting, setSorting] = useState(false)
   // A row to bring into view once the list shows it: a new node, which lands
-  // first while the list may be scrolled far down; one that joined a group, which
-  // the hub moved to the group's rows, once the list carries the move; or the one
-  // whose handle was pressed under a filter, once the filter is cleared. A filter
-  // hiding it cancels the scroll rather than leaving one to fire when it is cleared.
+  // first while the list may be scrolled far down; or one that joined a group,
+  // which the hub moved to the group's rows, once the list carries the move. A
+  // filter hiding it cancels the scroll rather than leaving one to fire when it
+  // is cleared.
   const reveal = useRef<{ id: number; group?: string } | null>(null)
   const drag = useDragOrder(nodes, "nodes", refresh)
   // For an undo pressed long after the render that offered it.
@@ -1694,6 +1694,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const found = inGroup(searchNodes(drag.order, query), group)
   const attention = ATTENTION.map(([key, label, test]) => ({ key, label, rows: found.filter((n) => test(n, warnAt, expiryDays)) }))
   const picked = attention.find((a) => a.key === status)
+  const showChips = status !== "all" || ATTENTION.some(([, , test]) => nodes.some((n) => test(n, warnAt, expiryDays)))
+  const chips = attention
+    .filter((a) => a.key === status || a.rows.length)
+    .map((a) => ({ key: a.key, label: <>{a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span></> }))
   const visible = picked?.rows ?? found
   useEffect(() => {
     if (!reveal.current) return
@@ -1738,18 +1742,18 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   // Under a filter the rows on screen are not the order, so a handle cannot
   // move one. A press says why and offers the way out, which a disabled
   // button would not: it takes no press, and a touch screen shows no title.
-  const locked = (id: number) => ({
-    onPointerDown: (e: React.PointerEvent) => e.button === 0 && hintLocked(id),
+  const locked = {
+    onPointerDown: (e: React.PointerEvent) => e.button === 0 && hintLocked(),
     onKeyDown: (e: React.KeyboardEvent) => {
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return
       e.preventDefault()
-      hintLocked(id)
+      hintLocked()
     },
-  })
-  function hintLocked(id: number) {
+  }
+  function hintLocked() {
     toast("筛选时不能拖动排序", {
       id: "drag-locked",
-      action: { label: "清除筛选", onClick: () => { reveal.current = { id }; setQuery(""); setGroup("all"); setStatus("all") } },
+      action: { label: "清除筛选", onClick: () => { scrollTo(0, 0); setQuery(""); setGroup("all"); setStatus("all") } },
     })
   }
 
@@ -1793,10 +1797,21 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     <div className="space-y-4">
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <div className="mr-auto flex w-full gap-2 sm:w-auto">
-          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={narrow(setQuery)} />
+        <div className={`mr-auto flex w-full gap-2 sm:w-auto ${showChips ? "xl:mr-0" : ""}`}>
+          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none xl:w-48" value={query} onChange={narrow(setQuery)} />
           <GroupFilter nodes={nodes} value={group} onChange={narrow(setGroup)} className="w-32" />
         </div>
+        {/* In the toolbar from xl up, so a filter appearing does not move the
+            table. A filter with nothing to show is left out unless picked: the
+            row then reads at a glance whether anything needs attention. Picked,
+            it stays when its count drops to zero, so the list does not change
+            under the reader. The slot is decided on the whole list, so searching
+            or switching group does not move the toolbar or the table. */}
+        {showChips && (
+          <div className="order-last min-h-8 w-full xl:order-none xl:mr-auto xl:w-auto">
+            {chips.length > 0 && <Segments label="按状态筛选" value={status} onPick={(key) => narrow(setStatus)(status === key ? "all" : key)} options={chips} />}
+          </div>
+        )}
         <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
           <Layers /> 分组
         </Button>
@@ -1809,21 +1824,6 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           <Plus /> 添加节点
         </Button>
       </div>
-
-      {/* A filter with nothing to show is left out unless picked: the row then
-          reads at a glance whether anything needs attention. Picked, it stays
-          when its count drops to zero, so the list does not change under the
-          reader. */}
-      {nodes.length > 0 && (
-        <Segments
-          label="按状态筛选"
-          value={status}
-          onPick={(key) => narrow(setStatus)(status === key ? "all" : key)}
-          options={[{ key: "all", label: "全部", rows: found }, ...attention]
-            .filter((a) => a.key === "all" || a.key === status || a.rows.length)
-            .map((a) => ({ key: a.key, label: <>{a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span></> }))}
-        />
-      )}
 
       <Card className="overflow-x-auto p-0">
         <Table className={frozen ? "table-fixed" : ""} style={frozen ? { minWidth: frozen.width } : undefined}>
@@ -1867,7 +1867,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 <TableCell className="whitespace-normal">
                   <div className="flex items-center gap-2">
                     <DragHandle
-                      {...(searching ? locked(n.id) : drag.handle(n.id))}
+                      {...(searching ? locked : drag.handle(n.id))}
                       name={n.name}
                       disabled={searching}
                       title={searching ? "清空搜索和筛选后可拖动排序" : undefined}
