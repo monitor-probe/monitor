@@ -15,7 +15,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
-import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
+import { addMonths, bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
@@ -487,18 +487,20 @@ function Command({ className = "", children }: { className?: string; children: R
   )
 }
 
-function Field({ label, hint, help, helpWidth, className = "", children }: {
+function Field({ label, hint, help, helpWidth, action, className = "", children }: {
   label: string
   hint?: string
   help?: React.ReactNode
   helpWidth?: string
+  action?: React.ReactNode
   className?: string
   children: React.ReactNode
 }) {
   const title = <Label className="text-sm font-medium">{label}</Label>
+  const head = help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title
   return (
     <div className={`space-y-2 ${className}`}>
-      {help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title}
+      {action ? <div className="flex items-center justify-between">{head}{action}</div> : head}
       {children}
       {/* Kept whole between punctuation, as in Help below. */}
       {hint && <p className="text-xs leading-relaxed text-muted-foreground break-keep wrap-anywhere">{hint}</p>}
@@ -1083,12 +1085,15 @@ function BillingForm({ node, onClose, onSaved }: {
   const [unit, setUnit] = useState(months === 0 ? "once" : months % 12 ? "months" : "years")
   const [count, setCount] = useState(String(months % 12 ? months : months / 12 || 1))
   const [saving, setSaving] = useState(false)
+  const [renewals, setRenewals] = useState(0)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
+  const length = Number(count) * (unit === "years" ? 12 : 1)
+  const renewable = unit !== "once" && Number.isInteger(length) && length > 0 && !!form.expires_at
 
   async function save() {
     // The hub refuses a length out of range and stores a named one by name, so
     // an unchanged length is compared in months, not in spelling.
-    const cycle = unit === "once" ? "once" : `${Number(count) * (unit === "years" ? 12 : 1)}m`
+    const cycle = unit === "once" ? "once" : `${length}m`
     setSaving(true)
     try {
       await api(`/nodes/${node.id}`, {
@@ -1158,16 +1163,17 @@ function BillingForm({ node, onClose, onSaved }: {
                 />
               </Field>
             </div>
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid gap-x-4 gap-y-5 sm:grid-cols-2">
               <Field label="付款周期">
-                <div className="flex gap-2">
+                {/* On a phone the two controls sit under the price and currency columns. */}
+                <div className="flex gap-4 sm:gap-2">
                   {unit !== "once" && (
                     <Input
                       type="number"
                       min="1"
                       step="1"
                       aria-label="周期长度"
-                      className="w-16"
+                      className="w-0 flex-1 sm:w-16 sm:flex-none"
                       value={count}
                       onChange={(e) => setCount(e.target.value)}
                     />
@@ -1182,8 +1188,37 @@ function BillingForm({ node, onClose, onSaved }: {
                   </Select>
                 </div>
               </Field>
-              <Field label="到期时间">
-                <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
+              <Field
+                label="到期时间"
+                action={renewable && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="xs"
+                    className="-my-1"
+                    title="提前续费后点这里，到期时间往后加一个付款周期，保存后生效"
+                    onClick={() => {
+                      set("expires_at", addMonths(form.expires_at!, length))
+                      setRenewals((n) => n + 1)
+                    }}
+                  >
+                    续期
+                  </Button>
+                )}
+              >
+                <div className="relative">
+                  <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
+                  {/* Keyed by the count so that every click replays the animation. */}
+                  {renewals > 0 && (
+                    <span
+                      key={renewals}
+                      aria-hidden
+                      className="pointer-events-none absolute -top-4 left-1/2 text-sm font-semibold text-primary animate-[renewed_900ms_ease-out_forwards] motion-reduce:hidden"
+                    >
+                      +1
+                    </span>
+                  )}
+                </div>
               </Field>
             </div>
           </div>
