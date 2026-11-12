@@ -443,7 +443,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
  * weighs. The hub accepts up to 8 MiB per request, so this can change without
  * touching the server or negotiating first.
  */
-const CHUNK = 4 * 1024 * 1024
+export const CHUNK = 4 * 1024 * 1024
 
 /**
  * Uploads a file one chunk at a time. There is no upload id: the hub tracks an

@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection, upload, CHUNK } from "./api.ts"
 import { addMonths } from "./format.ts"
 
 // The same results as the hub's roll-over, which uses chrono's checked_add_months.
@@ -163,4 +163,21 @@ for (const start of [close, [...close].reverse()]) {
 const twins = [{ id: 2, name: "备用机" }, { id: 1, name: "备用机" }]
 for (const start of [twins, [...twins].reverse()]) {
   assert.deepEqual(byName(start).map((n) => n.id), [1, 2])
+}
+
+// Every chunk but the last can be aborted. Once the last lands the hub applies
+// it whether or not anyone waits, so an abort there would report a database
+// that was replaced as one that was not.
+{
+  const signals: (AbortSignal | null | undefined)[] = []
+  globalThis.fetch = async (_: RequestInfo | URL, init?: RequestInit) => {
+    signals.push(init?.signal)
+    return new Response("{}", { headers: { "content-type": "application/json" } })
+  }
+  const abort = new AbortController()
+  await upload("/db/restore", new File([new Uint8Array(2 * CHUNK + 1)], "b.db"), undefined, abort.signal)
+  assert.deepEqual(signals, [abort.signal, abort.signal, undefined])
+  signals.length = 0
+  await upload("/db/restore", new File([new Uint8Array(CHUNK)], "b.db"), undefined, abort.signal)
+  assert.deepEqual(signals, [undefined])
 }
