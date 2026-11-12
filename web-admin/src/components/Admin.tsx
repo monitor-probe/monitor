@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, CHUNK, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { addMonths, bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -78,6 +78,53 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
   if (dragging === null && manualOrder.length
     && manualOrder.filter((id) => byId.has(id)).join() === items.filter((item) => orderedIds.has(item.id)).map((item) => item.id).join()) {
     setManualOrder([])
+  }
+
+  function move(id: number, to: number) {
+    const next = [...ids()]
+    const from = next.indexOf(id)
+    if (from < 0 || to < 0 || to >= next.length || from === to) return
+    next.splice(to, 0, ...next.splice(from, 1))
+    slide(body.current, () => setManualOrder(next))
+    return next
+  }
+
+  // Dropped outside the table or cancelled with Escape: the order is restored.
+  function cancel() {
+    setDragging(null)
+    const before = orderBeforeDrag.current
+    if (before.length) slide(body.current, () => setManualOrder(before))
+  }
+
+  function save(next: number[]) {
+    setDragging(null)
+    const before = orderBeforeDrag.current
+    if (!before.length || next.join() === before.join()) return
+    commit(next)
+  }
+
+  // The whole order at once, as sorting it or undoing a sort sets it.
+  function arrange(next: number[], rows: HTMLTableSectionElement | null) {
+    slide(rows, () => setManualOrder(next))
+    return commit(next)
+  }
+
+  function commit(next: number[]) {
+    orderBeforeDrag.current = next
+    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
+    // A refusal falls back to whatever the hub holds, which a save queued
+    // behind it may still change.
+    const saved = saving.current.then(put).then(() => {
+      reload()
+      return true
+    }, (e: Error) => {
+      setManualOrder([])
+      reload()
+      toast.error(e.message)
+      return false
+    })
+    saving.current = saved
+    return saved
   }
 
   // Handled on the document by layout position, not by the row under the
@@ -159,53 +206,6 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
       delete root.dataset.dragging
     }
   }, [dragging])
-
-  function move(id: number, to: number) {
-    const next = [...ids()]
-    const from = next.indexOf(id)
-    if (from < 0 || to < 0 || to >= next.length || from === to) return
-    next.splice(to, 0, ...next.splice(from, 1))
-    slide(body.current, () => setManualOrder(next))
-    return next
-  }
-
-  // Dropped outside the table or cancelled with Escape: the order is restored.
-  function cancel() {
-    setDragging(null)
-    const before = orderBeforeDrag.current
-    if (before.length) slide(body.current, () => setManualOrder(before))
-  }
-
-  function save(next: number[]) {
-    setDragging(null)
-    const before = orderBeforeDrag.current
-    if (!before.length || next.join() === before.join()) return
-    commit(next)
-  }
-
-  // The whole order at once, as sorting it or undoing a sort sets it.
-  function arrange(next: number[], rows: HTMLTableSectionElement | null) {
-    slide(rows, () => setManualOrder(next))
-    return commit(next)
-  }
-
-  function commit(next: number[]) {
-    orderBeforeDrag.current = next
-    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
-    // A refusal falls back to whatever the hub holds, which a save queued
-    // behind it may still change.
-    const saved = saving.current.then(put).then(() => {
-      reload()
-      return true
-    }, (e: Error) => {
-      setManualOrder([])
-      reload()
-      toast.error(e.message)
-      return false
-    })
-    saving.current = saved
-    return saved
-  }
 
   return {
     order,
@@ -848,17 +848,19 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
   )
 }
 
-function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
+function ConfirmDialog({ title, description, confirmLabel, busy = false, locked = false, onClose, onConfirm, children }: {
   title: string
   description: string
   confirmLabel: string
   busy?: boolean
+  // Past the point where closing could still stop anything.
+  locked?: boolean
   onClose: () => void
   onConfirm: () => void
   children?: React.ReactNode
 }) {
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
+    <Dialog open onOpenChange={(open) => !open && !locked && onClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
@@ -866,7 +868,7 @@ function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose
         </DialogHeader>
         {children}
         <DialogFooter className="border-t pt-4">
-          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button variant="ghost" onClick={onClose} disabled={locked}>取消</Button>
           <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
         </DialogFooter>
       </DialogContent>
@@ -1699,7 +1701,7 @@ function trafficTone(n: Node, warnAt: number) {
 }
 
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
-  const settings = useSettings().s
+  const settings = useSettings(true).s
   const warnAt = Number(settings?.notify_traffic) || 80
   const expiryDays = Number(settings?.notify_expiry) || 7
   const [creating, setCreating] = useState(false)
@@ -2612,8 +2614,15 @@ function Themes() {
   const [repo, setRepo] = useState("")
   const picker = useRef<HTMLInputElement>(null)
 
+  // A failed reload keeps the list on screen; only a failed first load draws it
+  // empty, keeping the install card in reach.
   const load = () =>
-    api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
+    api<{ themes: Theme[] }>("/themes")
+      .then((data) => setThemes(data.themes))
+      .catch((e: Error) => {
+        toast.error(e.message)
+        setThemes((themes) => themes ?? [])
+      })
   useEffect(() => { load() }, [])
 
   async function select(short: string) {
@@ -2860,10 +2869,12 @@ function Themes() {
 
 type Settings = Record<string, string | boolean | number>
 
-// Two pages write settings, and each loads only what it displays.
-function useSettings() {
+// Three pages write settings, and each loads only what it displays. `quiet` is
+// for a reader with defaults to fall back on; on a page that writes them, a
+// failed load leaves the form empty, so it is said.
+function useSettings(quiet = false) {
   const [s, setS] = useState<Settings | null>(null)
-  useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
+  useEffect(() => { api<Settings>("/settings").then(setS).catch((e: Error) => quiet || toast.error(e.message)) }, [quiet])
   return {
     s,
     set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),
@@ -3566,9 +3577,9 @@ function Data() {
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
   const [sent, setSent] = useState(0)
-  // Closing the dialog must stop the upload rather than merely hide it: restore
-  // is the one irreversible action here, and it takes minutes on a large
-  // backup.
+  // Closing the dialog stops the upload rather than merely hiding it: restore is
+  // the one irreversible action here. Once the last chunk is on its way it can
+  // no longer be stopped, and the dialog stays open until the hub answers.
   const abort = useRef<AbortController | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
@@ -3600,8 +3611,8 @@ function Data() {
       // replaced.
       setTimeout(() => location.reload(), 800)
     } catch (e) {
-      // Aborting partway is not a failure: the hub replaces nothing until the
-      // last chunk, so the original database remains.
+      // Aborting before the last chunk is not a failure: the hub replaces
+      // nothing until then, so the original database remains.
       const aborted = (e as Error).name === "AbortError"
       if (aborted) toast.info("已取消，数据库没有改动")
       else toast.error((e as Error).message)
@@ -3610,6 +3621,8 @@ function Data() {
     setPending(null)
   }
 
+  // `sent` counts acknowledged chunks, so the last one is in flight from here on.
+  const applying = busy === "restore" && !!pending && sent + CHUNK >= pending.size
   if (!info) return null
   const stat = (label: string, value: string, className = "") => (
     <div key={label} className={className}>
@@ -3701,8 +3714,9 @@ function Data() {
         <ConfirmDialog
           title="用备份覆盖当前数据？"
           description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的节点、设置和历史全部丢失，且无法撤销。`}
-          confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
+          confirmLabel={busy !== "restore" ? "确认恢复" : applying ? "正在校验并恢复…" : `已上传 ${bytes(sent)} / ${bytes(pending.size)}`}
           busy={!!busy}
+          locked={applying}
           onClose={() => { abort.current?.abort(); setPending(null) }}
           onConfirm={() => restore(pending)}
         />
