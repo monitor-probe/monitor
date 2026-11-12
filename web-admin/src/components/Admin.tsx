@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowDownAZ, ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { addMonths, bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -74,7 +74,9 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
 
   // Once the hub lists this order, its list is followed again, so a reorder made
   // in another tab appears here instead of being overwritten by the next drag.
-  if (dragging === null && manualOrder.length && manualOrder.join() === items.map((item) => item.id).join()) {
+  // Rows added or deleted meanwhile do not count: the hub's list places them.
+  if (dragging === null && manualOrder.length
+    && manualOrder.filter((id) => byId.has(id)).join() === items.filter((item) => orderedIds.has(item.id)).map((item) => item.id).join()) {
     setManualOrder([])
   }
 
@@ -178,19 +180,36 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     setDragging(null)
     const before = orderBeforeDrag.current
     if (!before.length || next.join() === before.join()) return
+    commit(next)
+  }
+
+  // The whole order at once, as sorting it or undoing a sort sets it.
+  function arrange(next: number[], rows: HTMLTableSectionElement | null) {
+    slide(rows, () => setManualOrder(next))
+    return commit(next)
+  }
+
+  function commit(next: number[]) {
     orderBeforeDrag.current = next
     const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
     // A refusal falls back to whatever the hub holds, which a save queued
     // behind it may still change.
-    saving.current = saving.current.then(put).then(reload, (e: Error) => {
+    const saved = saving.current.then(put).then(() => {
+      reload()
+      return true
+    }, (e: Error) => {
       setManualOrder([])
       reload()
       toast.error(e.message)
+      return false
     })
+    saving.current = saved
+    return saved
   }
 
   return {
     order,
+    arrange,
     row: (id: number) => ({
       "data-id": id,
       "data-dragging": dragging === id || undefined,
@@ -201,7 +220,7 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     }),
     handle: (id: number) => ({
       onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
-        if (e.currentTarget.disabled || dragging !== null || e.button !== 0) return
+        if (dragging !== null || e.button !== 0) return
         orderBeforeDrag.current = ids()
         body.current = e.currentTarget.closest("tbody")!
         // Captured by the rows' container, which stays put: the handle's row
@@ -228,15 +247,39 @@ function DragHandle({ name, disabled, title = "拖动排序", ...events }: React
   return (
     <button
       type="button"
-      disabled={disabled}
+      // Not `disabled`: a press on a locked handle is answered by the caller.
+      aria-disabled={disabled}
       // A larger target for a finger, and no text selection from a press.
-      className="cursor-grab touch-none rounded p-1 text-muted-foreground select-none hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent pointer-coarse:p-2"
+      className="cursor-grab touch-none rounded p-1 text-muted-foreground select-none hover:bg-muted hover:text-foreground active:cursor-grabbing aria-disabled:cursor-default aria-disabled:opacity-40 aria-disabled:hover:bg-transparent pointer-coarse:p-2"
       title={title}
       aria-label={`拖动 ${name} 排序`}
       {...events}
     >
       <GripVertical className="size-4" />
     </button>
+  )
+}
+
+function Segments<K extends string>({ label, options, value, onPick }: {
+  label: string
+  options: { key: K; label: React.ReactNode }[]
+  value: K
+  onPick: (key: K) => void
+}) {
+  return (
+    <div role="group" aria-label={label} className="flex w-fit max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.key}
+          type="button"
+          aria-pressed={value === o.key}
+          onClick={() => onPick(o.key)}
+          className={`rounded-md px-3 py-1 text-sm transition-colors ${value === o.key ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
   )
 }
 
@@ -744,7 +787,7 @@ function GroupInput({ nodes, value, onChange }: {
 // of any. Renaming or dissolving a group is the same act: filter the picker to
 // it, tick all, then type the new name or clear it. One request, applied to all
 // of them or none.
-function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: () => void }) {
+function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: (id: number, group: string) => void }) {
   const [name, setName] = useState("")
   const [chosen, setChosen] = useState<Set<number>>(new Set())
   const [saving, setSaving] = useState(false)
@@ -767,7 +810,8 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
       await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { group } }) })
       toast.success(group ? `已把 ${ids.length} 台设为「${group}」` : `已把 ${ids.length} 台移出分组`)
       onClose()
-      onSaved()
+      // The first that moved: one already in the group stays where it was.
+      onSaved(nodes.find((n) => chosen.has(n.id) && n.group !== group)?.id ?? ids[0], group)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -880,7 +924,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
   node: Node
   nodes: Node[]
   onClose: () => void
-  onSaved: () => void
+  onSaved: (group?: string) => void
 }) {
   const [form, setForm] = useState(node)
   const [limitGib, setLimitGib] = useState(String(node.traffic_limit / GIB || ""))
@@ -935,7 +979,7 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
       }
       toast.success("节点设置已保存")
       onClose()
-      onSaved()
+      onSaved(patch.group)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -1635,6 +1679,16 @@ function nameText(name: string) {
     })
 }
 
+// Quick filters over the node list, each gathering the rows already marked for
+// it: the traffic tint, and the window the expiry reminder covers plus any date
+// already past, which needs renewing all the more.
+const ATTENTION: [key: string, label: string, test: (n: Node, warnAt: number, expiryDays: number) => boolean][] = [
+  ["offline", "离线", (n) => !n.online],
+  ["traffic", "流量预警", (n, warnAt) => trafficTone(n, warnAt) !== ""],
+  ["expiring", "即将到期", (n, _, days) => n.expires_in !== null && n.expires_in <= days],
+  ["private", "不公开", (n) => !n.public],
+]
+
 // Traffic turns a subdued orange at the alert threshold and a subdued red once
 // the allowance is used up, so the table agrees with the alerts. With alerts
 // off, the threshold's default of 80 % still marks a node running short.
@@ -1645,7 +1699,9 @@ function trafficTone(n: Node, warnAt: number) {
 }
 
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
-  const warnAt = Number(useSettings().s?.notify_traffic) || 80
+  const settings = useSettings().s
+  const warnAt = Number(settings?.notify_traffic) || 80
+  const expiryDays = Number(settings?.notify_expiry) || 7
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -1656,20 +1712,107 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [removing, setRemoving] = useState(false)
   const [query, setQuery] = useState("")
   const [group, setGroup] = useGroupFilter(nodes)
+  const [status, setStatus] = useState("all")
   const [grouping, setGrouping] = useState(false)
-  // A new node lands last, a hundred rows down on a large fleet, so it is
-  // brought into view once the list carries it. A filter hiding it cancels the
-  // scroll rather than leaving one to fire when the filter is cleared.
-  const added = useRef<number | null>(null)
+  const [sorting, setSorting] = useState(false)
+  // A row to bring into view once the list shows it: a new node, which lands
+  // first while the list may be scrolled far down; or one that joined a group,
+  // which the hub moved to the group's rows, once the list carries the move. A
+  // filter hiding it cancels the scroll rather than leaving one to fire when it
+  // is cleared.
+  const reveal = useRef<{ id: number; group?: string } | null>(null)
   const drag = useDragOrder(nodes, "nodes", refresh)
-  const visible = inGroup(searchNodes(drag.order, query), group)
+  // For an undo pressed long after the render that offered it.
+  const latest = useRef(drag.order)
+  useEffect(() => { latest.current = drag.order })
+  // Counted within the search and the group, so each count is what its filter
+  // would then show.
+  const found = inGroup(searchNodes(drag.order, query), group)
+  const attention = ATTENTION.map(([key, label, test]) => ({ key, label, rows: found.filter((n) => test(n, warnAt, expiryDays)) }))
+  const picked = attention.find((a) => a.key === status)
+  const showChips = status !== "all" || ATTENTION.some(([, , test]) => nodes.some((n) => test(n, warnAt, expiryDays)))
+  const chips = attention
+    .filter((a) => a.key === status || a.rows.length)
+    .map((a) => ({ key: a.key, label: <>{a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span></> }))
+  const visible = picked?.rows ?? found
   useEffect(() => {
-    if (added.current === null || !nodes.some((n) => n.id === added.current)) return
-    document.querySelector(`tbody tr[data-id="${added.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
-    added.current = null
+    if (!reveal.current) return
+    const { id, group: joined } = reveal.current
+    const node = nodes.find((n) => n.id === id)
+    if (!node || (joined !== undefined && node.group !== joined)) return
+    document.querySelector(`tbody tr[data-id="${id}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
+    reveal.current = null
   })
-  const searching = query.trim() !== "" || group !== "all"
+  const searching = query.trim() !== "" || group !== "all" || status !== "all"
+
+  // The columns as the whole list lays them out, taken as a search or a filter
+  // begins, while that list is still on screen. The narrowed table is laid out
+  // by these shares, so the columns stay where they were rather than refit the
+  // rows left. Shares rather than pixels, so it still follows the window.
+  const head = useRef<HTMLTableRowElement>(null)
+  const [layout, setLayout] = useState<{ width: number; shares: number[] } | null>(null)
+  function narrow<T>(set: (v: T) => void) {
+    return (v: T) => {
+      const row = head.current
+      if (!searching && row) {
+        const width = row.getBoundingClientRect().width
+        setLayout({ width, shares: [...row.cells].map((c) => c.getBoundingClientRect().width / width) })
+      }
+      set(v)
+    }
+  }
+  const frozen = searching ? layout : null
+  // A new width lays the page out afresh: the shares were taken at another, and
+  // the narrowed rows are left to size the columns. A phone's address bar
+  // collapsing resizes only the height.
+  useEffect(() => {
+    if (!frozen) return
+    const width = innerWidth
+    const thaw = () => innerWidth !== width && setLayout(null)
+    addEventListener("resize", thaw)
+    return () => removeEventListener("resize", thaw)
+  }, [frozen])
+  const col = (i: number) => frozen?.shares[i] ? { width: `${frozen.shares[i] * 100}%` } : undefined
   const uninstall = refusal ? "" : uninstallCommand(site)
+
+  // Under a filter the rows on screen are not the order, so a handle cannot
+  // move one. A press says why and offers the way out, which a disabled
+  // button would not: it takes no press, and a touch screen shows no title.
+  const locked = {
+    onPointerDown: (e: React.PointerEvent) => e.button === 0 && hintLocked(),
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return
+      e.preventDefault()
+      hintLocked()
+    },
+  }
+  function hintLocked() {
+    toast("筛选时不能拖动排序", {
+      id: "drag-locked",
+      action: { label: "清除筛选", onClick: () => { scrollTo(0, 0); setQuery(""); setGroup("all"); setStatus("all") } },
+    })
+  }
+
+  function followGroup(id: number, group?: string) {
+    if (group) reveal.current = { id, group }
+    refresh()
+  }
+
+  // Confirmed first, since it replaces an order that may have taken many
+  // drags; the toast then keeps an undo long enough to think it over.
+  async function sortByName() {
+    setSorting(false)
+    const rows = head.current!.closest("table")!.tBodies[0]
+    const before = drag.order.map((n) => n.id)
+    if (!await drag.arrange(byName(drag.order).map((n) => n.id), rows)) return
+    // Against the list as it is by then, which the hub requires in full: a node
+    // added since goes first, where the hub placed it.
+    const undo = () => {
+      const now = latest.current.map((n) => n.id)
+      drag.arrange([...now.filter((id) => !before.includes(id)), ...before.filter((id) => now.includes(id))], rows)
+    }
+    toast.success("已按名称排序", { duration: 15_000, action: { label: "撤销", onClick: undo } })
+  }
 
   async function remove() {
     if (!deleting) return
@@ -1690,10 +1833,21 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     <div className="space-y-4">
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <div className="mr-auto flex w-full gap-2 sm:w-auto">
-          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
-          <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+        <div className={`mr-auto flex w-full gap-2 sm:w-auto ${showChips ? "xl:mr-0" : ""}`}>
+          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none xl:w-48" value={query} onChange={narrow(setQuery)} />
+          <GroupFilter nodes={nodes} value={group} onChange={narrow(setGroup)} className="w-32" />
         </div>
+        {/* In the toolbar from xl up, so a filter appearing does not move the
+            table. A filter with nothing to show is left out unless picked: the
+            row then reads at a glance whether anything needs attention. Picked,
+            it stays when its count drops to zero, so the list does not change
+            under the reader. The slot is decided on the whole list, so searching
+            or switching group does not move the toolbar or the table. */}
+        {showChips && (
+          <div className="order-last min-h-8 w-full xl:order-none xl:mr-auto xl:w-auto">
+            {chips.length > 0 && <Segments label="按状态筛选" value={status} onPick={(key) => narrow(setStatus)(status === key ? "all" : key)} options={chips} />}
+          </div>
+        )}
         <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
           <Layers /> 分组
         </Button>
@@ -1708,20 +1862,37 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       </div>
 
       <Card className="overflow-x-auto p-0">
-        <Table>
+        <Table className={frozen ? "table-fixed" : ""} style={frozen ? { minWidth: frozen.width } : undefined}>
           <TableHeader>
             {/* Percentages, or the address column swallows every spare pixel
                 and pushes status across the table. */}
-            <TableRow>
-              <TableHead className="w-[26%]">名称</TableHead>
-              <TableHead className="w-[18%]">IP</TableHead>
-              <TableHead className="w-[12%]">状态</TableHead>
-              <TableHead className="w-[16%]">流量</TableHead>
+            <TableRow ref={head}>
+              <TableHead className="w-[26%]" style={col(0)}>
+                {nodes.length > 1 ? (
+                  <button
+                    type="button"
+                    className="-mx-1 inline-flex items-center gap-1 rounded px-1 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                    title={groupsOf(nodes).length ? "按分组名、再按名称排序" : "按名称排序"}
+                    onClick={() => {
+                      const ids = drag.order.map((n) => n.id).join()
+                      if (byName(drag.order).map((n) => n.id).join() === ids) toast("已经是按名称排的顺序")
+                      else setSorting(true)
+                    }}
+                  >
+                    名称 <ArrowDownAZ className="size-3.5" />
+                  </button>
+                ) : (
+                  "名称"
+                )}
+              </TableHead>
+              <TableHead className="w-[18%]" style={col(1)}>IP</TableHead>
+              <TableHead className="w-[12%]" style={col(2)}>状态</TableHead>
+              <TableHead className="w-[16%]" style={col(3)}>流量</TableHead>
               {/* Below xl the expiry date moves under the price: seven
                   columns leave a 1024px window no room for names. */}
-              <TableHead className="w-[10%]">价格<span className="xl:hidden"> / 到期</span></TableHead>
-              <TableHead className="hidden w-[12%] xl:table-cell">到期</TableHead>
-              <TableHead className="text-right">操作</TableHead>
+              <TableHead className="w-[10%]" style={col(4)}>价格<span className="xl:hidden"> / 到期</span></TableHead>
+              <TableHead className="hidden w-[12%] xl:table-cell" style={col(5)}>到期</TableHead>
+              <TableHead className="text-right" style={col(6)}>操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1732,10 +1903,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 <TableCell className="whitespace-normal">
                   <div className="flex items-center gap-2">
                     <DragHandle
-                      {...drag.handle(n.id)}
+                      {...(searching ? locked : drag.handle(n.id))}
                       name={n.name}
                       disabled={searching}
-                      title={searching ? "清空搜索和分组筛选后可拖动排序" : undefined}
+                      title={searching ? "清空搜索和筛选后可拖动排序" : undefined}
                     />
                     <div className="min-w-24">
                       {/* Lines are balanced, so none ends on a character or two. */}
@@ -1821,28 +1992,21 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 </TableCell>
               </TableRow>
             ))}
-            {nodes.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有节点，右上角添加
-                </TableCell>
-              </TableRow>
-            )}
-            {searching && nodes.length > 0 && !visible.length && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  没有匹配的节点
-                </TableCell>
-              </TableRow>
-            )}
           </TableBody>
         </Table>
+        {/* Below the table rather than a row spanning it: below xl the span
+            would count the hidden expiry column and add a column of its own. */}
+        {!visible.length && (
+          <p className="py-10 text-center text-sm text-muted-foreground">
+            {!nodes.length ? "还没有节点，右上角添加" : picked && found.length ? `当前没有${picked.label}的节点` : "没有匹配的节点"}
+          </p>
+        )}
       </Card>
 
       {creating && (
         <CreateNode
           onClose={() => setCreating(false)}
-          onSaved={(id) => { added.current = id; refresh() }}
+          onSaved={(id) => { reveal.current = { id }; refresh() }}
         />
       )}
       {editing && (
@@ -1850,10 +2014,19 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           node={editing}
           nodes={nodes}
           onClose={() => setEditing(null)}
-          onSaved={refresh}
+          onSaved={(group) => followGroup(editing.id, group)}
         />
       )}
-      {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={refresh} />}
+      {sorting && (
+        <ConfirmDialog
+          title="按名称重新排序？"
+          description={`全部 ${nodes.length} 台节点将${groupsOf(nodes).length ? "先按分组名、组内再按名称" : "按名称"}重排${groupsOf(nodes).length ? "，未分组的排在最后" : ""}。当前的顺序会被替换，公开页同步变化；排序后 15 秒内可在提示里撤销。`}
+          confirmLabel="排序"
+          onClose={() => setSorting(false)}
+          onConfirm={sortByName}
+        />
+      )}
+      {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={followGroup} />}
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
@@ -2086,7 +2259,8 @@ function PingByNode({ nodes, tasks, reload }: { nodes: Node[]; tasks: PingTask[]
             <TableRow>
               <TableHead className="w-[30%]">节点</TableHead>
               <TableHead>监控</TableHead>
-              <TableHead className="w-0 text-right">操作</TableHead>
+              {/* Sized for its one button, which an empty list would not hold. */}
+              <TableHead className="w-13 text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -2173,18 +2347,12 @@ function Ping({ nodes }: { nodes: Node[] }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-2">
-        <div role="group" aria-label="视图" className="inline-flex rounded-lg bg-muted p-0.5">
-          {(["task", "node"] as const).map((v) => (
-            <button
-              key={v}
-              aria-pressed={view === v}
-              onClick={() => setView(v)}
-              className={`rounded-md px-3 py-1 text-sm transition-colors ${view === v ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
-            >
-              {v === "task" ? "按监控" : "按节点"}
-            </button>
-          ))}
-        </div>
+        <Segments
+          label="视图"
+          value={view}
+          onPick={setView}
+          options={[{ key: "task", label: "按监控" }, { key: "node", label: "按节点" }]}
+        />
         <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: nodes.map((n) => n.id), auto_join: true })}>
           <Plus /> 添加监控
         </Button>
