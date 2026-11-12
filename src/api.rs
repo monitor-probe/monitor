@@ -1702,16 +1702,21 @@ pub async fn db_restore(
         return fail(e);
     }
 
-    let outcome = restore(&app, &source).await;
-    // SQLite writes a -wal and a -shm beside any file it opens in WAL mode, and a
-    // plain copy of a running hub's database is exactly that. They are removed
-    // when the connection closes cleanly; these three lines cover the case where
-    // it does not.
-    for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
-        let _ = std::fs::remove_file(leftover);
-    }
-    match outcome {
-        Ok(()) => {
+    // Spawned rather than awaited in place: hyper drops this handler when the
+    // client disconnects, which a proxy's read timeout does on a large restore,
+    // and the copy on its blocking thread would finish without the cleanup below.
+    let task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let outcome = restore(&app, &source).await;
+            // SQLite writes a -wal and a -shm beside any file it opens in WAL
+            // mode, and a plain copy of a running hub's database is exactly that.
+            // They are removed when the connection closes cleanly; these three
+            // lines cover the case where it does not.
+            for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
+                let _ = std::fs::remove_file(leftover);
+            }
+            outcome?;
             // Agents authenticate at the handshake, and the tokens they hold may
             // now belong to different nodes, or to none. Dropping the senders ends
             // those loops; each reconnects against the restored database.
@@ -1719,12 +1724,16 @@ pub async fn db_restore(
             // Held readings belong to the database just replaced.
             app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
             invalidate_snapshot(&app);
-            let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
-                Ok(cookie) => cookie,
-                Err(e) => return fail(e),
-            };
-            with_cookies(Json(json!({"ok": true})), [cookie])
+            app.db.drop_all_sessions()
         }
+    });
+    match task
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|done| done)
+        .and_then(|()| issue_session(&app, &headers))
+    {
+        Ok(cookie) => with_cookies(Json(json!({"ok": true})), [cookie]),
         Err(e) => fail(e),
     }
 }
