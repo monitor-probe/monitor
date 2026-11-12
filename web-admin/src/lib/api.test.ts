@@ -1,7 +1,15 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
 import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { addMonths } from "./format.ts"
 
+// The same results as the hub's roll-over, which uses chrono's checked_add_months.
+assert.equal(addMonths("2026-11-20", 1), "2026-12-20")
+assert.equal(addMonths("2026-12-31", 2), "2027-02-28")
+assert.equal(addMonths("2028-01-31", 1), "2028-02-29")
+assert.equal(addMonths("2026-03-10", 60), "2031-03-10")
+assert.equal(addMonths("2026-12-15", 12), "2027-12-15")
+assert.equal(addMonths("0026-11-20", 1), "0026-12-20")
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
 assert.deepEqual(changes({ expires_at: "2030-01-01" as string | null }, { expires_at: null }), { expires_at: null })

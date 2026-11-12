@@ -138,3 +138,12 @@
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
+
+/* Billing dialog: the "+1" that rises from the expiry date on each renewal. */
+@keyframes renewed {
+  0% { opacity: 0; transform: translateY(6px) scale(0.7); }
+  20% { opacity: 1; transform: translateY(0) scale(1.15); }
+  35% { opacity: 1; transform: translateY(-2px) scale(1); }
+  70% { opacity: 1; transform: translateY(-8px); }
+  100% { opacity: 0; transform: translateY(-18px); }
+}
