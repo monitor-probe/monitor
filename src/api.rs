@@ -1622,20 +1622,19 @@ pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
 pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
     let path = scratch_path(&app, "backup");
     // Off the runtime: this reads the entire database, through a connection of
-    // its own, so the agents' writes continue meanwhile.
-    let copied = {
-        let (app, path) = (app.clone(), path.clone());
-        tokio::task::spawn_blocking(move || app.db.backup_into(&path)).await
-    };
-    if let Err(e) = copied.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+    // its own, so the agents' writes continue meanwhile. Opened and unlinked on
+    // the same thread: a client that disconnects during the copy drops this
+    // handler, and the blocking task still removes the file.
+    let copied = tokio::task::spawn_blocking(move || {
+        let opened = app.db.backup_into(&path).and_then(|()| Ok(std::fs::File::open(&path)?));
         let _ = std::fs::remove_file(&path);
-        return fail(e);
-    }
-    let opened = tokio::fs::File::open(&path).await;
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let _ = std::fs::remove_file(&path);
-    match opened {
-        Ok(file) => (
+        let file = opened?;
+        let size = file.metadata()?.len();
+        Ok::<_, anyhow::Error>((file, size))
+    })
+    .await;
+    match copied.map_err(anyhow::Error::from).and_then(|r| r) {
+        Ok((file, size)) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
                 (header::CONTENT_LENGTH, size.to_string()),
@@ -1646,7 +1645,7 @@ pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
                     format!("attachment; filename=\"monitor-{}.db\"", Local::now().format("%Y%m%d-%H%M%S")),
                 ),
             ],
-            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))),
         )
             .into_response(),
         Err(e) => fail(e),
@@ -1702,53 +1701,42 @@ pub async fn db_restore(
         return fail(e);
     }
 
-    // Spawned rather than awaited in place: hyper drops this handler when the
-    // client disconnects, which a proxy's read timeout does on a large restore,
-    // and the copy on its blocking thread would finish without the cleanup below.
-    let task = tokio::spawn({
-        let app = app.clone();
-        async move {
-            let outcome = restore(&app, &source).await;
-            // SQLite writes a -wal and a -shm beside any file it opens in WAL
-            // mode, and a plain copy of a running hub's database is exactly that.
-            // They are removed when the connection closes cleanly; these three
-            // lines cover the case where it does not.
-            for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
-                let _ = std::fs::remove_file(leftover);
-            }
-            outcome?;
-            // Agents authenticate at the handshake, and the tokens they hold may
-            // now belong to different nodes, or to none. Dropping the senders ends
-            // those loops; each reconnects against the restored database.
-            app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
-            // Held readings belong to the database just replaced.
-            app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            invalidate_snapshot(&app);
-            app.db.drop_all_sessions()
-        }
-    });
-    match task
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|done| done)
-        .and_then(|()| issue_session(&app, &headers))
-    {
+    match restore(&app, &source).await.and_then(|()| issue_session(&app, &headers)) {
         Ok(cookie) => with_cookies(Json(json!({"ok": true})), [cookie]),
         Err(e) => fail(e),
     }
 }
 
-async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
-    // Both halves read the whole file, off the runtime: `PRAGMA integrity_check`
-    // on a 1 GiB upload is not runtime work, and the copy that follows holds
-    // the connection the agents write through.
-    let (app, source) = (app.clone(), path.to_owned());
+/// Everything after the upload, on one blocking thread. hyper drops the handler
+/// when the client disconnects, as a proxy's read timeout does on a large
+/// restore, and shutdown drops it after `DRAIN`; a blocking task runs to the end
+/// either way, so the copy cannot complete without the cleanup that follows it.
+async fn restore(app: &Shared, source: &str) -> Result<(), anyhow::Error> {
+    let (app, source) = (app.clone(), source.to_owned());
     tokio::task::spawn_blocking(move || {
-        app.db.check_backup(&source)?;
-        app.db.restore_from(&source)?;
+        let outcome = app.db.check_backup(&source).and_then(|()| app.db.restore_from(&source));
+        // SQLite writes a -wal and a -shm beside any file it opens in WAL mode,
+        // and a plain copy of a running hub's database is exactly that. They are
+        // removed when the connection closes cleanly; these three lines cover the
+        // case where it does not.
+        for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
+            let _ = std::fs::remove_file(leftover);
+        }
+        outcome?;
+        // The handler that would report it may be gone, and the panel then shows
+        // a failure; this line is the record that the database was replaced.
+        info!("database restored from an uploaded backup");
         // A statement about where this hub is reachable from, which the file
         // cannot carry to a different machine; the operator confirms it again.
-        app.db.set("origin_cdn_only", "off")
+        app.db.set("origin_cdn_only", "off")?;
+        // Agents authenticate at the handshake, and the tokens they hold may now
+        // belong to different nodes, or to none. Dropping the senders ends those
+        // loops; each reconnects against the restored database.
+        app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+        // Held readings belong to the database just replaced.
+        app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        invalidate_snapshot(&app);
+        app.db.drop_all_sessions()
     })
     .await?
 }
@@ -1805,15 +1793,16 @@ pub async fn upload_theme(
         return fail(e);
     }
 
-    // Off the runtime: gunzip plus a few thousand small writes.
-    let installed = {
-        let (app, path) = (app.clone(), source.clone());
-        tokio::task::spawn_blocking(move || {
-            crate::frontend::install(&app.themes, std::fs::File::open(&path)?, None)
-        })
-        .await
-    };
-    let _ = std::fs::remove_file(&source);
+    // Off the runtime: gunzip plus a few thousand small writes. The archive is
+    // removed on the same thread, which outlives a client that disconnects.
+    let installed = tokio::task::spawn_blocking(move || {
+        let installed = std::fs::File::open(&source)
+            .map_err(anyhow::Error::from)
+            .and_then(|file| crate::frontend::install(&app.themes, file, None));
+        let _ = std::fs::remove_file(&source);
+        installed
+    })
+    .await;
     match installed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(theme) => Json(json!({"theme": theme})).into_response(),
         Err(e) => fail(e),
@@ -2673,60 +2662,82 @@ mod tests {
     /// This does not cover the rename in `db_restore`, which changes which path is
     /// open during the copy and would require a second upload landing inside it.
     /// It covers the part that outlives the request, which is what a later edit
-    /// could silently drop.
+    /// could silently drop: once with the answer awaited, and once with the
+    /// handler dropped right after the copy starts, as a client disconnecting or a
+    /// proxy timing out does.
     #[tokio::test]
     async fn a_finished_restore_leaves_no_scratch_file_behind() {
-        let tmp = crate::TempDir::new("restore");
-        let dir = tmp.0.clone();
-        let live = dir.join("live.db").to_string_lossy().into_owned();
-        let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
-        node(&app, "kept", true);
-        app.db.set("origin_cdn_only", "on").unwrap();
-        // In the backup, and so restored with it unless the restore drops it.
-        app.db.create_session(&sha256("backed-up"), Utc::now().timestamp() + 3_600).unwrap();
+        for dropped in [false, true] {
+            let tmp = crate::TempDir::new("restore");
+            let dir = tmp.0.clone();
+            let live = dir.join("live.db").to_string_lossy().into_owned();
+            let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
+            node(&app, "kept", true);
+            app.db.set("origin_cdn_only", "on").unwrap();
+            // In the backup, and so restored with it unless the restore drops it.
+            app.db.create_session(&sha256("backed-up"), Utc::now().timestamp() + 3_600).unwrap();
 
-        // What a restore actually receives: a backup of a hub database.
-        let copy = format!("{live}.copy");
-        app.db.backup_into(&copy).unwrap();
-        let bytes = std::fs::read(&copy).unwrap();
-        std::fs::remove_file(&copy).unwrap();
-        // Not in the backup: it stays until the last chunk has arrived.
-        node(&app, "added", true);
+            // What a restore actually receives: a backup of a hub database.
+            let copy = format!("{live}.copy");
+            app.db.backup_into(&copy).unwrap();
+            let bytes = std::fs::read(&copy).unwrap();
+            std::fs::remove_file(&copy).unwrap();
+            // Not in the backup: it stays until the last chunk has arrived.
+            node(&app, "added", true);
 
-        // In two chunks, as the panel sends any backup larger than one.
-        let (total, half) = (bytes.len() as u64, bytes.len() / 2);
-        let mut done = None;
-        for (offset, piece) in [(0, &bytes[..half]), (half as u64, &bytes[half..])] {
-            let piece = axum::body::Body::from(piece.to_vec());
-            done = Some(
+            // In two chunks, as the panel sends any backup larger than one.
+            let (total, half) = (bytes.len() as u64, bytes.len() / 2);
+            let chunk = |offset: u64, piece: &[u8]| {
                 db_restore(
                     Admin,
                     State(app.clone()),
                     Query(Chunk { offset, total }),
                     HeaderMap::new(),
-                    piece,
+                    axum::body::Body::from(piece.to_vec()),
                 )
-                .await,
+            };
+            chunk(0, &bytes[..half]).await;
+            assert_eq!(app.db.nodes().unwrap().len(), 2, "restored on the last chunk alone");
+            let last = chunk(half as u64, &bytes[half..]);
+            if dropped {
+                // Polled until the upload is moved aside, which is where the copy
+                // is handed to its thread, and dropped before it can answer.
+                let upload = format!("{live}.upload");
+                let mut last = Box::pin(last);
+                while std::path::Path::new(&upload).exists() {
+                    let polled = tokio::time::timeout(std::time::Duration::ZERO, &mut last).await;
+                    assert!(polled.is_err(), "answered before it could be dropped");
+                    tokio::task::yield_now().await;
+                }
+                drop(last);
+                for _ in 0..500 {
+                    if !app.db.session_valid(&sha256("backed-up")) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            } else {
+                assert_eq!(last.await.status(), StatusCode::OK);
+            }
+            assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
+            assert!(
+                !app.db.session_valid(&sha256("backed-up")),
+                "a session from the backup does not come back"
             );
-            let expected = if offset == 0 { 2 } else { 1 };
-            assert_eq!(app.db.nodes().unwrap().len(), expected, "restored on the last chunk alone");
-        }
-        assert_eq!(done.unwrap().status(), StatusCode::OK);
-        assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
-        assert!(!app.db.session_valid(&sha256("backed-up")), "a session from the backup does not come back");
-        assert_eq!(
-            app.db.get("origin_cdn_only").as_deref(),
-            Some("off"),
-            "the premise is the operator's to restate"
-        );
+            assert_eq!(
+                app.db.get("origin_cdn_only").as_deref(),
+                Some("off"),
+                "the premise is the operator's to restate"
+            );
 
-        // The database and its journal are the only files that may remain.
-        let left: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-            .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
-            .collect();
-        assert!(left.is_empty(), "left beside the database: {left:?}");
+            // The database and its journal are the only files that may remain.
+            let left: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
+                .collect();
+            assert!(left.is_empty(), "left beside the database (dropped: {dropped}): {left:?}");
+        }
     }
 
     /// A connected agent holding one report. The receiver is returned because
