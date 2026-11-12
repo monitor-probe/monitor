@@ -80,6 +80,53 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
     setManualOrder([])
   }
 
+  function move(id: number, to: number) {
+    const next = [...ids()]
+    const from = next.indexOf(id)
+    if (from < 0 || to < 0 || to >= next.length || from === to) return
+    next.splice(to, 0, ...next.splice(from, 1))
+    slide(body.current, () => setManualOrder(next))
+    return next
+  }
+
+  // Dropped outside the table or cancelled with Escape: the order is restored.
+  function cancel() {
+    setDragging(null)
+    const before = orderBeforeDrag.current
+    if (before.length) slide(body.current, () => setManualOrder(before))
+  }
+
+  function save(next: number[]) {
+    setDragging(null)
+    const before = orderBeforeDrag.current
+    if (!before.length || next.join() === before.join()) return
+    commit(next)
+  }
+
+  // The whole order at once, as sorting it or undoing a sort sets it.
+  function arrange(next: number[], rows: HTMLTableSectionElement | null) {
+    slide(rows, () => setManualOrder(next))
+    return commit(next)
+  }
+
+  function commit(next: number[]) {
+    orderBeforeDrag.current = next
+    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
+    // A refusal falls back to whatever the hub holds, which a save queued
+    // behind it may still change.
+    const saved = saving.current.then(put).then(() => {
+      reload()
+      return true
+    }, (e: Error) => {
+      setManualOrder([])
+      reload()
+      toast.error(e.message)
+      return false
+    })
+    saving.current = saved
+    return saved
+  }
+
   // Handled on the document by layout position, not by the row under the
   // pointer: a sliding row is drawn away from its place, and the one under the
   // pointer mid-slide is not the one it would displace. Re-attached on every
@@ -159,53 +206,6 @@ function useDragOrder<T extends { id: number }>(items: T[], path: string, reload
       delete root.dataset.dragging
     }
   }, [dragging])
-
-  function move(id: number, to: number) {
-    const next = [...ids()]
-    const from = next.indexOf(id)
-    if (from < 0 || to < 0 || to >= next.length || from === to) return
-    next.splice(to, 0, ...next.splice(from, 1))
-    slide(body.current, () => setManualOrder(next))
-    return next
-  }
-
-  // Dropped outside the table or cancelled with Escape: the order is restored.
-  function cancel() {
-    setDragging(null)
-    const before = orderBeforeDrag.current
-    if (before.length) slide(body.current, () => setManualOrder(before))
-  }
-
-  function save(next: number[]) {
-    setDragging(null)
-    const before = orderBeforeDrag.current
-    if (!before.length || next.join() === before.join()) return
-    commit(next)
-  }
-
-  // The whole order at once, as sorting it or undoing a sort sets it.
-  function arrange(next: number[], rows: HTMLTableSectionElement | null) {
-    slide(rows, () => setManualOrder(next))
-    return commit(next)
-  }
-
-  function commit(next: number[]) {
-    orderBeforeDrag.current = next
-    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
-    // A refusal falls back to whatever the hub holds, which a save queued
-    // behind it may still change.
-    const saved = saving.current.then(put).then(() => {
-      reload()
-      return true
-    }, (e: Error) => {
-      setManualOrder([])
-      reload()
-      toast.error(e.message)
-      return false
-    })
-    saving.current = saved
-    return saved
-  }
 
   return {
     order,
@@ -2612,8 +2612,15 @@ function Themes() {
   const [repo, setRepo] = useState("")
   const picker = useRef<HTMLInputElement>(null)
 
+  // A failed reload keeps the list on screen; only a failed first load draws it
+  // empty, keeping the install card in reach.
   const load = () =>
-    api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
+    api<{ themes: Theme[] }>("/themes")
+      .then((data) => setThemes(data.themes))
+      .catch((e: Error) => {
+        toast.error(e.message)
+        setThemes((themes) => themes ?? [])
+      })
   useEffect(() => { load() }, [])
 
   async function select(short: string) {
@@ -2863,7 +2870,8 @@ type Settings = Record<string, string | boolean | number>
 // Two pages write settings, and each loads only what it displays.
 function useSettings() {
   const [s, setS] = useState<Settings | null>(null)
-  useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
+  // A failed load leaves the page empty, so it is said rather than swallowed.
+  useEffect(() => { api<Settings>("/settings").then(setS).catch((e: Error) => toast.error(e.message)) }, [])
   return {
     s,
     set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),

@@ -467,7 +467,10 @@ export async function upload<T>(
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: file.slice(offset, offset + CHUNK),
-      signal,
+      // Not the last: once it lands the hub applies the file whether or not
+      // anyone still waits for the answer, so aborting it would report a
+      // change that was made as one that was not.
+      signal: offset + CHUNK < file.size ? signal : undefined,
     })
     // A 413 never reached the hub: the proxy in front answered, and only its
     // own logs record it. The message names the setting responsible.
