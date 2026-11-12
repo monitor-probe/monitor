@@ -139,12 +139,13 @@ export function RegisterDialog({ site, reg, onClose }: {
 
 // The reporting interval both install dialogs offer, opening on the node's
 // current one where the hub has read it from the reports. `flag` stays
-// undefined until the field is changed, including back to what it opened on.
+// undefined until the field is changed, including back to what it opened on,
+// and while it is empty: a cleared box keeps the machine's interval.
 function useIntervalOption(current?: number | null) {
   const [typed, setTyped] = useState<string>()
   const text = typed ?? String(current ?? 1)
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(text) || 1)))
-  return { typed: text, setTyped, current, flag: typed === undefined ? undefined : seconds }
+  return { typed: text, setTyped, current, flag: typed === undefined || typed === "" ? undefined : seconds }
 }
 
 function IntervalOption({ option, batch = false }: { option: ReturnType<typeof useIntervalOption>; batch?: boolean }) {
@@ -164,6 +165,7 @@ function IntervalOption({ option, batch = false }: { option: ReturnType<typeof u
         <Input
           inputMode="numeric"
           value={option.typed}
+          placeholder={String(option.current ?? 1)}
           onChange={(e) => option.setTyped(e.target.value.replace(/\D/g, ""))}
           aria-label="上报间隔（秒）"
           className="tnum h-8 w-20 bg-background text-right"
