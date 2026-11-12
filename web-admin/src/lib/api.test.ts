@@ -133,20 +133,26 @@ assert.deepEqual(
 // The same list from any starting order: 日本 (ri) before 香港 (xiang) by
 // pinyin, Latin before Chinese.
 const named = [
-  { name: "HK-10", group: "香港" },
-  { name: "solo", group: "" },
-  { name: "JP-1", group: "日本" },
-  { name: "香港 · 甲", group: "香港" },
-  { name: "备用机" },
-  { name: "HK-2", group: "香港" },
-  { name: "alpha" },
+  { id: 1, name: "HK-10", group: "香港" },
+  { id: 2, name: "solo", group: "" },
+  { id: 3, name: "JP-1", group: "日本" },
+  { id: 4, name: "香港 · 甲", group: "香港" },
+  { id: 5, name: "备用机" },
+  { id: 6, name: "HK-2", group: "香港" },
+  { id: 7, name: "alpha" },
 ]
 for (const start of [named, [...named].reverse()]) {
   assert.deepEqual(byName(start).map((n) => n.name), ["JP-1", "HK-2", "HK-10", "香港 · 甲", "alpha", "solo", "备用机"])
 }
 
 // Groups the numeric collation calls equal stay apart.
-const close = [{ name: "b", group: "G1" }, { name: "a", group: "G01" }, { name: "c", group: "G01" }]
+const close = [{ id: 1, name: "b", group: "G1" }, { id: 2, name: "a", group: "G01" }, { id: 3, name: "c", group: "G01" }]
 for (const start of [close, [...close].reverse()]) {
   assert.deepEqual(byName(start).map((n) => n.name), ["a", "c", "b"])
+}
+
+// The same name twice: by id, so the order it started in leaves no trace.
+const twins = [{ id: 2, name: "备用机" }, { id: 1, name: "备用机" }]
+for (const start of [twins, [...twins].reverse()]) {
+  assert.deepEqual(byName(start).map((n) => n.id), [1, 2])
 }

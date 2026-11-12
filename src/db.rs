@@ -1152,10 +1152,16 @@ impl Db {
                 n.traffic_mode,
                 n.traffic_reset_day,
                 Utc::now().timestamp(),
-                n.group,
+                "",
                 id
             ],
         )?;
+        // Created in a group, it joins that group's rows as a node moved into it
+        // later would, rather than drag the group's tab to the front.
+        if !n.group.is_empty() {
+            Self::gather_into_group(&tx, &[id], &n.group)?;
+            tx.execute("UPDATE node SET group_name=?1 WHERE id=?2", params![n.group, id])?;
+        }
         // Only a registration without `--name` arrives unnamed; the panel
         // requires a name.
         if n.name.is_empty() {
@@ -3927,6 +3933,12 @@ mod tests {
         let patch = NodePatch { group: Some("港".into()), ..Default::default() };
         assert!(!db.update_nodes(&[us, 9999], &patch).unwrap());
         assert_eq!(order(), vec![n, hk2, jp, x, y, us, hk1]);
+
+        // Created in a group, as the API allows: into its rows, not first.
+        let made = Node { name: "z".into(), group: "港".into(), ..Default::default() };
+        let z = db.create_node(&made, "token-z").unwrap();
+        assert_eq!(order(), vec![n, hk2, z, jp, x, y, us, hk1]);
+        assert_eq!(db.node(z).unwrap().unwrap().group, "港");
     }
 
     /// Themes draw probes in the order they first appear in the rows, so the rows

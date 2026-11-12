@@ -808,7 +808,8 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
       await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { group } }) })
       toast.success(group ? `已把 ${ids.length} 台设为「${group}」` : `已把 ${ids.length} 台移出分组`)
       onClose()
-      onSaved(ids[0], group)
+      // The first that moved: one already in the group stays where it was.
+      onSaved(nodes.find((n) => chosen.has(n.id) && n.group !== group)?.id ?? ids[0], group)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
