@@ -64,3 +64,14 @@ const NAMED_CYCLES: Record<string, number> = { monthly: 1, quarterly: 3, semiann
 export function cycleMonths(cycle: string): number {
   return cycle === "once" ? 0 : NAMED_CYCLES[cycle] ?? Number(/^(\d+)m$/.exec(cycle)?.[1])
 }
+
+/** `date` (YYYY-MM-DD) plus whole months, a shorter month clamping to its last day as the hub's roll-over does. */
+export function addMonths(date: string, months: number): string {
+  const [y, m, d] = date.split("-").map(Number)
+  const at = new Date(0)
+  // Day 0 of the following month is the last day of the target one.
+  // setUTCFullYear, since Date.UTC would read a year below 100 as 19xx.
+  at.setUTCFullYear(y, m + months, 0)
+  at.setUTCDate(Math.min(d, at.getUTCDate()))
+  return at.toISOString().slice(0, 10)
+}
