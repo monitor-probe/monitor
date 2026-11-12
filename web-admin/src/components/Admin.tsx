@@ -1213,7 +1213,7 @@ function BillingForm({ node, onClose, onSaved }: {
                     <span
                       key={renewals}
                       aria-hidden
-                      className="pointer-events-none absolute -top-4 left-1/2 text-sm font-semibold text-primary animate-[renewed_900ms_ease-out_forwards] motion-reduce:hidden"
+                      className="pointer-events-none absolute -top-4 left-1/2 -translate-x-1/2 text-sm font-semibold text-primary animate-[renewed_900ms_ease-out_forwards] motion-reduce:hidden"
                     >
                       +1
                     </span>
