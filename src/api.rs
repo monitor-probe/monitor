@@ -1385,6 +1385,17 @@ fn valid_target(target: &str) -> bool {
     !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
+/// The longest probe target, in bytes: a 253-character host name with its
+/// trailing dot, then `:65535`. Every target assigned to a node travels to it
+/// in one `ping.tasks` frame, which the agent refuses past 64 KiB, the same
+/// ceiling as [`MAX_FRAME`]; refused, the agent drops the session and receives
+/// the same frame on every reconnect, and the node stays offline. Control
+/// characters are refused, so a target grows at most twofold in JSON (`"` and
+/// `\` escaped), which with each task's other fields keeps a full list near
+/// 37 KB.
+const MAX_TARGET: usize = 260;
+const _: () = assert!(Db::MAX_PROBES_PER_NODE as usize * (2 * MAX_TARGET + 64) <= MAX_FRAME);
+
 pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task): Json<PingTask>) -> Response {
     // Trimmed into the stored value rather than a discarded copy: what reaches
     // the agent is `task.target`, and a trailing space from a paste passes
@@ -1398,6 +1409,14 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     }
     if task.name.chars().count() > MAX_NAME {
         return bad("名称最多 64 个字");
+    }
+    if task.target.len() > MAX_TARGET {
+        return bad(&format!("目标太长，最多 {MAX_TARGET} 字节（一个汉字占 3 字节）"));
+    }
+    // No host name holds one, and each would reach the agent escaped to six
+    // bytes, past what `MAX_TARGET` allows for.
+    if task.target.chars().any(char::is_control) {
+        return bad("目标里有不可见的字符，删掉重新输入");
     }
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
@@ -2532,7 +2551,29 @@ mod tests {
         assert_eq!(stored.name, "探测", "and it labels an anonymous chart");
         // Trimming must not turn a blank entry into a saved row.
         assert_eq!(save("   ", "   ").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(save("   ", "1.1.1.1:443").await.status(), StatusCode::BAD_REQUEST, "a name is required");
         assert_eq!(app.db.ping_tasks().unwrap().len(), 1);
+    }
+
+    /// A target reaches the agent inside a frame it refuses past 64 KiB, so it
+    /// has a ceiling; a name of exactly `MAX_NAME` characters is still taken.
+    #[tokio::test]
+    async fn a_probe_name_and_target_have_a_ceiling() {
+        let app = std::sync::Arc::new(app());
+        let save = |name: String, target: String| {
+            let task = PingTask { id: 0, name, target, interval: 60, nodes: vec![], ..Default::default() };
+            save_ping_task(Admin, State(app.clone()), Json(task))
+        };
+        let host = |len: usize| format!("{}:65535", "a".repeat(len - ":65535".len()));
+        assert_eq!(save("探".repeat(MAX_NAME), "1.1.1.1:443".into()).await.status(), StatusCode::OK);
+        assert_eq!(
+            save("p".into(), "a\u{85}b:80".into()).await.status(),
+            StatusCode::BAD_REQUEST,
+            "control character"
+        );
+        assert_eq!(save("p".into(), host(MAX_TARGET)).await.status(), StatusCode::OK);
+        assert_eq!(save("p".into(), host(MAX_TARGET + 1)).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.ping_tasks().unwrap().len(), 2);
     }
 
     /// The same rule as `retention_days`, applied to the other value this hub
