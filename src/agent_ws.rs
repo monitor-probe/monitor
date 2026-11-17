@@ -648,7 +648,7 @@ fn country_source(ip: &str, ipv4: &str, ipv6: &str) -> Option<IpAddr> {
 /// acquires its badge when the hour is up, and an empty column is already a
 /// permitted state. Returning to the last address answered before the current
 /// one is not a change: `Db::save_facts` restores that answer without asking.
-static ASKED: OnceLock<Mutex<HashMap<i64, Instant>>> = OnceLock::new();
+static ASKED: OnceLock<Mutex<HashMap<i64, Option<Instant>>>> = OnceLock::new();
 const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 
 /// Resolves a node's lookup address (see [`country_source`]) to a country, at
@@ -660,11 +660,10 @@ const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 /// hidden until the retry.
 ///
 /// ponytail: no backoff beyond that one window, and the record is per process. A
-/// hub restart lifts the gate, so each node still without a country is looked
-/// up again at once.
+/// hub restart reopens the gate for every node still owed a country.
 fn locate(app: Shared, node_id: i64, source: String) {
     let mut asked = ASKED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if !may_ask(&mut asked, node_id, Instant::now()) {
+    if !spaced(asked.entry(node_id).or_default(), Instant::now(), LOCATE_RETRY) {
         return;
     }
     drop(asked);
@@ -687,22 +686,12 @@ fn locate(app: Shared, node_id: i64, source: String) {
     });
 }
 
-/// Whether a node may be looked up at `now` under [`ASKED`], recording the
-/// lookup when it may.
-fn may_ask(asked: &mut HashMap<i64, Instant>, node_id: i64, now: Instant) -> bool {
-    if asked.get(&node_id).is_some_and(|at| now.saturating_duration_since(*at) < LOCATE_RETRY) {
-        return false;
-    }
-    asked.insert(node_id, now);
-    true
-}
-
 /// The country in a lookup's reply. The reply reaches the public page, so
 /// nothing but two ASCII letters passes: a proxy's error page or an empty body
 /// is no answer.
 fn country_code(body: &str) -> Option<String> {
-    let cc = body.trim().to_ascii_uppercase();
-    (cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_uppercase())).then_some(cc)
+    let cc = body.trim();
+    (cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_alphabetic())).then(|| cc.to_ascii_uppercase())
 }
 
 /// Figures `api::node_view` fills into `metrics` from the traffic row. They never
@@ -1570,21 +1559,9 @@ mod tests {
     #[test]
     fn a_lookup_reply_counts_only_as_two_letters() {
         assert_eq!(country_code(" us\n").as_deref(), Some("US"));
-        for body in ["", "U", "USA", "U1", "<!doctype html>", "ÜS"] {
+        for body in ["", "U", "USA", "U1", "U-", "é", " - ", "<!doctype html>", "ÜS"] {
             assert_eq!(country_code(body), None, "{body:?}");
         }
-    }
-
-    #[test]
-    fn a_node_is_looked_up_at_most_once_an_hour() {
-        let mut asked = HashMap::new();
-        let t0 = Instant::now();
-        let second = Duration::from_secs(1);
-        assert!(may_ask(&mut asked, 1, t0));
-        assert!(!may_ask(&mut asked, 1, t0 + LOCATE_RETRY - second));
-        assert!(may_ask(&mut asked, 2, t0 + second), "the gate is per node");
-        assert!(may_ask(&mut asked, 1, t0 + LOCATE_RETRY));
-        assert!(!may_ask(&mut asked, 1, t0 + LOCATE_RETRY + second), "the hour restarts at each lookup");
     }
 
     #[test]
