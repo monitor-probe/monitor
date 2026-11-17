@@ -118,6 +118,18 @@ pub fn settings(app: &App, out: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// What a notification setting is stored as. A template equal to its default
+/// is stored empty, which follows the default: the panel shows the default
+/// text and saves it back unchanged, and stored as given it would keep a hub
+/// on that text after a release changes the default.
+pub fn stored<'a>(key: &str, value: &'a str) -> &'a str {
+    match key {
+        "notify_telegram_text" if value == DEFAULT_TEXT => "",
+        "notify_webhook_body" if value == DEFAULT_BODY => "",
+        _ => value,
+    }
+}
+
 /// Why a notification setting cannot be stored, or `None` when it can.
 pub fn setting_error(key: &str, value: &str) -> Option<String> {
     if let Some((_, min, max, _, label)) = NUMBERS.iter().find(|(k, ..)| *k == key) {

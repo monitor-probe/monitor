@@ -2353,7 +2353,7 @@ pub async fn save_settings(
         }
         let saved = match key.as_str() {
             "github_allowed_users" => app.db.set_github_allowed(value),
-            _ => app.db.set(key, value),
+            _ => app.db.set(key, crate::notify::stored(key, value)),
         };
         if let Err(e) = saved {
             return fail(e);
@@ -4225,6 +4225,21 @@ mod tests {
         for key in ["notify_telegram_text", "notify_webhook_body", "notify_login"] {
             assert_eq!(again[key], read[key], "{key} reads back as it was echoed");
         }
+        // The echoed defaults are stored as following the default, so a release
+        // that changes it reaches this hub; an edited template is kept as typed.
+        for key in ["notify_telegram_text", "notify_webhook_body"] {
+            assert_eq!(app.db.get(key).unwrap_or_default(), "", "{key}");
+        }
+        let edited = r#"{"text":"{{title}}"}"#;
+        let saved = save_settings(
+            Admin,
+            State(app.clone()),
+            HeaderMap::new(),
+            Json(json!({"notify_webhook_body": edited})),
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(app.db.get("notify_webhook_body").as_deref(), Some(edited));
     }
 
     /// The sign-in alert switch, saved as the panel saves it, reads back as
