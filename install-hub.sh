@@ -142,6 +142,31 @@ check_port() {
 # would silently reset the port and drop --site.
 old_exec() { sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null || true; }
 
+# The arguments of the installed unit's ExecStart that the rewrite does not
+# carry over, empty when there are none. The rewrite keeps --listen and --site
+# and writes the default --db, so anything else -- a --themes, a database moved
+# elsewhere -- is lost on upgrade, which is said rather than done silently.
+dropped_args() {
+	line="$(sed -n 's/^ExecStart=//p' "$UNIT" 2>/dev/null | tail -n 1)"
+	[ -n "$line" ] || return 0
+	set -f
+	# shellcheck disable=SC2086 # split into words, as systemd does
+	set -- $line
+	set +f
+	shift
+	out=""
+	while [ $# -gt 0 ]; do
+		if [ $# -ge 2 ] && { [ "$1" = --listen ] || [ "$1" = --site ] ||
+			{ [ "$1" = --db ] && [ "$2" = "$DATA/monitor.db" ]; }; }; then
+			shift 2
+		else
+			out="$out $1"
+			shift
+		fi
+	done
+	printf '%s' "${out# }"
+}
+
 # The port that unit listens on, empty when there is none. Read twice: once for
 # the carry-over and once for the default the menu offers, since pressing Enter
 # there must leave a running deployment unchanged.
@@ -176,6 +201,9 @@ install_hub() {
 		esac
 	fi
 	check_port "$PORT"
+	dropped="$(dropped_args)"
+	[ -z "$dropped" ] ||
+		warn "单元里的 $dropped 不会保留：升级按新版重写单元，只沿用端口和 --site。要长期改单元，用 systemctl edit $SERVICE"
 
 	# Before anything is stopped, replaced or downloaded: a port conflict must
 	# leave the running hub untouched. The hub's own socket is never a conflict,
@@ -232,7 +260,11 @@ install_hub() {
 	ok "校验" "sha256 一致"
 
 	# Keep the old binary until the new one has proved it starts: a failed upgrade
-	# must leave a running hub rather than a dead service.
+	# must leave a running hub rather than a dead service. Both binaries are
+	# written while the old hub still serves, under names of their own: a full
+	# disk then stops the script before the service is touched, a copy cut short
+	# never takes a final name, and the stop below is followed by a rename, which
+	# needs no space.
 	backup=""
 	if [ -f "$BIN" ]; then
 		backup="$BIN.old"
@@ -240,11 +272,16 @@ install_hub() {
 		# and the health check left $BIN holding a binary that never proved it
 		# starts; copying that over the good backup would make the rollback restore
 		# the same broken binary while reporting success.
-		[ -f "$backup" ] || cp -f "$BIN" "$backup"
+		if [ ! -f "$backup" ]; then
+			cp -f "$BIN" "$backup.new" || { rm -f "$backup.new"; die "备份当前版本失败，磁盘可能满了；运行中的 hub 没有动"; }
+			mv -f "$backup.new" "$backup"
+		fi
 	fi
-	# Stopped first so the copy does not land beneath a live process.
+	install -m 0755 "$tmp/$asset" "$BIN.new" ||
+		{ rm -f "$BIN.new"; die "写入新版本失败，磁盘可能满了；运行中的 hub 没有动"; }
+	# Stopped first so the new binary does not land beneath a live process.
 	systemctl stop "$SERVICE" 2>/dev/null || true
-	install -m 0755 "$tmp/$asset" "$BIN"
+	mv -f "$BIN.new" "$BIN"
 	# The download is complete. Cleared here as well as on EXIT because the menu
 	# calls this more than once per run and each call replaces the trap, leaving
 	# the previous directory and its binary uncollected.
