@@ -1278,10 +1278,12 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Ok(false) => return no_such_node(),
         Err(e) => return fail(e),
     }
-    // The token is checked only at the handshake, so deleting the row does not
-    // end a connection already open on it; dropping the sender does. Dropped
-    // after the delete, so the reconnect that follows finds no token to accept.
-    // The same reasoning applies in `reset_token` below.
+    // The token is checked at the handshake, so deleting the row does not end a
+    // connection already open on it; dropping the sender does. Dropped after the
+    // delete, so the reconnect that follows finds no token to accept, and a
+    // handshake in flight, which `agent_ws::enlist` checks again once its entry
+    // is in place, either finds none or has its entry removed here. The same
+    // order holds in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     // Its held reading as well, which no node would book.
     app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -1300,8 +1302,8 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Ok(false) => return no_such_node(),
         Err(e) => return fail(e),
     }
-    // The token is checked only at the handshake, so a session opened with the
-    // old one would continue reporting. Dropping the sender ends that loop; the
+    // The token is checked at the handshake, so a session opened with the old
+    // one would continue reporting. Dropping the sender ends that loop; the
     // agent reconnects and is refused. Its own teardown leaves the entry
     // untouched, because the session tag no longer matches.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -3505,6 +3507,21 @@ mod tests {
             assert_eq!(updated.status(), StatusCode::BAD_REQUEST, "update accepted {bad}");
         }
         assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing was created");
+        let longest = json!({"name": "名".repeat(MAX_NAME)});
+        let created = create_node(
+            Admin,
+            axum::extract::State(app.clone()),
+            panel_headers(),
+            Ok(Json(serde_json::from_value(longest.clone()).unwrap())),
+        );
+        assert_eq!(created.await.status(), StatusCode::OK, "the longest name is accepted on create");
+        let updated = update_node(
+            Admin,
+            axum::extract::State(app.clone()),
+            Path(id),
+            Ok(Json(serde_json::from_value(longest).unwrap())),
+        );
+        assert_eq!(updated.await.status(), StatusCode::OK, "and on update");
     }
 
     /// A length with a name is stored under it, so a theme built for hub 1.3.0
