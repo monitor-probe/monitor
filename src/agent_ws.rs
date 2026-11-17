@@ -349,10 +349,11 @@ pub async fn handler(
         Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
     };
     let ip = node_ip(&app, &headers, peer.ip()).to_string();
+    let token = bearer(&headers).unwrap_or_default().to_owned();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
-            if let Err(e) = serve(app, node_id, ip, socket).await {
+            if let Err(e) = serve(app, node_id, &token, ip, socket).await {
                 debug!("node {node_id} disconnected: {e:#}");
             }
         },
@@ -396,14 +397,16 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
-async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
+async fn serve(app: Shared, node_id: i64, token: &str, ip: String, mut socket: WebSocket) -> Result<()> {
     // One slot: a resend already queued reads the list as it is when it runs.
     let (tx, mut rx) = mpsc::channel::<()>(1);
-    let tag = SESSION.fetch_add(1, Ordering::Relaxed);
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
+    let Some(tag) = enlist(&app, node_id, token, tx) else {
+        debug!("node {node_id}: its token was reissued or the node deleted during the handshake");
+        return Ok(());
+    };
     info!("node {node_id} connected from {ip}");
 
     let mut session = Session::default();
@@ -494,6 +497,23 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     }
     tokio::task::block_in_place(|| close(&app, node_id, ended.as_ref(), &mut session));
     outcome
+}
+
+/// Installs a session as the node's connection and returns its tag, or None,
+/// with nothing left installed, when `token` no longer belongs to the node.
+///
+/// The token was checked before the upgrade. A reissue or a delete landing
+/// between that check and this point removes an entry that is not yet this
+/// one, so the token is checked again once the entry is in place, where such
+/// a write landing later removes it instead.
+fn enlist(app: &App, node_id: i64, token: &str, tx: mpsc::Sender<()>) -> Option<u64> {
+    let tag = SESSION.fetch_add(1, Ordering::Relaxed);
+    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
+    if matches!(app.db.node_by_token(token), Ok(Some(id)) if id == node_id) {
+        return Some(tag);
+    }
+    release(app, node_id, tag);
+    None
 }
 
 /// Drops a node's connection state, but only while the session tagged `tag` is
@@ -1026,6 +1046,30 @@ mod tests {
         for refused in [HeaderMap::new(), with("Bearer nope"), with("Basic abc")] {
             assert!(authenticate(&app, &refused).is_err());
         }
+    }
+
+    /// A reissue or a delete that lands between the handshake's token check and
+    /// the session taking its place finds no entry to remove, so the session
+    /// must not stay installed on the token it was let in with.
+    #[test]
+    fn a_session_let_in_on_a_token_since_retired_does_not_stay() {
+        let app = app();
+        let token = crate::auth::random_token();
+        let id = app.db.create_node(&Node { name: "n".into(), ..Default::default() }, &token).unwrap();
+        let online = |app: &App| app.agents.read().unwrap().contains_key(&id);
+        assert!(enlist(&app, id, &token, mpsc::channel(1).0).is_some(), "a current token is let in");
+        assert!(online(&app));
+
+        app.db.reset_token(id, &crate::auth::random_token()).unwrap();
+        app.agents.write().unwrap().remove(&id);
+        assert!(enlist(&app, id, &token, mpsc::channel(1).0).is_none(), "a reissued token is not");
+        assert!(!online(&app));
+
+        let token = crate::auth::random_token();
+        app.db.reset_token(id, &token).unwrap();
+        assert!(app.db.delete_node(id).unwrap());
+        assert!(enlist(&app, id, &token, mpsc::channel(1).0).is_none(), "nor a deleted node's");
+        assert!(!online(&app));
     }
 
     /// A connected agent, the precondition for filing any report: the session

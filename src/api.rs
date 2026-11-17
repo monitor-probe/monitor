@@ -3505,6 +3505,21 @@ mod tests {
             assert_eq!(updated.status(), StatusCode::BAD_REQUEST, "update accepted {bad}");
         }
         assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing was created");
+        let longest = json!({"name": "名".repeat(MAX_NAME)});
+        let created = create_node(
+            Admin,
+            axum::extract::State(app.clone()),
+            panel_headers(),
+            Ok(Json(serde_json::from_value(longest.clone()).unwrap())),
+        );
+        assert_eq!(created.await.status(), StatusCode::OK, "the longest name is accepted on create");
+        let updated = update_node(
+            Admin,
+            axum::extract::State(app.clone()),
+            Path(id),
+            Ok(Json(serde_json::from_value(longest).unwrap())),
+        );
+        assert_eq!(updated.await.status(), StatusCode::OK, "and on update");
     }
 
     /// A length with a name is stored under it, so a theme built for hub 1.3.0
