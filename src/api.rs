@@ -4182,6 +4182,8 @@ mod tests {
             (StatusCode::UNPROCESSABLE_ENTITY, "Failed to deserialize the JSON body").into_response();
         assert_eq!(read(rejection).await, "请求格式不对");
         assert_eq!(read(StatusCode::UNAUTHORIZED.into_response()).await, "登录已失效，请重新登录");
+        assert_eq!(read(StatusCode::NOT_FOUND.into_response()).await, "请求的内容不存在");
+        assert_eq!(read(StatusCode::BAD_GATEWAY.into_response()).await, INTERNAL);
         assert_eq!(read(bad("请填写节点名称")).await, "请填写节点名称");
     }
 }
