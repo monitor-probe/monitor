@@ -3272,6 +3272,7 @@ mod tests {
         assert_eq!(saved.status(), StatusCode::NO_CONTENT);
         let read_back: Value = serde_json::from_slice(&body(read("default").await).await).unwrap();
         assert_eq!(read_back, Value::Object(values.clone()));
+        assert_eq!(&body(read("aurora").await).await[..], b"{}", "each theme keeps its own settings");
 
         let missing = save_theme_config(Admin, state(), Path("aurora".into()), Json(values.clone())).await;
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "a theme that is not installed takes no write");
