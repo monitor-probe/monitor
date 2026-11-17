@@ -617,6 +617,9 @@ async fn main() -> Result<()> {
     }
 
     let held = app.clone();
+    if let Err(e) = notify::unpin_default_text(&app) {
+        warn!("clearing a Telegram text stored as the default failed: {e:#}");
+    }
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));

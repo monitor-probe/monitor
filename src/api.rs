@@ -4225,21 +4225,21 @@ mod tests {
         for key in ["notify_telegram_text", "notify_webhook_body", "notify_login"] {
             assert_eq!(again[key], read[key], "{key} reads back as it was echoed");
         }
-        // The echoed defaults are stored as following the default, so a release
-        // that changes it reaches this hub; an edited template is kept as typed.
-        for key in ["notify_telegram_text", "notify_webhook_body"] {
-            assert_eq!(app.db.get(key).unwrap_or_default(), "", "{key}");
-        }
-        let edited = r#"{"text":"{{title}}"}"#;
+        // The echoed Telegram text is stored as following the default, so a
+        // release that changes it reaches this hub; the webhook body, the format
+        // a receiver parses, and an edited text are kept as sent.
+        assert_eq!(app.db.get("notify_telegram_text").unwrap_or_default(), "");
+        assert_eq!(app.db.get("notify_webhook_body").as_deref(), Some(crate::notify::DEFAULT_BODY));
+        let edited = "{{title}}";
         let saved = save_settings(
             Admin,
             State(app.clone()),
             HeaderMap::new(),
-            Json(json!({"notify_webhook_body": edited})),
+            Json(json!({"notify_telegram_text": edited})),
         )
         .await;
         assert_eq!(saved.status(), StatusCode::OK);
-        assert_eq!(app.db.get("notify_webhook_body").as_deref(), Some(edited));
+        assert_eq!(app.db.get("notify_telegram_text").as_deref(), Some(edited));
     }
 
     /// The sign-in alert switch, saved as the panel saves it, reads back as
