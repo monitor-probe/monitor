@@ -1215,6 +1215,11 @@ mod tests {
         }
         assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx_total"], 6_900, "the live view follows");
         assert_eq!(total_rx(&app, id), 0, "within the minute nothing past the baseline is booked");
+        assert_eq!(
+            app.db.node(id).unwrap().unwrap().last_seen,
+            at(0).at.timestamp(),
+            "within the minute last_seen is written once, by the first report"
+        );
         assert!(
             app.db.metrics(id, Span::minutes(0, 60)).unwrap().is_empty(),
             "a session writes no row for its first minute"
@@ -1262,11 +1267,13 @@ mod tests {
         let app = app();
         let (id, _held) = connect(&app);
         let mut session = Session::default();
-        let burst = |rx: i64, instant: i64, cpu: f64, mem: i64| {
+        let burst = |rx: i64, instant: i64, cpu: f64, count: i64| {
             json!({"jsonrpc": "2.0", "method": "report",
                    "params": {"boot_id": "boot-a", "net_rx_total": rx, "net_tx_total": 0,
                               // What the agent measured over its own last second.
-                              "net_rx": instant, "net_tx": 0, "cpu": cpu, "mem_used": mem}})
+                              "net_rx": instant, "net_tx": instant, "cpu": cpu, "mem_used": count,
+                              "swap_used": count, "disk_used": count, "tcp": count, "udp": count,
+                              "procs": count}})
             .to_string()
         };
 
@@ -1274,9 +1281,9 @@ mod tests {
         // the next sample both have ended. The sample halfway caught the busiest
         // second of the burst. The first lands half a second in, so the row spans
         // 59.5 s.
-        dispatch(&app, id, "ip", &burst(1_000, 0, 100.0, 100), &mut session, at_ms(500)).unwrap();
+        dispatch(&app, id, "ip", &burst(1_000, 0, 99.5, 100), &mut session, at_ms(500)).unwrap();
         send(&app, id, &mut session, 30, &burst(1_000 + 45_000_000, 3_000_000, 50.0, 151)).unwrap();
-        send(&app, id, &mut session, 60, &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
+        send(&app, id, &mut session, 60, &burst(1_000 + 60_000_000, 0, 1.0, 201)).unwrap();
 
         let row = &app.db.metrics(id, Span::minutes(0, 60)).unwrap()[0];
         assert_eq!(
@@ -1284,11 +1291,15 @@ mod tests {
             "60 MB over 59.5 s, not the agent's 0 nor over 59 whole seconds"
         );
         assert_eq!(row["net_rx_max"], 3_000_000, "the busiest second survives the mean");
-        assert_eq!(row["cpu"], 50.0, "the mean of the minute, not the idle second it ended on");
-        assert_eq!(row["cpu_max"], 100.0, "and its busiest second of CPU survives it too");
+        assert_eq!(row["net_tx_max"], 3_000_000, "for each direction");
+        let cpu = row["cpu"].as_f64().unwrap();
+        assert!((cpu - 150.5 / 3.0).abs() < 1e-9, "the mean of the minute, fraction kept: {cpu}");
+        assert_eq!(row["cpu_max"], 99.5, "and its busiest second of CPU survives it too");
         // Integers remain integral: the column is read with as_i64, which returns
         // nothing for the 150.67 the raw mean would produce.
-        assert_eq!(row["mem_used"], 151);
+        for column in ["mem_used", "swap_used", "disk_used", "tcp", "udp", "procs"] {
+            assert_eq!(row[column], 151, "{column}");
+        }
         // The live view still shows the instantaneous reading, which is its
         // purpose.
         assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx"], 0);
