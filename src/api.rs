@@ -2743,7 +2743,7 @@ mod tests {
     /// A connected agent holding one report. The receiver is returned because
     /// dropping it closes the channel, which is the signal `reset_token` is tested
     /// for.
-    fn connect(app: &App, id: i64, metrics: Value) -> tokio::sync::mpsc::Receiver<String> {
+    fn connect(app: &App, id: i64, metrics: Value) -> tokio::sync::mpsc::Receiver<()> {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut agent = crate::agent_ws::Agent::new(7, tx);
         agent.metrics = metrics;
