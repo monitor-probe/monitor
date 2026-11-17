@@ -2827,11 +2827,10 @@ pub fn period_start(today: NaiveDate, reset_day: u32) -> NaiveDate {
     let clamped = |y: i32, m: u32| {
         let last =
             NaiveDate::from_ymd_opt(if m == 12 { y + 1 } else { y }, if m == 12 { 1 } else { m + 1 }, 1)
-                .unwrap()
-                .pred_opt()
-                .unwrap()
+                .and_then(|first| first.pred_opt())
+                .expect("the first of the next month follows a valid date")
                 .day();
-        NaiveDate::from_ymd_opt(y, m, day.min(last)).unwrap()
+        NaiveDate::from_ymd_opt(y, m, day.min(last)).expect("a day clamped to the month's last")
     };
     let this = clamped(today.year(), today.month());
     if today >= this {
