@@ -460,13 +460,14 @@ pub fn keep_listed(ids: &str, list: &str) -> String {
 /// caller could mint a fresh identity per request, bypassing the lockout and
 /// growing the throttle map without bound.
 ///
-/// The last value is taken, not the first. Both documented proxies append
-/// rather than replace -- nginx's `$proxy_add_x_forwarded_for`, caddy's
-/// `reverse_proxy` default -- so a caller supplying its own `X-Forwarded-For`
-/// leaves that value at the head while the address the proxy observed lands at
-/// the tail. Reading the head would return control of the lockout to the
-/// caller: rotating the header makes every attempt a fresh address, and writing
-/// the operator's address locks them out of the sign-in page.
+/// The last value is taken, not the first. Each documented proxy puts the
+/// address it observed last: nginx's `$proxy_add_x_forwarded_for` appends it to
+/// whatever the caller sent, and caddy's `reverse_proxy` replaces the header
+/// from a peer outside `trusted_proxies`. A value the caller supplies thus
+/// never reaches the tail. Reading the head would return control of the
+/// lockout to the caller: rotating the header makes every attempt a fresh
+/// address, and writing the operator's address locks them out of the sign-in
+/// page.
 ///
 /// A second trusted proxy in front of the local one places its own address at
 /// the tail instead. No single value in this header identifies the client, so
