@@ -13,6 +13,9 @@ set -eu
 # lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH is set, and
 # Debian does not set it.
 PATH="$PATH:/usr/sbin:/sbin"
+# A signal becomes an exit, so the EXIT traps that remove staged files run:
+# dash runs none for a signal that kills it.
+trap 'exit 1' HUP INT TERM
 
 REPO="monitor-probe/monitor"
 SERVICE="monitor-hub"
@@ -259,42 +262,14 @@ install_hub() {
 	[ "$got" = "$want" ] || die "校验不通过，已丢弃下载的文件。期望 $want，实得 $got"
 	ok "校验" "sha256 一致"
 
-	# Keep the old binary until the new one has proved it starts: a failed upgrade
-	# must leave a running hub rather than a dead service. Both binaries are
-	# written while the old hub still serves, under names of their own: a full
-	# disk then stops the script before the service is touched, a copy cut short
-	# never takes a final name, and the stop below is followed by a rename, which
-	# needs no space.
-	backup=""
-	if [ -f "$BIN" ]; then
-		backup="$BIN.old"
-		# Never over an existing backup. A run that died between the install below
-		# and the health check left $BIN holding a binary that never proved it
-		# starts; copying that over the good backup would make the rollback restore
-		# the same broken binary while reporting success.
-		if [ ! -f "$backup" ]; then
-			cp -f "$BIN" "$backup.new" || { rm -f "$backup.new"; die "备份当前版本失败，磁盘可能满了；运行中的 hub 没有动"; }
-			mv -f "$backup.new" "$backup"
-		fi
-	fi
-	install -m 0755 "$tmp/$asset" "$BIN.new" ||
-		{ rm -f "$BIN.new"; die "写入新版本失败，磁盘可能满了；运行中的 hub 没有动"; }
-	# Stopped first so the new binary does not land beneath a live process.
-	systemctl stop "$SERVICE" 2>/dev/null || true
-	mv -f "$BIN.new" "$BIN"
-	# The download is complete. Cleared here as well as on EXIT because the menu
-	# calls this more than once per run and each call replaces the trap, leaving
-	# the previous directory and its binary uncollected.
-	rm -rf "$tmp"
-	trap - EXIT
-
 	# Loopback only: the panel and the agent tokens never traverse a network in
 	# the clear, and there is no port to firewall. Reaching it is the reverse
 	# proxy's responsibility, and 127.0.0.1 rather than [::1] because that is
 	# every proxy's default upstream; the hub binds one address, not both.
 	args="--listen 127.0.0.1:$PORT --db $DATA/monitor.db"
 	[ -z "$SITE" ] || args="$args --site $SITE"
-	cat >"$UNIT" <<UNIT
+	unit_new="$(mktemp "$UNIT.install-XXXXXX")"
+	cat >"$unit_new" <<UNIT
 [Unit]
 Description=monitor hub
 After=network-online.target
@@ -325,6 +300,42 @@ MemoryMax=256M
 [Install]
 WantedBy=multi-user.target
 UNIT
+	chmod 0644 "$unit_new"
+
+	# Keep the old binary until the new one has proved it starts: a failed upgrade
+	# must leave a running hub rather than a dead service. Everything is written
+	# while the old hub still serves, under names of this run's own beside the
+	# final ones: a full disk then stops the script before the service is
+	# touched, a partial file never takes a final name, and the stop below is
+	# followed by renames, which need no space.
+	backup=""
+	stage="$(mktemp -d "$ROOT/.install-XXXXXX")"
+	trap 'rm -rf "$tmp" "$stage"; rm -f "$unit_new"' EXIT
+	if [ -f "$BIN" ]; then
+		backup="$BIN.old"
+		# Never over an existing backup. A run that died between the install below
+		# and the health check left $BIN holding a binary that never proved it
+		# starts; copying that over the good backup would make the rollback restore
+		# the same broken binary while reporting success. A hard link: $BIN is
+		# replaced by a rename, which leaves this inode as it was, and a link takes
+		# no space.
+		if [ ! -f "$backup" ]; then
+			ln "$BIN" "$stage/old" 2>/dev/null || cp -f "$BIN" "$stage/old" ||
+				die "备份当前版本失败，磁盘可能满了；运行中的 hub 没有动"
+		fi
+	fi
+	install -m 0755 "$tmp/$asset" "$stage/$asset" ||
+		die "写入新版本失败，磁盘可能满了；运行中的 hub 没有动"
+	# Stopped first so the new binary does not land beneath a live process.
+	systemctl stop "$SERVICE" 2>/dev/null || true
+	[ ! -f "$stage/old" ] || mv -f "$stage/old" "$backup"
+	mv -f "$stage/$asset" "$BIN"
+	mv -f "$unit_new" "$UNIT"
+	# Cleared here as well as on EXIT because the menu calls this more than once
+	# per run and each call replaces the trap, leaving the previous directories
+	# uncollected.
+	rm -rf "$tmp" "$stage"
+	trap - EXIT
 
 	# Taken from the binary's stdout rather than the journal, which some hosts
 	# keep nowhere. Set before the service starts, so the hub finds a password in
@@ -443,7 +454,8 @@ uninstall_hub() {
 		confirm "卸载 monitor hub？数据保留在 $DATA" || return 0
 	fi
 	systemctl disable --now "$SERVICE" 2>/dev/null || true
-	rm -f "$UNIT" "$BIN" "$BIN.old"
+	rm -f "$UNIT" "$BIN" "$BIN.old" "$UNIT".install-*
+	rm -rf "$ROOT"/.install-*
 	systemctl daemon-reload
 	ok "服务" "已移除"
 	if [ -n "$PURGE" ]; then
@@ -566,8 +578,13 @@ fi
 [ "$(id -u)" = 0 ] || die "需要 root：sudo sh $0"
 command -v curl >/dev/null 2>&1 || die "需要 curl"
 command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum（装 coreutils）"
-command -v systemctl >/dev/null 2>&1 ||
+# systemd by the test sd_booted(3) performs: systemctl is also present where
+# systemd is installed but not PID 1 (WSL, a container), where every step below
+# would fail after the system was changed.
+if [ ! -d /run/systemd/system ]; then
+	! command -v systemctl >/dev/null 2>&1 || warn "systemd 装了但没在运行（WSL、容器里常见）"
 	die "这个安装器只装 systemd 服务。手动运行：$BIN --listen 127.0.0.1:$PORT --db $DATA/monitor.db"
+fi
 
 case "$ACTION" in
 uninstall) banner; uninstall_hub ;;
