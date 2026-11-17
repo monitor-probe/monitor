@@ -704,6 +704,66 @@ mod tests {
         assert!(refused(&[full.as_slice(), &[1]].concat()));
     }
 
+    /// Files count toward [`MAX_ENTRIES`] alongside the directories their
+    /// paths imply, and a directory entry counts once, as a directory: a
+    /// package of files each in a directory of its own, half of those
+    /// directories also listed as entries the way `tar czf` writes them,
+    /// installs at exactly the ceiling and is refused one past it, with the
+    /// entries themselves well under it.
+    #[test]
+    fn files_and_the_directories_they_imply_share_one_ceiling() {
+        let tmp = crate::TempDir::new("entry-ceiling");
+        let base = tmp.0.clone();
+        let manifest = r#"{"name":"x","short":"x","description":"","version":"1","author":"a","url":""}"#;
+        // theme.json, dist/ and dist/index.html are three; `extra` adds a file
+        // in dist/, and each `d{i}/f` one file and one directory.
+        let counted = |extra: bool, spread: usize| 3 + usize::from(extra) + 2 * spread;
+        let pack = |extra: bool, spread: usize| {
+            let mut tar =
+                tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+            let mut add = |name: &str, dir: bool, data: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(if dir { tar::EntryType::Directory } else { tar::EntryType::Regular });
+                header.set_size(data.len() as u64);
+                header.set_mode(if dir { 0o755 } else { 0o644 });
+                tar.append_data(&mut header, name, data).unwrap();
+            };
+            add("theme.json", false, manifest.as_bytes());
+            add("dist/", true, b"");
+            add("dist/index.html", false, b"x");
+            if extra {
+                add("dist/extra", false, b"x");
+            }
+            for i in 0..spread {
+                if i % 2 == 0 {
+                    add(&format!("d{i}/"), true, b"");
+                }
+                add(&format!("d{i}/f"), false, b"x");
+            }
+            tar.into_inner().unwrap().finish().unwrap()
+        };
+        // Whichever parity the ceiling has, one package lands on it and one just past.
+        let shape = |total: usize| {
+            let extra = (total - 3) % 2 == 1;
+            let spread = (total - 3 - usize::from(extra)) / 2;
+            assert_eq!(counted(extra, spread), total);
+            (extra, spread)
+        };
+        let (extra, spread) = shape(MAX_ENTRIES);
+        if let Err(e) = install(&base, &pack(extra, spread)[..], None) {
+            panic!("exactly the ceiling was refused: {e:#}");
+        }
+        let (extra, spread) = shape(MAX_ENTRIES + 1);
+        let Err(e) = install(&base, &pack(extra, spread)[..], None) else {
+            panic!("one past the ceiling installed");
+        };
+        assert_eq!(
+            e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()),
+            Some(format!("主题包里的文件和目录超过 {MAX_ENTRIES} 个").as_str()),
+            "{e:#}"
+        );
+    }
+
     /// Everything an uploaded archive must satisfy before replacing a theme
     /// currently being served.
     #[test]
