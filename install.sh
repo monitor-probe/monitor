@@ -216,12 +216,18 @@ http://*)
 	exit 2
 	;;
 esac
-if command -v systemctl >/dev/null; then
+# systemd by the test sd_booted(3) performs, since systemctl is also present
+# where systemd is installed but not PID 1 (WSL, a container), and every
+# systemctl call below would fail there after the key is spent. Decided before
+# the download and the registration for the same reason.
+if [ -d /run/systemd/system ]; then
 	INIT=systemd
 elif command -v rc-update >/dev/null; then
 	INIT=openrc
 else
-	echo "this installer needs systemd or OpenRC" >&2
+	echo "this installer needs systemd or OpenRC running as the init system" >&2
+	! command -v systemctl >/dev/null ||
+		echo "systemd is installed but is not PID 1 here, as in WSL or a container" >&2
 	exit 1
 fi
 
@@ -254,7 +260,7 @@ esac
 # which is why none is requested here.
 URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+trap 'rm -f "$TMP" "$BIN.new" "$BIN.old.new" "$ENV_FILE.new"' EXIT
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -319,6 +325,21 @@ x86_64:62 | aarch64:183) ;;
 *) echo "${BINARY:-the download} is not built for $ARCH; use monitor-agent-$ARCH-unknown-linux-musl" >&2; exit 1 ;;
 esac
 
+# Everything this install writes beneath $ROOT is written while the running
+# agent still serves, under names of its own, and the binaries before the
+# registration: a full disk then ends the script before a key is spent or the
+# agent is stopped, and what follows the stop is renames, which need no space.
+# A partial copy never takes a final name, so a rollback cannot restore one.
+install -d -m 0755 "$ROOT"
+# Kept until the new binary has proved it starts; see not_started. Never over
+# an existing copy: a run that died before that check left an unproven binary
+# in $BIN, and the copy is the one that ran before it.
+if [ -f "$BIN" ] && [ ! -f "$BIN.old" ]; then
+	cp "$BIN" "$BIN.old.new"
+	mv -f "$BIN.old.new" "$BIN.old"
+fi
+install -m 0755 "$TMP" "$BIN.new"
+
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
 # is only written once the binary is in place. A download that fails after
@@ -374,12 +395,25 @@ if [ -z "$TOKEN" ]; then
 	fi
 fi
 
+# The token lives in a root-only environment file rather than the unit, keeping
+# it out of `systemctl cat` and the world-readable journal. 0600 root is what
+# keeps it private, since $ROOT itself is readable and holds the binaries. Set in
+# a subshell, because the unit file written below is read by anyone debugging
+# with `systemctl cat` and need not be 0600.
+(
+	umask 077
+	cat >"$ENV_FILE.new" <<ENV
+MONITOR_SERVER=$SERVER
+MONITOR_TOKEN=$TOKEN
+ENV
+	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE.new"
+)
+
 # Stop an agent already running here before replacing its binary. The service
 # name is fixed, so a reinstall could never start a second copy, but without this
 # the new binary lands beneath a live process and only the restart at the end
-# picks it up. Stopping first also means the copy does not depend on `install`
-# unlinking rather than failing with ETXTBSY. Placed after the download, so a
-# node that cannot fetch the binary keeps running.
+# picks it up. Placed after every write above, so a node that cannot fetch or
+# store the new files keeps running.
 if [ "$INIT" = openrc ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 else
@@ -395,26 +429,8 @@ else
 		exit 1
 	}
 fi
-install -d -m 0755 "$ROOT"
-# Kept until the new binary has proved it starts; see not_started. Never over
-# an existing copy: a run that died before that check left an unproven binary
-# in $BIN, and the copy is the one that ran before it.
-[ ! -f "$BIN" ] || [ -f "$BIN.old" ] || cp "$BIN" "$BIN.old"
-install -m 0755 "$TMP" "$BIN"
-
-# The token lives in a root-only environment file rather than the unit, keeping
-# it out of `systemctl cat` and the world-readable journal. 0600 root is what
-# keeps it private, since $ROOT itself is readable and holds the binaries. Set in
-# a subshell, because the unit file written below is read by anyone debugging
-# with `systemctl cat` and need not be 0600.
-(
-	umask 077
-	cat >"$ENV_FILE" <<ENV
-MONITOR_SERVER=$SERVER
-MONITOR_TOKEN=$TOKEN
-ENV
-	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE"
-)
+mv -f "$BIN.new" "$BIN"
+mv -f "$ENV_FILE.new" "$ENV_FILE"
 
 # The new agent is not running. The binary it replaced is put back and started
 # again, so a failed upgrade leaves the machine reporting as before; the unit
