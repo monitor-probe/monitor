@@ -4135,10 +4135,9 @@ mod tests {
         assert_eq!(app.db.retention_days(), 30, "and the stored window is the one that was shown");
     }
 
-    /// Each key's check, through the route that stores it: a value the check
-    /// refuses answers 400 and leaves the stored one in place, and the nearest
-    /// value it accepts is stored. Internal state and unknown names are refused
-    /// whatever their value.
+    /// Each key's check, through the route that stores it: a refused value
+    /// answers 400 and leaves the value stored before it in place. Internal
+    /// state and unknown names are refused whatever their value.
     #[tokio::test]
     async fn each_setting_is_checked_before_it_is_stored() {
         use base64::Engine;
@@ -4150,48 +4149,53 @@ mod tests {
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n")
         );
-        for (key, refused, accepted) in [
-            ("theme", "not-installed", "default"),
-            ("github_proxy", "http://mirror.example/", "https://mirror.example/"),
-            ("favicon", "data:image/png;base64,aGVsbG8=", png.as_str()),
-            ("touch_icon", "data:text/html;base64,aGVsbG8=", png.as_str()),
-            ("origin_cdn_only", "yes", "on"),
+        for (key, accepted, refused) in [
+            ("theme", "default", "not-installed"),
+            ("github_proxy", "https://mirror.example/", "http://mirror.example/"),
+            ("favicon", png.as_str(), "data:image/png;base64,aGVsbG8="),
+            ("touch_icon", png.as_str(), "data:text/html;base64,aGVsbG8="),
+            ("origin_cdn_only", "on", "yes"),
         ] {
-            assert_eq!(save(key, refused).await.status(), StatusCode::BAD_REQUEST, "{key}={refused}");
-            assert_eq!(app.db.get(key), None, "{key}: a refused value is not stored");
             assert_eq!(save(key, accepted).await.status(), StatusCode::OK, "{key}={accepted}");
-            assert_eq!(app.db.get(key).as_deref(), Some(accepted));
+            assert_eq!(save(key, refused).await.status(), StatusCode::BAD_REQUEST, "{key}={refused}");
+            assert_eq!(app.db.get(key).as_deref(), Some(accepted), "{key}");
         }
         assert_eq!(save("favicon", "").await.status(), StatusCode::OK, "an empty icon clears it");
         assert_eq!(app.db.get("favicon").as_deref(), Some(""));
 
-        assert_eq!(save("admin_password", "elevenbytes").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(save("admin_password", "elevenchars").await.status(), StatusCode::BAD_REQUEST);
         assert!(app.db.get("admin_password_hash").is_none());
-        assert_eq!(save("admin_password", "twelve-bytes").await.status(), StatusCode::OK);
+        assert_eq!(save("admin_password", "twelve-chars").await.status(), StatusCode::OK);
         assert!(app.db.get("admin_password_hash").is_some());
 
         assert_eq!(save("github_client_secret", "s3cret").await.status(), StatusCode::OK);
         assert_eq!(app.db.get("github_client_secret").as_deref(), Some("s3cret"));
 
-        for key in [
+        let issued = crate::db::ID_TABLES.map(|table| format!("{table}_id_issued"));
+        let internal = [
             "register_key",
             "register_until",
-            crate::auth::GITHUB_IDS,
             "admin_password_hash",
-            "history_rolled",
-            "node_id_issued",
+            "notify_expiry_sent",
+            "theme_config:default",
+            crate::auth::GITHUB_IDS,
+            crate::db::ROLLED,
+            crate::notify::TRAFFIC_ALERTED,
             "no_such_key",
-        ] {
+        ];
+        for key in internal.iter().copied().chain(issued.iter().map(String::as_str)) {
             app.db.set(key, "kept").unwrap();
             assert_eq!(save(key, "changed").await.status(), StatusCode::BAD_REQUEST, "{key}");
             assert_eq!(app.db.get(key).as_deref(), Some("kept"), "{key}");
         }
 
         // Taking a name off the list also drops the account it was bound to.
+        app.db.set(crate::auth::GITHUB_IDS, "").unwrap();
         app.db.set_github_allowed("alice,bob").unwrap();
         assert_eq!(app.db.bind_github("alice", "1").unwrap().as_deref(), Some("1"));
         assert_eq!(app.db.bind_github("bob", "2").unwrap().as_deref(), Some("2"));
         assert_eq!(save("github_allowed_users", "bob").await.status(), StatusCode::OK);
+        assert_eq!(app.db.get("github_allowed_users").as_deref(), Some("bob"));
         assert_eq!(app.db.get(crate::auth::GITHUB_IDS).as_deref(), Some("bob:2"));
     }
 
