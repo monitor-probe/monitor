@@ -520,19 +520,22 @@ pub struct Watch {
 pub async fn watch(app: Shared) {
     let mut watch = Watch::default();
     let mut ticker = tokio::time::interval(SWEEP);
-    // Absences are timed on this rather than the wall clock. A hub started
+    // Absences are timed on the ticks rather than the wall clock. A hub started
     // before NTP corrects a clock running hours fast, as an RTC kept in local
     // time reads, would otherwise date them hours ahead and hold its offline
-    // alerts back by the correction as well as the grace period.
-    let started = std::time::Instant::now();
+    // alerts back by the correction as well as the grace period. Each tick is
+    // its scheduled instant, so sweeps lie whole multiples of SWEEP apart and a
+    // grace period of whole sweeps is never cut short by a rounded second.
+    let first = ticker.tick().await;
+    let mut tick = first;
     loop {
-        ticker.tick().await;
-        let (now, steady) = (Utc::now().timestamp(), started.elapsed().as_secs() as i64);
+        let (now, steady) = (Utc::now().timestamp(), tick.duration_since(first).as_secs() as i64);
         // Synchronous database work, kept off the runtime threads like a report.
         match tokio::task::block_in_place(|| sweep(&app, &mut watch, now, steady)) {
             Ok(notes) => notes.into_iter().for_each(|note| send(&app, note)),
             Err(e) => warn!("notification sweep failed: {e:#}"),
         }
+        tick = ticker.tick().await;
     }
 }
 
@@ -582,8 +585,11 @@ fn sweep(app: &App, watch: &mut Watch, now: i64, steady: i64) -> Result<Vec<Note
         let flapping = watch.returned.get(&node.id).is_some_and(|back| since - back < FLAP_WINDOW);
         let wait = if flapping { FLAP_GRACE } else { grace };
         if armed && node.notify && node.down_since == 0 && steady - since >= wait {
-            app.db.set_down_since(node.id, node.last_seen)?;
-            down.push((node.name.as_str(), format!("最后上报 {}", clock(node.last_seen))));
+            // A report stamped by a clock since corrected backwards would show
+            // a time yet to come and make the outage read as none.
+            let last = node.last_seen.min(now);
+            app.db.set_down_since(node.id, last)?;
+            down.push((node.name.as_str(), format!("最后上报 {}", clock(last))));
         }
     }
     let mut notes: Vec<Note> = [batch("offline", "🔴", "离线", down), batch("online", "🟢", "恢复在线", up)]
@@ -816,6 +822,47 @@ mod tests {
         let notes = sweep(&app, &mut watch, now + 180, 180).unwrap();
         assert_eq!(notes.len(), 1, "announced once the grace period has passed");
         assert_eq!(notes[0].event, "offline");
+    }
+
+    /// The wall clock jumping forward neither shortens the grace period nor the
+    /// longer one a flapping node is held to.
+    #[test]
+    fn a_clock_moved_forward_shortens_no_grace_period() {
+        let app = app();
+        with_channel(&app);
+        let now = 1_000_000;
+        let a = node(&app, "a", true, now - 60);
+        let mut watch = Watch::default();
+        let hour = 3_600;
+        assert!(sweep(&app, &mut watch, now, 0).unwrap().is_empty());
+        assert!(sweep(&app, &mut watch, now + 24 * hour, 150).unwrap().is_empty(), "inside the grace period");
+        assert_eq!(sweep(&app, &mut watch, now + 24 * hour, 180).unwrap().len(), 1);
+
+        // Back after an announced absence, then gone again within the hour:
+        // flapping, so the absence must last FLAP_GRACE whatever the wall says.
+        connect(&app, a);
+        assert_eq!(sweep(&app, &mut watch, now + 24 * hour, 300).unwrap()[0].event, "online");
+        app.agents.write().unwrap().clear();
+        assert!(sweep(&app, &mut watch, now + 25 * hour, 400).unwrap().is_empty());
+        assert!(sweep(&app, &mut watch, now + 48 * hour, 400 + FLAP_GRACE - 30).unwrap().is_empty());
+        assert_eq!(sweep(&app, &mut watch, now + 48 * hour, 400 + FLAP_GRACE).unwrap().len(), 1);
+    }
+
+    /// A report stamped before the clock was corrected backwards is announced
+    /// as no later than now, and the outage that follows reads as its length.
+    #[test]
+    fn a_report_stamped_ahead_of_the_clock_is_announced_as_now() {
+        let app = app();
+        with_channel(&app);
+        let now = 1_000_000;
+        let a = node(&app, "a", true, now + 8 * 3_600);
+        let mut watch = Watch::default();
+        assert!(sweep(&app, &mut watch, now, 0).unwrap().is_empty());
+        let notes = sweep(&app, &mut watch, now + 180, 180).unwrap();
+        assert_eq!(notes[0].message, format!("最后上报 {}", clock(now + 180)));
+        connect(&app, a);
+        let notes = sweep(&app, &mut watch, now + 2 * 3_600, 7_200).unwrap();
+        assert!(notes[0].message.starts_with("离线 1 小时"), "{}", notes[0].message);
     }
 
     #[test]
