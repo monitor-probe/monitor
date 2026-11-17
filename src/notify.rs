@@ -118,6 +118,29 @@ pub fn settings(app: &App, out: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// What a notification setting is stored as. The Telegram text equal to its
+/// default is stored empty, which follows the default: the panel shows the
+/// default text and saves it back unchanged, and stored as given it would keep
+/// a hub on that text after a release changes the default. The webhook body is
+/// stored as given even then: it is the format the receiving end parses, which
+/// a release must not change under a configured receiver.
+pub fn stored<'a>(key: &str, value: &'a str) -> &'a str {
+    if key == "notify_telegram_text" && value == DEFAULT_TEXT {
+        ""
+    } else {
+        value
+    }
+}
+
+/// Clears a Telegram text that an earlier release stored equal to the default,
+/// so it follows the default as one saved now would.
+pub fn unpin_default_text(app: &App) -> anyhow::Result<()> {
+    if app.db.get("notify_telegram_text").as_deref() == Some(DEFAULT_TEXT) {
+        app.db.set("notify_telegram_text", "")?;
+    }
+    Ok(())
+}
+
 /// Why a notification setting cannot be stored, or `None` when it can.
 pub fn setting_error(key: &str, value: &str) -> Option<String> {
     if let Some((_, min, max, _, label)) = NUMBERS.iter().find(|(k, ..)| *k == key) {
@@ -869,6 +892,21 @@ mod tests {
         connect(&app, a);
         let notes = sweep(&app, &mut watch, now + 2 * 3_600, 7_200).unwrap();
         assert!(notes[0].message.starts_with("离线 1 小时"), "{}", notes[0].message);
+    }
+
+    #[test]
+    fn a_telegram_text_stored_as_the_default_follows_it() {
+        let app = app();
+        app.db.set("notify_telegram_text", DEFAULT_TEXT).unwrap();
+        unpin_default_text(&app).unwrap();
+        assert_eq!(app.db.get("notify_telegram_text").as_deref(), Some(""));
+        app.db.set("notify_telegram_text", "{{title}}").unwrap();
+        unpin_default_text(&app).unwrap();
+        assert_eq!(
+            app.db.get("notify_telegram_text").as_deref(),
+            Some("{{title}}"),
+            "an edited text is kept"
+        );
     }
 
     #[test]
