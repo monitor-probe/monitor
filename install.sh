@@ -64,7 +64,9 @@ if [ -n "$UNINSTALL" ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 	rc-update del monitor-agent default >/dev/null 2>&1 || true
 	systemctl disable --now monitor-agent 2>/dev/null || true
-	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE"
+	rm -f "$UNIT_FILE" "$RC_FILE" "$LOG_FILE" "$BIN" "$BIN.old" "$ENV_FILE" \
+		"$UNIT_FILE".install-* "$RC_FILE".install-*
+	rm -rf "$ROOT"/.install-*
 	systemctl daemon-reload 2>/dev/null || true
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
@@ -216,18 +218,20 @@ http://*)
 	exit 2
 	;;
 esac
-# systemd by the test sd_booted(3) performs, since systemctl is also present
-# where systemd is installed but not PID 1 (WSL, a container), and every
-# systemctl call below would fail there after the key is spent. Decided before
+# systemd by the test sd_booted(3) performs, OpenRC by the runlevel it records
+# once booted: either may be installed where it is not the running init (WSL, a
+# container), and every service call below would fail there after the key is
+# spent. Decided before
 # the download and the registration for the same reason.
 if [ -d /run/systemd/system ]; then
 	INIT=systemd
-elif command -v rc-update >/dev/null; then
+elif [ -e /run/openrc/softlevel ] && command -v rc-update >/dev/null; then
 	INIT=openrc
 else
 	echo "this installer needs systemd or OpenRC running as the init system" >&2
-	! command -v systemctl >/dev/null ||
-		echo "systemd is installed but is not PID 1 here, as in WSL or a container" >&2
+	if command -v systemctl >/dev/null || command -v rc-update >/dev/null; then
+		echo "one is installed but did not boot this machine, as in WSL or a container" >&2
+	fi
 	exit 1
 fi
 
@@ -260,7 +264,12 @@ esac
 # which is why none is requested here.
 URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
-trap 'rm -f "$TMP" "$BIN.new" "$BIN.old.new" "$ENV_FILE.new"' EXIT
+STAGE="" SERVICE_NEW=""
+# Staged files are removed on any exit before they take their final names. A
+# signal is turned into an exit, since dash runs no EXIT trap for a signal that
+# kills it.
+trap 'rm -f "$TMP" ${SERVICE_NEW:+"$SERVICE_NEW"}; [ -z "$STAGE" ] || rm -rf "$STAGE"' EXIT
+trap 'exit 1' HUP INT TERM
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -325,20 +334,23 @@ x86_64:62 | aarch64:183) ;;
 *) echo "${BINARY:-the download} is not built for $ARCH; use monitor-agent-$ARCH-unknown-linux-musl" >&2; exit 1 ;;
 esac
 
-# Everything this install writes beneath $ROOT is written while the running
-# agent still serves, under names of its own, and the binaries before the
-# registration: a full disk then ends the script before a key is spent or the
-# agent is stopped, and what follows the stop is renames, which need no space.
-# A partial copy never takes a final name, so a rollback cannot restore one.
+# Everything this install writes is written while the running agent still
+# serves, into a directory of this run's own beside the final names, and the
+# binary before the registration: a full disk then ends the script before a key
+# is spent or the agent is stopped, and what follows the stop is renames, which
+# need no space. A run that stops early leaves nothing behind, and a concurrent
+# one cannot remove what this one staged.
 install -d -m 0755 "$ROOT"
+STAGE=$(mktemp -d "$ROOT/.install-XXXXXX")
 # Kept until the new binary has proved it starts; see not_started. Never over
 # an existing copy: a run that died before that check left an unproven binary
-# in $BIN, and the copy is the one that ran before it.
+# in $BIN, and the copy is the one that ran before it. A hard link: $BIN is
+# replaced by a rename, which leaves this inode as it was, and a link takes no
+# space.
 if [ -f "$BIN" ] && [ ! -f "$BIN.old" ]; then
-	cp "$BIN" "$BIN.old.new"
-	mv -f "$BIN.old.new" "$BIN.old"
+	ln "$BIN" "$STAGE/old" 2>/dev/null || cp "$BIN" "$STAGE/old"
 fi
-install -m 0755 "$TMP" "$BIN.new"
+install -m 0755 "$TMP" "$STAGE/monitor-agent"
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -402,55 +414,19 @@ fi
 # with `systemctl cat` and need not be 0600.
 (
 	umask 077
-	cat >"$ENV_FILE.new" <<ENV
+	cat >"$STAGE/agent.env" <<ENV
 MONITOR_SERVER=$SERVER
 MONITOR_TOKEN=$TOKEN
 ENV
-	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$ENV_FILE.new"
+	[ -z "$IFACE" ] || printf 'MONITOR_IFACE=%s\n' "$IFACE" >>"$STAGE/agent.env"
 )
 
-# Stop an agent already running here before replacing its binary. The service
-# name is fixed, so a reinstall could never start a second copy, but without this
-# the new binary lands beneath a live process and only the restart at the end
-# picks it up. Placed after every write above, so a node that cannot fetch or
-# store the new files keeps running.
+# The service definition is staged beside its final name for the reason the
+# files above are: /etc commonly shares a disk with $ROOT.
 if [ "$INIT" = openrc ]; then
-	rc-service monitor-agent stop 2>/dev/null || true
-else
-	systemctl stop monitor-agent 2>/dev/null || true
-	# An agent installed before the fixed user ran under DynamicUser=, and while
-	# it runs nss-systemd resolves its transient user of the same name: the check
-	# above passes, and useradd refuses the name as taken. Stopping the unit
-	# releases that user, so the fixed one is created here. Should that fail, the
-	# old binary and unit are still in place and are started again.
-	id -u monitor-agent >/dev/null 2>&1 || add_user || {
-		systemctl start monitor-agent 2>/dev/null || true
-		echo "cannot create the system user monitor-agent" >&2
-		exit 1
-	}
-fi
-mv -f "$BIN.new" "$BIN"
-mv -f "$ENV_FILE.new" "$ENV_FILE"
-
-# The new agent is not running. The binary it replaced is put back and started
-# again, so a failed upgrade leaves the machine reporting as before; the unit
-# and env file just written suit that binary as well, since an upgrade keeps the
-# token and the settings. A first install has nothing to put back.
-not_started() {
-	echo "monitor-agent did not start; see: $1" >&2
-	[ -f "$BIN.old" ] || exit 1
-	mv -f "$BIN.old" "$BIN"
-	if [ "$INIT" = openrc ]; then
-		rc-service monitor-agent restart >/dev/null 2>&1 || true
-	else
-		systemctl restart monitor-agent || true
-	fi
-	echo "the previous monitor-agent binary is back in place and was restarted" >&2
-	exit 1
-}
-
-if [ "$INIT" = openrc ]; then
-	cat >"$RC_FILE" <<RC
+	SERVICE_FILE="$RC_FILE"
+	SERVICE_NEW=$(mktemp "$RC_FILE.install-XXXXXX")
+	cat >"$SERVICE_NEW" <<RC
 #!/sbin/openrc-run
 description="monitor agent"
 command="$BIN"
@@ -476,21 +452,11 @@ start_pre() {
 	set +a
 }
 RC
-	chmod 0755 "$RC_FILE"
-	rc-update add monitor-agent default >/dev/null
-	rc-service monitor-agent restart
-	# supervise-daemon reports the service started while it respawns an agent
-	# that exits at once, so the process itself is what is looked for, inside
-	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
-	# against the full path.
-	sleep 3
-	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
-	rm -f "$BIN.old"
-	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
-	exit 0
-fi
-
-cat >"$UNIT_FILE" <<UNIT
+	chmod 0755 "$SERVICE_NEW"
+else
+	SERVICE_FILE="$UNIT_FILE"
+	SERVICE_NEW=$(mktemp "$UNIT_FILE.install-XXXXXX")
+	cat >"$SERVICE_NEW" <<UNIT
 [Unit]
 Description=monitor agent
 After=network-online.target
@@ -525,6 +491,64 @@ MemoryMax=64M
 [Install]
 WantedBy=multi-user.target
 UNIT
+	chmod 0644 "$SERVICE_NEW"
+fi
+
+# Stop an agent already running here before replacing its binary. The service
+# name is fixed, so a reinstall could never start a second copy, but without this
+# the new binary lands beneath a live process and only the restart at the end
+# picks it up. Placed after every write above, so a node that cannot fetch or
+# store the new files keeps running.
+if [ "$INIT" = openrc ]; then
+	rc-service monitor-agent stop 2>/dev/null || true
+else
+	systemctl stop monitor-agent 2>/dev/null || true
+	# An agent installed before the fixed user ran under DynamicUser=, and while
+	# it runs nss-systemd resolves its transient user of the same name: the check
+	# above passes, and useradd refuses the name as taken. Stopping the unit
+	# releases that user, so the fixed one is created here. Should that fail, the
+	# old binary and unit are still in place and are started again.
+	id -u monitor-agent >/dev/null 2>&1 || add_user || {
+		systemctl start monitor-agent 2>/dev/null || true
+		echo "cannot create the system user monitor-agent" >&2
+		exit 1
+	}
+fi
+[ ! -f "$STAGE/old" ] || mv -f "$STAGE/old" "$BIN.old"
+mv -f "$STAGE/monitor-agent" "$BIN"
+mv -f "$STAGE/agent.env" "$ENV_FILE"
+mv -f "$SERVICE_NEW" "$SERVICE_FILE"
+
+# The new agent is not running. The binary it replaced is put back and started
+# again, so a failed upgrade leaves the machine reporting as before; the unit
+# and env file just written suit that binary as well, since an upgrade keeps the
+# token and the settings. A first install has nothing to put back.
+not_started() {
+	echo "monitor-agent did not start; see: $1" >&2
+	[ -f "$BIN.old" ] || exit 1
+	mv -f "$BIN.old" "$BIN"
+	if [ "$INIT" = openrc ]; then
+		rc-service monitor-agent restart >/dev/null 2>&1 || true
+	else
+		systemctl restart monitor-agent || true
+	fi
+	echo "the previous monitor-agent binary is back in place and was restarted" >&2
+	exit 1
+}
+
+if [ "$INIT" = openrc ]; then
+	rc-update add monitor-agent default >/dev/null
+	rc-service monitor-agent restart
+	# supervise-daemon reports the service started while it respawns an agent
+	# that exits at once, so the process itself is what is looked for, inside
+	# the respawn delay. pidof rather than pgrep -x, which BusyBox matches
+	# against the full path.
+	sleep 3
+	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
+	rm -f "$BIN.old"
+	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
+	exit 0
+fi
 
 systemctl daemon-reload
 systemctl enable monitor-agent >/dev/null
