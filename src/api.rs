@@ -3258,23 +3258,46 @@ mod tests {
     }
 
     /// What the panel saves is what an anonymous visitor reads, under the same
-    /// condition as the node list, and only an installed theme takes a write.
+    /// condition as the node list. Each theme keeps its own settings, and only
+    /// an installed theme takes a write.
     #[tokio::test]
     async fn saved_theme_settings_reach_visitors_while_the_status_page_is_open() {
-        let app = std::sync::Arc::new(app());
+        let themes = crate::TempDir::new("theme-config");
+        let aurora = themes.0.join("aurora");
+        std::fs::create_dir_all(aurora.join("dist")).unwrap();
+        std::fs::write(aurora.join("dist/index.html"), "").unwrap();
+        std::fs::write(
+            aurora.join("theme.json"),
+            r#"{"name":"极光","short":"aurora","description":"","version":"1","author":"a","url":""}"#,
+        )
+        .unwrap();
+        let app = std::sync::Arc::new(App { themes: themes.0.clone(), ..app() });
         let state = || axum::extract::State(app.clone());
         let read = |short: &str| theme_config(state(), HeaderMap::new(), Path(short.to_owned()));
         let body = |r: Response| async { axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap() };
+        let save = |short: &str, values: &Value| {
+            save_theme_config(
+                Admin,
+                state(),
+                Path(short.to_owned()),
+                Json(values.as_object().unwrap().clone()),
+            )
+        };
+        let stored = |short: &'static str| async move {
+            serde_json::from_slice::<Value>(&body(read(short).await).await).unwrap()
+        };
 
-        assert_eq!(&body(read("default").await).await[..], b"{}", "nothing saved reads as no overrides");
-        let values = json!({"notice": "维护中", "show_price": false}).as_object().unwrap().clone();
-        let saved = save_theme_config(Admin, state(), Path("default".into()), Json(values.clone())).await;
-        assert_eq!(saved.status(), StatusCode::NO_CONTENT);
-        let read_back: Value = serde_json::from_slice(&body(read("default").await).await).unwrap();
-        assert_eq!(read_back, Value::Object(values.clone()));
+        assert_eq!(stored("default").await, json!({}), "nothing saved reads as no overrides");
+        let values = json!({"notice": "维护中", "show_price": false});
+        let other = json!({"notice": "极光"});
+        assert_eq!(save("default", &values).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(save("aurora", &other).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(stored("default").await, values, "each theme keeps its own settings");
+        assert_eq!(stored("aurora").await, other);
 
-        let missing = save_theme_config(Admin, state(), Path("aurora".into()), Json(values.clone())).await;
+        let missing = save("solar", &values).await;
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "a theme that is not installed takes no write");
+        assert_eq!(stored("solar").await, json!({}), "and nothing is stored for it");
         assert_eq!(read("../etc").await.status(), StatusCode::NOT_FOUND);
 
         app.db.set("public_page", "off").unwrap();
