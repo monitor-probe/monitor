@@ -328,12 +328,12 @@ struct Rpc {
     params: serde_json::Value,
 }
 
-/// The node a request's bearer token belongs to, or the 401 text. The same
-/// text whether the token is malformed or merely unknown.
-fn authenticate(app: &App, headers: &HeaderMap) -> Result<i64, &'static str> {
+/// The node a request's bearer token belongs to, with the token, or the 401
+/// text. The same text whether the token is malformed or merely unknown.
+fn authenticate<'h>(app: &App, headers: &'h HeaderMap) -> Result<(i64, &'h str), &'static str> {
     let token = bearer(headers).ok_or("missing token")?;
     match app.db.node_by_token(token) {
-        Ok(Some(id)) => Ok(id),
+        Ok(Some(id)) => Ok((id, token)),
         _ => Err("invalid token"),
     }
 }
@@ -344,12 +344,11 @@ pub async fn handler(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let node_id = match authenticate(&app, &headers) {
-        Ok(id) => id,
+    let (node_id, token) = match authenticate(&app, &headers) {
+        Ok((id, token)) => (id, token.to_owned()),
         Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
     };
     let ip = node_ip(&app, &headers, peer.ip()).to_string();
-    let token = bearer(&headers).unwrap_or_default().to_owned();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
@@ -378,7 +377,7 @@ pub async fn echo(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let node_id = match authenticate(&app, &headers) {
-        Ok(id) => id,
+        Ok((id, _)) => id,
         Err(refusal) => return crate::api::answer(StatusCode::UNAUTHORIZED, refusal),
     };
     // A proxy that wrote nothing leaves the proxy's own address here, which
@@ -403,8 +402,7 @@ async fn serve(app: Shared, node_id: i64, token: &str, ip: String, mut socket: W
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    let Some(tag) = enlist(&app, node_id, token, tx) else {
-        debug!("node {node_id}: its token was reissued or the node deleted during the handshake");
+    let Some(tag) = tokio::task::block_in_place(|| enlist(&app, node_id, token, tx)) else {
         return Ok(());
     };
     info!("node {node_id} connected from {ip}");
@@ -500,19 +498,34 @@ async fn serve(app: Shared, node_id: i64, token: &str, ip: String, mut socket: W
 }
 
 /// Installs a session as the node's connection and returns its tag, or None,
-/// with nothing left installed, when `token` no longer belongs to the node.
+/// leaving the connection it found in place, when `token` no longer belongs to
+/// the node.
 ///
-/// The token was checked before the upgrade. A reissue or a delete landing
-/// between that check and this point removes an entry that is not yet this
-/// one, so the token is checked again once the entry is in place, where such
-/// a write landing later removes it instead.
+/// The token was checked before the upgrade. A reissue or a delete writes the
+/// database first and then removes the node's entry, so one landing between
+/// that check and this point removes an entry that is not yet this one; the
+/// token is therefore checked again once the entry is in place, where such a
+/// write landing later removes it instead. The session it displaced is held
+/// meanwhile and put back on a refusal: its channel stays open, so it does not
+/// notice, and a reissue that meant to end it removes it afterwards.
 fn enlist(app: &App, node_id: i64, token: &str, tx: mpsc::Sender<()>) -> Option<u64> {
     let tag = SESSION.fetch_add(1, Ordering::Relaxed);
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
-    if matches!(app.db.node_by_token(token), Ok(Some(id)) if id == node_id) {
-        return Some(tag);
+    let displaced =
+        app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
+    match app.db.node_by_token(token) {
+        Ok(Some(id)) if id == node_id => return Some(tag),
+        Ok(_) => info!(
+            "node {node_id}: refused a session whose token was reissued or node deleted during the handshake"
+        ),
+        Err(e) => warn!("node {node_id}: refused a session, its token could not be checked again: {e:#}"),
     }
-    release(app, node_id, tag);
+    let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+    if agents.get(&node_id).is_some_and(|a| a.session == tag) {
+        match displaced {
+            Some(agent) => agents.insert(node_id, agent),
+            None => agents.remove(&node_id),
+        };
+    }
     None
 }
 
@@ -1042,7 +1055,7 @@ mod tests {
             h.insert("authorization", value.parse().unwrap());
             h
         };
-        assert_eq!(authenticate(&app, &with(&format!("Bearer {token}"))).ok(), Some(id));
+        assert_eq!(authenticate(&app, &with(&format!("Bearer {token}"))).ok(), Some((id, token.as_str())));
         for refused in [HeaderMap::new(), with("Bearer nope"), with("Basic abc")] {
             assert!(authenticate(&app, &refused).is_err());
         }
@@ -1065,8 +1078,17 @@ mod tests {
         assert!(enlist(&app, id, &token, mpsc::channel(1).0).is_none(), "a reissued token is not");
         assert!(!online(&app));
 
-        let token = crate::auth::random_token();
-        app.db.reset_token(id, &token).unwrap();
+        // A refused session leaves the connection it found in place.
+        let current = crate::auth::random_token();
+        app.db.reset_token(id, &current).unwrap();
+        let (tx, mut live) = mpsc::channel(1);
+        let tag = enlist(&app, id, &current, tx).unwrap();
+        assert!(enlist(&app, id, &token, mpsc::channel(1).0).is_none());
+        assert_eq!(app.agents.read().unwrap()[&id].session, tag, "the current session keeps the node");
+        assert!(matches!(live.try_recv(), Err(mpsc::error::TryRecvError::Empty)), "and is not told to go");
+
+        let token = current;
+        app.agents.write().unwrap().remove(&id);
         assert!(app.db.delete_node(id).unwrap());
         assert!(enlist(&app, id, &token, mpsc::channel(1).0).is_none(), "nor a deleted node's");
         assert!(!online(&app));
