@@ -81,8 +81,9 @@ impl Arrival {
 pub struct Agent {
     /// Distinguishes one session on a node from the next; see [`release`].
     pub session: u64,
-    /// Outbound channel, used to push probe assignments.
-    pub tx: mpsc::Sender<String>,
+    /// Asks the session to resend the node's probe list; see [`push_ping_tasks`].
+    /// Closed, it ends the session.
+    pub tx: mpsc::Sender<()>,
     /// The latest report, or `Null` between connecting and the first one.
     pub metrics: serde_json::Value,
     pub last_seen: i64,
@@ -105,7 +106,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
+    pub fn new(session: u64, tx: mpsc::Sender<()>) -> Self {
         Self {
             session,
             tx,
@@ -396,18 +397,14 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<String>(16);
+    // One slot: a resend already queued reads the list as it is when it runs.
+    let (tx, mut rx) = mpsc::channel::<()>(1);
     let tag = SESSION.fetch_add(1, Ordering::Relaxed);
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(tag, tx));
     info!("node {node_id} connected from {ip}");
-
-    // Send the probe list before the first report arrives.
-    if let Some(tasks) = ping_tasks_message(&app, node_id) {
-        let _ = socket.send(Message::Text(tasks.into())).await;
-    }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.
@@ -418,11 +415,15 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     // steady link is days away.
     let mut owed: Option<String> = None;
     let mut session = Session::default();
+    // Sent before the first report arrives. The agent starts each connection
+    // without probes and replaces its list with each one it receives, so a list
+    // that cannot be read is owed and retried on the heartbeat, never sent empty.
+    let mut tasks_owed = send_tasks(&app, node_id, &mut socket, &mut session).await?;
 
     let outcome = loop {
         tokio::select! {
-            outbound = rx.recv() => match outbound {
-                Some(text) => socket.send(Message::Text(text.into())).await?,
+            resend = rx.recv() => match resend {
+                Some(()) => tasks_owed = send_tasks(&app, node_id, &mut socket, &mut session).await?,
                 None => break Ok(()),
             },
             // A machine that leaves the network without closing its socket would
@@ -448,6 +449,9 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                         Ok(false) => owed = None,
                         Err(e) => debug!("node {node_id}: country check failed: {e:#}"),
                     }
+                }
+                if tasks_owed {
+                    tasks_owed = send_tasks(&app, node_id, &mut socket, &mut session).await?;
                 }
                 socket.send(Message::Ping(Vec::new().into())).await?;
             }
@@ -922,41 +926,40 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
     Ok(())
 }
 
-/// The node's probe list as a frame, or `None` when it cannot be read: the
-/// agent replaces its list with whatever arrives, so an empty one would stop
-/// every probe until the next push or reconnect.
-fn ping_tasks_message(app: &App, node_id: i64) -> Option<String> {
-    match app.db.ping_tasks_for(node_id) {
-        Ok(tasks) => Some(json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string()),
+fn ping_tasks_message(app: &App, node_id: i64) -> Result<String> {
+    let tasks = app.db.ping_tasks_for(node_id)?;
+    Ok(json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string())
+}
+
+/// Sends the node's probe list and returns whether one is still owed: true when
+/// the list could not be read, which is then not sent at all.
+async fn send_tasks(app: &App, node_id: i64, socket: &mut WebSocket, session: &mut Session) -> Result<bool> {
+    // Off the worker, like every other read here: a restore or vacuum holds the
+    // connection for seconds while the agents reconnect.
+    match tokio::task::block_in_place(|| ping_tasks_message(app, node_id)) {
+        Ok(text) => {
+            socket.send(Message::Text(text.into())).await?;
+            Ok(false)
+        }
         Err(e) => {
-            warn!("node {node_id}: reading its probe list failed, so none was sent: {e:#}");
-            None
+            session.complain(
+                node_id,
+                format_args!("reading its probe list failed, retried each heartbeat: {e:#}"),
+            );
+            Ok(true)
         }
     }
 }
 
-/// Pushes the current probe list to the connected agents, so a panel edit takes
-/// effect without waiting for a reconnect. `only` limits it to one node, for an
-/// edit that changed that node alone: every push is a query and a message per
-/// agent.
+/// Asks the connected agents' sessions to resend their probe lists, so a panel
+/// edit takes effect without waiting for a reconnect. `only` limits it to one
+/// node, for an edit that changed that node alone. The read happens in each
+/// session, which retries a failed one on its heartbeat.
 pub fn push_ping_tasks(app: &App, only: Option<i64>) {
-    let connected: Vec<(i64, mpsc::Sender<String>)> = app
-        .agents
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|(id, _)| only.is_none_or(|only| only == **id))
-        .map(|(id, agent)| (*id, agent.tx.clone()))
-        .collect();
-    for (node_id, sender) in connected {
-        let Some(tasks) = ping_tasks_message(app, node_id) else { continue };
-        // The queue carries only these messages, so a full one indicates an agent
-        // that has stopped reading its socket. It is dropped within SILENCE and
-        // reconnects onto the current list; what must not happen is the panel
-        // reporting a push that never occurred.
-        if sender.try_send(tasks).is_err() {
-            warn!("node {node_id} is not draining its queue; it gets the new probe list when it reconnects");
-        }
+    let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+    for (_, agent) in agents.iter().filter(|(id, _)| only.is_none_or(|only| only == **id)) {
+        // Full means a resend is already queued; closed, a session ending.
+        let _ = agent.tx.try_send(());
     }
 }
 
@@ -998,7 +1001,7 @@ mod tests {
 
     /// A connected agent, the precondition for filing any report: the session
     /// holds the node's live state.
-    fn connect(app: &App) -> (i64, mpsc::Receiver<String>) {
+    fn connect(app: &App) -> (i64, mpsc::Receiver<()>) {
         let id = node(app);
         let (tx, rx) = mpsc::channel(4);
         app.agents.write().unwrap().insert(id, Agent::new(1, tx));
@@ -1481,12 +1484,18 @@ mod tests {
         // The busiest honest node runs every probe at the shortest interval, and
         // one window can span two of its rounds: none of that may be dropped.
         let task = probe(&app, id, "p");
-        let rounds = 2 * Db::MAX_PROBES_PER_NODE as usize;
-        for _ in 0..rounds + 10 {
-            send(&app, id, &mut session, 20, &result_json(task, 1)).unwrap();
+        let round = Db::MAX_PROBES_PER_NODE as usize;
+        let per_window = RESULT_WINDOW.as_secs().div_ceil(Db::MIN_PROBE_INTERVAL as u64) as usize + 1;
+        let rounds = round * per_window;
+        let window = RESULT_WINDOW.as_millis() as u64;
+        for n in 0..rounds + 10 {
+            // The first round opens the window; the others, and the excess, land
+            // in its last millisecond.
+            let ms = if n < round { 20_000 } else { 20_000 + window - 1 };
+            dispatch(&app, id, "ip", &result_json(task, 1), &mut session, at_ms(ms)).unwrap();
         }
-        assert_eq!(session.results.len(), rounds, "two full rounds pass, and the excess is dropped");
-        send(&app, id, &mut session, 25, &result_json(task, 1)).unwrap();
+        assert_eq!(session.results.len(), rounds, "every round an honest node fits in a window passes");
+        dispatch(&app, id, "ip", &result_json(task, 1), &mut session, at_ms(20_000 + window)).unwrap();
         assert_eq!(session.results.len(), rounds + 1, "the next window admits again");
 
         let due = |session: &mut Session, secs| {
@@ -1632,31 +1641,31 @@ mod tests {
         );
     }
 
-    /// A panel edit reaches the agents it concerns, carrying their own list.
+    /// A panel edit reaches the sessions it concerns, and each sends its own
+    /// node's list; one that cannot be read is an error, never an empty list.
     #[test]
     fn a_probe_edit_is_pushed_to_the_nodes_it_names() {
         let app = app();
         let (a, b) = (node(&app), node(&app));
         let task = probe(&app, a, "p");
-        let (ta, mut to_a) = mpsc::channel(4);
-        let (tb, mut to_b) = mpsc::channel(4);
+        let (ta, mut to_a) = mpsc::channel(1);
+        let (tb, mut to_b) = mpsc::channel(1);
         app.agents.write().unwrap().insert(a, Agent::new(1, ta));
         app.agents.write().unwrap().insert(b, Agent::new(2, tb));
 
         push_ping_tasks(&app, Some(a));
-        let sent: serde_json::Value = serde_json::from_str(&to_a.try_recv().unwrap()).unwrap();
-        assert_eq!(sent["method"], "ping.tasks");
-        assert_eq!(sent["params"][0]["id"], task);
-        assert!(to_b.try_recv().is_err(), "an edit of one node is pushed to that node alone");
-
-        push_ping_tasks(&app, None);
         assert!(to_a.try_recv().is_ok());
-        let sent: serde_json::Value = serde_json::from_str(&to_b.try_recv().unwrap()).unwrap();
-        assert_eq!(sent["params"], json!([]), "a node without probes is told so");
-
-        app.db.execute_for_test("DROP TABLE ping_node");
+        assert!(to_b.try_recv().is_err(), "an edit of one node is pushed to that node alone");
         push_ping_tasks(&app, None);
-        assert!(to_a.try_recv().is_err(), "a list that cannot be read is not sent as an empty one");
+        assert!(to_a.try_recv().is_ok() && to_b.try_recv().is_ok());
+
+        let list =
+            |id| serde_json::from_str::<serde_json::Value>(&ping_tasks_message(&app, id).unwrap()).unwrap();
+        assert_eq!(list(a)["method"], "ping.tasks");
+        assert_eq!(list(a)["params"][0]["id"], task);
+        assert_eq!(list(b)["params"], json!([]), "a node without probes is told so");
+        app.db.execute_for_test("DROP TABLE ping_node");
+        assert!(ping_tasks_message(&app, a).is_err(), "a list that cannot be read is not an empty one");
     }
 
     #[test]
