@@ -405,7 +405,9 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     info!("node {node_id} connected from {ip}");
 
     // Send the probe list before the first report arrives.
-    let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
+    if let Some(tasks) = ping_tasks_message(&app, node_id) {
+        let _ = socket.send(Message::Text(tasks.into())).await;
+    }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.
@@ -920,9 +922,17 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
     Ok(())
 }
 
-fn ping_tasks_message(app: &App, node_id: i64) -> String {
-    let tasks = app.db.ping_tasks_for(node_id).unwrap_or_default();
-    json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string()
+/// The node's probe list as a frame, or `None` when it cannot be read: the
+/// agent replaces its list with whatever arrives, so an empty one would stop
+/// every probe until the next push or reconnect.
+fn ping_tasks_message(app: &App, node_id: i64) -> Option<String> {
+    match app.db.ping_tasks_for(node_id) {
+        Ok(tasks) => Some(json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string()),
+        Err(e) => {
+            warn!("node {node_id}: reading its probe list failed, so none was sent: {e:#}");
+            None
+        }
+    }
 }
 
 /// Pushes the current probe list to the connected agents, so a panel edit takes
@@ -939,11 +949,12 @@ pub fn push_ping_tasks(app: &App, only: Option<i64>) {
         .map(|(id, agent)| (*id, agent.tx.clone()))
         .collect();
     for (node_id, sender) in connected {
+        let Some(tasks) = ping_tasks_message(app, node_id) else { continue };
         // The queue carries only these messages, so a full one indicates an agent
         // that has stopped reading its socket. It is dropped within SILENCE and
         // reconnects onto the current list; what must not happen is the panel
         // reporting a push that never occurred.
-        if sender.try_send(ping_tasks_message(app, node_id)).is_err() {
+        if sender.try_send(tasks).is_err() {
             warn!("node {node_id} is not draining its queue; it gets the new probe list when it reconnects");
         }
     }
@@ -1391,6 +1402,13 @@ mod tests {
         assert_eq!(total_rx(&app, id), 3_000, "the held reading is booked");
         assert_eq!(results(&app, id), vec![(task, 42)], "the gathered results are filed");
         assert_eq!(app.db.node(id).unwrap().unwrap().last_seen, at(10).at.timestamp());
+
+        // A session that ends before its first report has no time to record.
+        let (tx, _rx) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(id, Agent::new(2, tx));
+        let agent = release(&app, id, 2).expect("the session is still the node's");
+        close(&app, id, Some(&agent), &mut Session::default());
+        assert_eq!(app.db.node(id).unwrap().unwrap().last_seen, at(10).at.timestamp(), "last_seen stays");
     }
 
     /// A reconnect replacing a half-open session leaves that session's probe
@@ -1460,13 +1478,16 @@ mod tests {
         dispatch(&app, id, "ip", &cpu(3.0), &mut session, at_ms(11_000)).unwrap();
         assert_eq!(live_cpu(), 3.0, "one a second later is the agent's own pace");
 
+        // The busiest honest node runs every probe at the shortest interval, and
+        // one window can span two of its rounds: none of that may be dropped.
         let task = probe(&app, id, "p");
-        for _ in 0..RESULTS_PER_WINDOW + 10 {
+        let rounds = 2 * Db::MAX_PROBES_PER_NODE as usize;
+        for _ in 0..rounds + 10 {
             send(&app, id, &mut session, 20, &result_json(task, 1)).unwrap();
         }
-        assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize, "the excess of one window is dropped");
+        assert_eq!(session.results.len(), rounds, "two full rounds pass, and the excess is dropped");
         send(&app, id, &mut session, 25, &result_json(task, 1)).unwrap();
-        assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize + 1, "the next window admits again");
+        assert_eq!(session.results.len(), rounds + 1, "the next window admits again");
 
         let due = |session: &mut Session, secs| {
             session.held_hello_due(at(secs).tick).map(|f| f["hostname"].clone())
@@ -1632,6 +1653,10 @@ mod tests {
         assert!(to_a.try_recv().is_ok());
         let sent: serde_json::Value = serde_json::from_str(&to_b.try_recv().unwrap()).unwrap();
         assert_eq!(sent["params"], json!([]), "a node without probes is told so");
+
+        app.db.execute_for_test("DROP TABLE ping_node");
+        push_ping_tasks(&app, None);
+        assert!(to_a.try_recv().is_err(), "a list that cannot be read is not sent as an empty one");
     }
 
     #[test]
