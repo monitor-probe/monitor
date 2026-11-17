@@ -50,6 +50,16 @@ serde_urlencoded = "0.7"
 # dev-dependencies do not reach the shipped binary.
 tokio = { version = "1", features = ["test-util"] }
 
+# On top of clippy's defaults, which CI runs with -D warnings. Tests may still
+# unwrap (clippy.toml).
+[lints.clippy]
+# The release build aborts on panic, so a failed unwrap takes the whole hub
+# down, and every node's reporting with it: use ?, or expect("why this cannot
+# fail").
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
 [profile.release]
 codegen-units = 1
 lto = true
