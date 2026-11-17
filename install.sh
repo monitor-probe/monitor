@@ -263,13 +263,30 @@ esac
 # fetch releases itself is configured with a GitHub proxy in its own settings,
 # which is why none is requested here.
 URL="${SERVER%/}/agent/$ARCH"
-TMP="$(mktemp)"
+
+# Everything this install writes is written while the running agent still
+# serves, into a directory of this run's own beside the final names, the
+# download included and the binary before the registration: a full disk then
+# ends the script before a key is spent or the agent is stopped, and what
+# follows the stop is renames, which need no space. A run that stops early
+# leaves nothing behind, and a concurrent one cannot remove what this one
+# staged.
+install -d -m 0755 "$ROOT"
+# A run killed outright leaves its staging behind: a directory holding a whole
+# binary, and a service definition beside the final one. Those untouched for a
+# day belong to no live run.
+find "$ROOT" -maxdepth 1 -name '.install-*' -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
+find /etc/systemd/system /etc/init.d -maxdepth 1 -name 'monitor-agent*.install-*' -mmin +1440 \
+	-exec rm -f {} \; 2>/dev/null || true
 STAGE="" SERVICE_NEW=""
-# Staged files are removed on any exit before they take their final names. A
-# signal is turned into an exit, since dash runs no EXIT trap for a signal that
-# kills it.
-trap 'rm -f "$TMP" ${SERVICE_NEW:+"$SERVICE_NEW"}; [ -z "$STAGE" ] || rm -rf "$STAGE"' EXIT
+# Staged files are removed on any exit before they take their final names, and
+# $ROOT once nothing is left in it. Until the stop below a signal is turned into
+# an exit, since dash runs no EXIT trap for a signal that kills it; from the
+# stop on, signals are ignored (see there).
+trap 'rm -f ${SERVICE_NEW:+"$SERVICE_NEW"}; [ -z "$STAGE" ] || rm -rf "$STAGE"; rmdir "$ROOT" 2>/dev/null || true' EXIT
 trap 'exit 1' HUP INT TERM
+STAGE=$(mktemp -d "$ROOT/.install-XXXXXX")
+TMP="$STAGE/monitor-agent"
 
 # A machine whose link to the hub cannot carry the binary in time installs one
 # uploaded beforehand: registration and the service then need only a few small
@@ -334,17 +351,6 @@ x86_64:62 | aarch64:183) ;;
 *) echo "${BINARY:-the download} is not built for $ARCH; use monitor-agent-$ARCH-unknown-linux-musl" >&2; exit 1 ;;
 esac
 
-# Everything this install writes is written while the running agent still
-# serves, into a directory of this run's own beside the final names, and the
-# binary before the registration: a full disk then ends the script before a key
-# is spent or the agent is stopped, and what follows the stop is renames, which
-# need no space. A run that stops early leaves nothing behind, and a concurrent
-# one cannot remove what this one staged.
-install -d -m 0755 "$ROOT"
-# A run killed outright leaves its staging directory, which holds a whole
-# binary; one untouched for an hour belongs to no live run.
-find "$ROOT" -maxdepth 1 -name '.install-*' -mmin +60 -exec rm -rf {} + 2>/dev/null || true
-STAGE=$(mktemp -d "$ROOT/.install-XXXXXX")
 # Kept until the new binary has proved it starts; see not_started. Never over
 # an existing copy: a run that died before that check left an unproven binary
 # in $BIN, and the copy is the one that ran before it. A hard link: $BIN is
@@ -353,7 +359,7 @@ STAGE=$(mktemp -d "$ROOT/.install-XXXXXX")
 if [ -f "$BIN" ] && [ ! -f "$BIN.old" ]; then
 	ln "$BIN" "$STAGE/old" 2>/dev/null || cp "$BIN" "$STAGE/old"
 fi
-install -m 0755 "$TMP" "$STAGE/monitor-agent"
+chmod 0755 "$TMP"
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it
@@ -455,7 +461,6 @@ start_pre() {
 	set +a
 }
 RC
-	chmod 0755 "$SERVICE_NEW"
 else
 	SERVICE_FILE="$UNIT_FILE"
 	SERVICE_NEW=$(mktemp "$UNIT_FILE.install-XXXXXX")
@@ -504,9 +509,12 @@ fi
 # store the new files keeps running.
 #
 # From here to the health check the agent is down or unproven, and an
-# interrupted run would leave it so: a signal is ignored until the script ends,
-# by then reporting either a running agent or the rollback.
-trap '' HUP INT TERM
+# interrupted run would leave it so. Signals that would end or pause the run are
+# ignored until it ends, and a failed command no longer ends it: the health
+# check settles every step, reporting a running agent or rolling back. Output
+# can fail too, once the terminal has gone or a pipe reader has died.
+trap '' HUP INT QUIT TERM TSTP PIPE
+set +e
 if [ "$INIT" = openrc ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 else
@@ -522,29 +530,39 @@ else
 		exit 1
 	}
 fi
-[ ! -f "$STAGE/old" ] || mv -f "$STAGE/old" "$BIN.old"
-mv -f "$STAGE/monitor-agent" "$BIN"
-mv -f "$STAGE/agent.env" "$ENV_FILE"
-mv -f "$SERVICE_NEW" "$SERVICE_FILE"
-
 # The new agent is not running. The binary it replaced is put back and started
-# again, so a failed upgrade leaves the machine reporting as before; the unit
-# and env file just written suit that binary as well, since an upgrade keeps the
-# token and the settings. A first install has nothing to put back.
+# again before anything is reported, so a failed upgrade leaves the machine
+# reporting as before; the unit and env file just written suit that binary as
+# well, since an upgrade keeps the token and the settings. A first install has
+# nothing to put back.
 not_started() {
-	echo "monitor-agent did not start; see: $1" >&2
-	[ -f "$BIN.old" ] || exit 1
-	mv -f "$BIN.old" "$BIN"
-	if [ "$INIT" = openrc ]; then
-		rc-service monitor-agent restart >/dev/null 2>&1 || true
+	if [ -f "$BIN.old" ]; then
+		mv -f "$BIN.old" "$BIN"
+		if [ "$INIT" = openrc ]; then
+			rc-service monitor-agent restart >/dev/null 2>&1
+		else
+			systemctl restart monitor-agent
+		fi
+		echo "monitor-agent did not start; see: $1" >&2
+		echo "the previous monitor-agent binary is back in place and was restarted" >&2
 	else
-		systemctl restart monitor-agent || true
+		echo "monitor-agent did not start; see: $1" >&2
 	fi
-	echo "the previous monitor-agent binary is back in place and was restarted" >&2
 	exit 1
 }
 
+if ! { { [ ! -f "$STAGE/old" ] || mv -f "$STAGE/old" "$BIN.old"; } &&
+	mv -f "$STAGE/monitor-agent" "$BIN" &&
+	mv -f "$STAGE/agent.env" "$ENV_FILE" &&
+	mv -f "$SERVICE_NEW" "$SERVICE_FILE"; }; then
+	echo "the new files could not be renamed into place" >&2
+	not_started "the message above"
+fi
+
 if [ "$INIT" = openrc ]; then
+	# Executable only under its final name, so a staged copy left by a killed
+	# run is never taken for a service.
+	chmod 0755 "$RC_FILE"
 	rc-update add monitor-agent default >/dev/null
 	rc-service monitor-agent restart
 	# supervise-daemon reports the service started while it respawns an agent

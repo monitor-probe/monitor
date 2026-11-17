@@ -266,9 +266,12 @@ install_hub() {
 		useradd --system --no-create-home --shell /usr/sbin/nologin "$USER_NAME" ||
 		die "无法创建系统用户 $USER_NAME"
 	install -d -m 0755 "$ROOT"
-	# A run killed outright leaves its staging directory, which holds a whole
-	# binary; one untouched for an hour belongs to no live run.
-	find "$ROOT" -maxdepth 1 -name '.hub-install-*' -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+	# A run killed outright leaves its staging behind: a directory holding a
+	# whole binary, and a unit beside the final one. Those untouched for a day
+	# belong to no live run.
+	find "$ROOT" -maxdepth 1 -name '.hub-install-*' -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
+	find /etc/systemd/system -maxdepth 1 -name 'monitor-hub.service.install-*' -mmin +1440 \
+		-exec rm -f {} \; 2>/dev/null || true
 	# 0700 owned by the service user, so its group is irrelevant and nothing here
 	# depends on useradd having created one.
 	install -d -m 0700 -o "$USER_NAME" "$DATA"
@@ -375,7 +378,7 @@ UNIT
 	# From the stop to the health check the hub is down or unproven, and an
 	# interrupted run would leave it so: a signal there is ignored, until the
 	# hub serves again or the rollback has run.
-	trap '' HUP INT TERM
+	trap '' HUP INT QUIT TERM TSTP PIPE
 	# Stopped first so the new binary does not land beneath a live process.
 	systemctl stop "$SERVICE" 2>/dev/null || true
 	[ ! -f "$stage/old" ] || mv -f "$stage/old" "$backup"
@@ -398,7 +401,8 @@ UNIT
 		pw="$(new_password)"
 	fi
 
-	systemctl daemon-reload
+	# Not left to set -e either: the health check below settles it.
+	systemctl daemon-reload || true
 	systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 	# Not left to set -e: a binary that cannot exec fails the job itself, which is
 	# precisely the case the rollback below exists for. Unguarded, the script
@@ -429,6 +433,7 @@ UNIT
 	fi
 	rm -f "$BIN.old"
 	trap 'exit 1' HUP INT TERM
+	trap - QUIT TSTP PIPE
 	ok "服务" "已启动并开机自启"
 
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
