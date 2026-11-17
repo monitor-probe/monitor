@@ -1483,6 +1483,12 @@ impl Db {
         rows.map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
+    /// Runs a statement on the writer, for tests that need the database to fail.
+    #[cfg(test)]
+    pub fn execute_for_test(&self, sql: &str) {
+        self.conn().execute_batch(sql).unwrap();
+    }
+
     /// The traffic row as stored, without the period gate `all_traffic` applies,
     /// for tests that compare what two ways of booking left behind.
     #[cfg(test)]

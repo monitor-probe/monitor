@@ -399,33 +399,34 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
         .with_context(|| format!("user response ({status}): {}", body.chars().take(200).collect::<String>()))
         .context(Shown(format!("GitHub 没有返回用户信息（HTTP {}），重新登录再试", status.as_u16())))?;
 
-    if !allowed.contains(&user.login.to_lowercase()) {
-        // The list stays in the log and out of the reason, which travels back in
-        // a query string: any GitHub account can reach that page, and a reason
-        // carrying the allow list would disclose the accounts worth phishing.
-        warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
-        refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
-    }
-    let id = user.id.to_string();
-    match app.db.bind_github(&user.login.to_lowercase(), &id)? {
-        None => {
-            warn!("GitHub user {} was removed from the allowed list during sign-in", user.login);
-            refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
-        }
-        Some(bound) if bound != id => {
-            warn!(
-                "GitHub user {} is account {id}, but the name first signed in as account {bound}",
-                user.login
-            );
-            refuse!(
-                "GitHub 用户 {} 已经不是第一次登录时的那个账号。如果账号确实重建过，先把它从允许名单里删掉并保存，再加回来",
-                user.login
-            );
-        }
-        Some(_) => {}
-    }
+    admit(app, &user.login, &user.id.to_string())?;
     info!("GitHub sign-in accepted for {}", user.login);
     Ok(user.login)
+}
+
+/// Admits a GitHub account whose login the allow list names, provided it is the
+/// account that login first signed in as. `Db::bind_github` decides both under
+/// the writer lock; this turns its answer into the reason the sign-in page shows.
+fn admit(app: &App, login: &str, account: &str) -> Result<()> {
+    match app.db.bind_github(&login.to_lowercase(), account)? {
+        None => {
+            // The list stays in the log and out of the reason, which travels back in
+            // a query string: any GitHub account can reach that page, and a reason
+            // carrying the allow list would disclose the accounts worth phishing.
+            let list = app.db.get("github_allowed_users").unwrap_or_default();
+            warn!("GitHub user {login} is not on the allowed list {list:?}");
+            refuse!("GitHub 用户 {login} 不在允许登录的名单里");
+        }
+        Some(bound) if bound != account => {
+            warn!(
+                "GitHub user {login} is account {account}, but the name first signed in as account {bound}"
+            );
+            refuse!(
+                "GitHub 用户 {login} 已经不是第一次登录时的那个账号。如果账号确实重建过，先把它从允许名单里删掉并保存，再加回来"
+            );
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 /// The GitHub account each listed login belonged to when it first signed in,
@@ -638,6 +639,27 @@ mod tests {
         // mistake a lockout.
         t.clear(other);
         assert_eq!(held(), 0);
+    }
+
+    /// The binding rules are `Db::bind_github`'s and tested there. What `admit`
+    /// adds is the case GitHub ignores, and refusals whose reason, which travels
+    /// in a query string, names neither the list nor the bound account.
+    #[test]
+    fn github_admits_only_a_listed_name_and_only_the_account_it_first_bound() {
+        let app = shared();
+        app.db.set_github_allowed("Alice,bob").unwrap();
+        let refused = |login: &str, account| {
+            let e = admit(&app, login, account).expect_err(login);
+            e.downcast_ref::<Shown>().expect("a reason for the sign-in page").0.to_lowercase()
+        };
+
+        assert!(admit(&app, "ALICE", "1001").is_ok(), "a listed name signs in whatever its case");
+        assert!(admit(&app, "alice", "1001").is_ok(), "and its account returns");
+        let reason = refused("alice", "2002");
+        assert!(reason.contains("不是第一次登录时的那个账号") && !reason.contains("1001"), "{reason}");
+        let reason = refused("mallory", "3003");
+        assert!(reason.contains("mallory 不在允许登录的名单里"), "{reason}");
+        assert!(!reason.contains("alice") && !reason.contains("bob"), "{reason}");
     }
 
     /// Taken by every test that passes through `PASSWORD_GATE`, which is
