@@ -1370,11 +1370,6 @@ pub async fn reorder_ping_tasks(_: Admin, State(app): State<Shared>, Json(order)
 /// draws a probe at 100% loss indefinitely with nothing in any log identifying
 /// the target as the cause.
 fn valid_target(target: &str) -> bool {
-    // No host name holds one, and each would reach the agent escaped to six
-    // bytes, beyond what `MAX_TARGET` reckons with.
-    if target.chars().any(char::is_control) {
-        return false;
-    }
     let (host, port) = match target.strip_prefix('[') {
         Some(rest) => match rest.split_once("]:") {
             Some(pair) => pair,
@@ -1392,10 +1387,14 @@ fn valid_target(target: &str) -> bool {
 
 /// The longest probe target, in bytes: a 253-character host name with its
 /// trailing dot, then `:65535`. Every target assigned to a node travels to it
-/// in one `ping.tasks` frame, which the agent refuses past 64 KiB; refused, the
-/// agent drops the session and receives the same frame on every reconnect, and
-/// the node stays offline. 64 probes at this length are about 19 KB.
+/// in one `ping.tasks` frame, which the agent refuses past 64 KiB, the same
+/// ceiling as [`MAX_FRAME`]; refused, the agent drops the session and receives
+/// the same frame on every reconnect, and the node stays offline. Control
+/// characters are refused, so a target grows at most twofold in JSON (`"` and
+/// `\` escaped), which with each task's other fields keeps a full list near
+/// 37 KB.
 const MAX_TARGET: usize = 260;
+const _: () = assert!(Db::MAX_PROBES_PER_NODE as usize * (2 * MAX_TARGET + 64) <= MAX_FRAME);
 
 pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task): Json<PingTask>) -> Response {
     // Trimmed into the stored value rather than a discarded copy: what reaches
@@ -1412,7 +1411,12 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
         return bad("名称最多 64 个字");
     }
     if task.target.len() > MAX_TARGET {
-        return bad(&format!("目标太长，最多 {MAX_TARGET} 个字符"));
+        return bad(&format!("目标太长，最多 {MAX_TARGET} 字节（一个汉字占 3 字节）"));
+    }
+    // No host name holds one, and each would reach the agent escaped to six
+    // bytes, past what `MAX_TARGET` allows for.
+    if task.target.chars().any(char::is_control) {
+        return bad("目标里有不可见的字符，删掉重新输入");
     }
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
@@ -2513,16 +2517,9 @@ mod tests {
         // Each of these causes `lookup_host` to return an error, verified against
         // it: a bare IPv6 address is all colons, and the other two omit the half
         // the message requires.
-        for bad in [
-            "2606:4700:4700::1111",
-            ":443",
-            "example.com:",
-            "1.1.1.1",
-            "1.1.1.1:0",
-            "[::1]:x",
-            "[::1]",
-            "a\u{1}b:80",
-        ] {
+        for bad in
+            ["2606:4700:4700::1111", ":443", "example.com:", "1.1.1.1", "1.1.1.1:0", "[::1]:x", "[::1]"]
+        {
             assert!(!valid_target(bad), "{bad}");
         }
         for good in ["1.1.1.1:443", "[2606:4700:4700::1111]:443", "example.com:80", "[::1]:1"] {
@@ -2558,8 +2555,8 @@ mod tests {
         assert_eq!(app.db.ping_tasks().unwrap().len(), 1);
     }
 
-    /// A name reaches every visitor as a chart label, and a target reaches the
-    /// agent inside a frame it refuses past 64 KiB, so both have a ceiling.
+    /// A target reaches the agent inside a frame it refuses past 64 KiB, so it
+    /// has a ceiling; a name of exactly `MAX_NAME` characters is still taken.
     #[tokio::test]
     async fn a_probe_name_and_target_have_a_ceiling() {
         let app = std::sync::Arc::new(app());
@@ -2570,8 +2567,9 @@ mod tests {
         let host = |len: usize| format!("{}:65535", "a".repeat(len - ":65535".len()));
         assert_eq!(save("探".repeat(MAX_NAME), "1.1.1.1:443".into()).await.status(), StatusCode::OK);
         assert_eq!(
-            save("探".repeat(MAX_NAME + 1), "1.1.1.1:443".into()).await.status(),
-            StatusCode::BAD_REQUEST
+            save("p".into(), "a\u{85}b:80".into()).await.status(),
+            StatusCode::BAD_REQUEST,
+            "control character"
         );
         assert_eq!(save("p".into(), host(MAX_TARGET)).await.status(), StatusCode::OK);
         assert_eq!(save("p".into(), host(MAX_TARGET + 1)).await.status(), StatusCode::BAD_REQUEST);

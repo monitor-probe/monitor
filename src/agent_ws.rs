@@ -947,6 +947,15 @@ fn tasks_frame(app: &App, node_id: i64, failing: &mut bool) -> Option<String> {
             if std::mem::replace(failing, false) {
                 info!("node {node_id}: its probe list was read and sent after failing");
             }
+            // Only targets stored before the panel bounded them, or restored
+            // from such a backup, reach this. Sent all the same: the agent's
+            // refusal is the visible symptom, and this names its cause.
+            if text.len() > crate::api::MAX_FRAME {
+                warn!(
+                    "node {node_id}: its probe list is {} bytes, past the agent's 64 KiB frame limit; the agent will drop each session until the probe targets are shortened",
+                    text.len()
+                );
+            }
             Some(text)
         }
         Err(e) if *failing => {

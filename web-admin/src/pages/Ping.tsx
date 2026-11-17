@@ -89,7 +89,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
                 <Input autoFocus={!task.id} maxLength={64} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
               </Field>
               <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接">
-                <Input value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />
+                <Input maxLength={260} value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />
               </Field>
               <Field label="间隔（秒）" hint="5–3600">
                 <Input type="number" min="5" max="3600" value={every} onChange={(e) => setEvery(e.target.value)} />
