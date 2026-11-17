@@ -704,6 +704,43 @@ mod tests {
         assert!(refused(&[full.as_slice(), &[1]].concat()));
     }
 
+    /// Files count toward [`MAX_ENTRIES`] alongside the directories their
+    /// paths imply: a package of files each in a directory of its own installs
+    /// at exactly the ceiling and is refused one past it, with the entries
+    /// themselves well under it.
+    #[test]
+    fn files_and_the_directories_they_imply_share_one_ceiling() {
+        let tmp = crate::TempDir::new("entry-ceiling");
+        let base = tmp.0.clone();
+        let manifest = r#"{"name":"x","short":"x","description":"","version":"1","author":"a","url":""}"#;
+        // theme.json, dist/index.html and the dist directory, then one file and
+        // one directory per `d{i}/f`.
+        let pack = |extra: bool, spread: usize| {
+            let mut tar =
+                tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+            let mut add = |name: &str, data: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                tar.append_data(&mut header, name, data).unwrap();
+            };
+            add("theme.json", manifest.as_bytes());
+            add("dist/index.html", b"x");
+            if extra {
+                add("dist/extra", b"x");
+            }
+            for i in 0..spread {
+                add(&format!("d{i}/f"), b"x");
+            }
+            tar.into_inner().unwrap().finish().unwrap()
+        };
+        assert!(install(&base, &pack(true, (MAX_ENTRIES - 4) / 2)[..], None).is_ok(), "exactly the ceiling");
+        let Err(past) = install(&base, &pack(false, (MAX_ENTRIES - 2) / 2)[..], None) else {
+            panic!("one past the ceiling installed")
+        };
+        assert!(format!("{past:#}").contains("文件和目录"), "one past it: {past:#}");
+    }
+
     /// Everything an uploaded archive must satisfy before replacing a theme
     /// currently being served.
     #[test]
