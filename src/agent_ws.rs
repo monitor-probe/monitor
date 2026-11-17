@@ -1236,8 +1236,9 @@ mod tests {
     }
 
     /// A minute of reports a second apart: each moves the live view, history
-    /// takes one row stamped on the boundary, and the traffic row is booked as
-    /// the minute turns rather than with every report.
+    /// takes one row stamped on the boundary, and the traffic row and
+    /// `last_seen` are written as the minute turns (`last_seen` also by the
+    /// session's first report) rather than with every report.
     #[test]
     fn a_minute_of_reports_writes_one_row_and_books_traffic_as_it_turns() {
         let app = app();
@@ -1301,38 +1302,50 @@ mod tests {
         let app = app();
         let (id, _held) = connect(&app);
         let mut session = Session::default();
-        let burst = |rx: i64, instant: i64, cpu: f64, count: i64| {
-            json!({"jsonrpc": "2.0", "method": "report",
-                   "params": {"boot_id": "boot-a", "net_rx_total": rx, "net_tx_total": 0,
-                              // What the agent measured over its own last second.
-                              "net_rx": instant, "net_tx": instant, "cpu": cpu, "mem_used": count,
-                              "swap_used": count, "disk_used": count, "tcp": count, "udp": count,
-                              "procs": count}})
-            .to_string()
+        // Every column gets a value of its own, so two of them swapped anywhere
+        // between the report and the read shows.
+        const OFFSETS: [(&str, i64); 6] = [
+            ("mem_used", 0),
+            ("swap_used", 1_000),
+            ("disk_used", 2_000),
+            ("tcp", 3_000),
+            ("udp", 4_000),
+            ("procs", 5_000),
+        ];
+        let burst = |(rx, tx): (i64, i64), (rx_now, tx_now): (i64, i64), cpu: f64, count: i64| {
+            let mut params = json!({"boot_id": "boot-a", "net_rx_total": rx, "net_tx_total": tx,
+                                    // What the agent measured over its own last second.
+                                    "net_rx": rx_now, "net_tx": tx_now, "cpu": cpu});
+            for (column, offset) in OFFSETS {
+                params[column] = json!(count + offset);
+            }
+            json!({"jsonrpc": "2.0", "method": "report", "params": params}).to_string()
         };
 
-        // Busy for half the minute, then idle; 60 MB arrive in between, and by
-        // the next sample both have ended. The sample halfway caught the busiest
-        // second of the burst. The first lands half a second in, so the row spans
-        // 59.5 s.
-        dispatch(&app, id, "ip", &burst(1_000, 0, 99.5, 100), &mut session, at_ms(500)).unwrap();
-        send(&app, id, &mut session, 30, &burst(1_000 + 45_000_000, 3_000_000, 50.0, 151)).unwrap();
-        send(&app, id, &mut session, 60, &burst(1_000 + 60_000_000, 0, 1.0, 201)).unwrap();
+        // The CPU is busiest at the first sample and eases off; 60 MB come down
+        // and 20 MB go up in between, and the halfway sample caught the busiest
+        // second of that transfer. The first lands half a second in, so the row
+        // spans 59.5 s.
+        dispatch(&app, id, "ip", &burst((1_000, 0), (0, 0), 99.5, 100), &mut session, at_ms(500)).unwrap();
+        let halfway = burst((1_000 + 45_000_000, 15_000_000), (3_000_000, 1_000_000), 50.0, 151);
+        send(&app, id, &mut session, 30, &halfway).unwrap();
+        send(&app, id, &mut session, 60, &burst((1_000 + 60_000_000, 20_000_000), (0, 0), 1.0, 201)).unwrap();
 
         let row = &app.db.metrics(id, Span::minutes(0, 60)).unwrap()[0];
         assert_eq!(
             row["net_rx"], 1_008_403,
             "60 MB over 59.5 s, not the agent's 0 nor over 59 whole seconds"
         );
+        assert_eq!(row["net_tx"], 336_134, "20 MB over 59.5 s, from the tx counter");
         assert_eq!(row["net_rx_max"], 3_000_000, "the busiest second survives the mean");
-        assert_eq!(row["net_tx_max"], 3_000_000, "for each direction");
+        assert_eq!(row["net_tx_max"], 1_000_000, "in each direction");
         let cpu = row["cpu"].as_f64().unwrap();
         assert!((cpu - 150.5 / 3.0).abs() < 1e-9, "the mean of the minute, fraction kept: {cpu}");
         assert_eq!(row["cpu_max"], 99.5, "and its busiest second of CPU survives it too");
         // Integers remain integral: the column is read with as_i64, which returns
         // nothing for the 150.67 the raw mean would produce.
-        for column in ["mem_used", "swap_used", "disk_used", "tcp", "udp", "procs"] {
-            assert_eq!(row[column], 151, "{column}");
+        for (column, offset) in OFFSETS {
+            assert_eq!(row[column], 151 + offset, "{column}");
         }
         // The live view still shows the instantaneous reading, which is its
         // purpose.
