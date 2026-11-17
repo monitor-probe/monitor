@@ -4193,6 +4193,13 @@ mod tests {
         let Json(read) = settings(Admin, State(app.clone()), peer(), HeaderMap::new()).await;
         assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
         assert_eq!(read["your_address"], "198.51.100.7");
+        assert_eq!(
+            read["notify_telegram_text"],
+            crate::notify::DEFAULT_TEXT,
+            "an unset template reads as its default"
+        );
+        assert_eq!(read["notify_webhook_body"], crate::notify::DEFAULT_BODY);
+        assert_eq!(read["notify_login"], "on");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -4214,6 +4221,10 @@ mod tests {
             "a fresh hub's own settings must survive a round trip"
         );
         assert_eq!(app.db.retention_days(), 30, "and the stored window is the one that was shown");
+
+        app.db.set("notify_login", "off").unwrap();
+        let Json(read) = settings(Admin, State(app.clone()), peer(), HeaderMap::new()).await;
+        assert_eq!(read["notify_login"], "off", "a switched-off sign-in alert reads back off");
     }
 
     /// Each key's check, through the route that stores it: a refused value
