@@ -660,13 +660,13 @@ const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 /// hidden until the retry.
 ///
 /// ponytail: no backoff beyond that one window, and the record is per process. A
-/// hub restart repeats the lookup once per node.
+/// hub restart lifts the gate, so each node still without a country is looked
+/// up again at once.
 fn locate(app: Shared, node_id: i64, source: String) {
     let mut asked = ASKED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if asked.get(&node_id).is_some_and(|at| at.elapsed() < LOCATE_RETRY) {
+    if !may_ask(&mut asked, node_id, Instant::now()) {
         return;
     }
-    asked.insert(node_id, Instant::now());
     drop(asked);
 
     tokio::spawn(async move {
@@ -674,17 +674,35 @@ fn locate(app: Shared, node_id: i64, source: String) {
             let url = format!("https://ipinfo.io/{source}/country");
             anyhow::Ok(app.http.get(url).send().await?.error_for_status()?.text().await?)
         };
-        let cc = match lookup.await {
-            Ok(body) => body.trim().to_ascii_uppercase(),
+        let body = match lookup.await {
+            Ok(body) => body,
             Err(e) => return debug!("node {node_id}: no country for {source}: {e:#}"),
         };
-        if cc.len() != 2 || !cc.bytes().all(|b| b.is_ascii_uppercase()) {
+        let Some(cc) = country_code(&body) else {
             return debug!("node {node_id}: {source} resolved to no country");
-        }
+        };
         if let Err(e) = app.db.set_country(node_id, &cc, &source) {
             warn!("node {node_id}: storing country {cc} failed: {e:#}");
         }
     });
+}
+
+/// Whether a node may be looked up at `now` under [`ASKED`], recording the
+/// lookup when it may.
+fn may_ask(asked: &mut HashMap<i64, Instant>, node_id: i64, now: Instant) -> bool {
+    if asked.get(&node_id).is_some_and(|at| now.saturating_duration_since(*at) < LOCATE_RETRY) {
+        return false;
+    }
+    asked.insert(node_id, now);
+    true
+}
+
+/// The country in a lookup's reply. The reply reaches the public page, so
+/// nothing but two ASCII letters passes: a proxy's error page or an empty body
+/// is no answer.
+fn country_code(body: &str) -> Option<String> {
+    let cc = body.trim().to_ascii_uppercase();
+    (cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_uppercase())).then_some(cc)
 }
 
 /// Figures `api::node_view` fills into `metrics` from the traffic row. They never
@@ -1547,6 +1565,26 @@ mod tests {
         {
             assert!(public(ip), "{ip}");
         }
+    }
+
+    #[test]
+    fn a_lookup_reply_counts_only_as_two_letters() {
+        assert_eq!(country_code(" us\n").as_deref(), Some("US"));
+        for body in ["", "U", "USA", "U1", "<!doctype html>", "ÜS"] {
+            assert_eq!(country_code(body), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_node_is_looked_up_at_most_once_an_hour() {
+        let mut asked = HashMap::new();
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+        assert!(may_ask(&mut asked, 1, t0));
+        assert!(!may_ask(&mut asked, 1, t0 + LOCATE_RETRY - second));
+        assert!(may_ask(&mut asked, 2, t0 + second), "the gate is per node");
+        assert!(may_ask(&mut asked, 1, t0 + LOCATE_RETRY));
+        assert!(!may_ask(&mut asked, 1, t0 + LOCATE_RETRY + second), "the hour restarts at each lookup");
     }
 
     #[test]
