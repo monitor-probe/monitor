@@ -501,7 +501,8 @@ fn batch(event: &'static str, mark: &str, what: &str, items: Vec<(&str, String)>
 /// `notify_`, whose keys the panel reads and writes.
 pub(crate) const TRAFFIC_ALERTED: &str = "traffic_alerted";
 
-/// Sweep state that need not outlive the process.
+/// Sweep state that need not outlive the process, in the monotonic seconds
+/// `sweep` is given as `steady`.
 #[derive(Default)]
 pub struct Watch {
     /// Per absent node, when a sweep first found it absent. Absence is measured
@@ -519,10 +520,16 @@ pub struct Watch {
 pub async fn watch(app: Shared) {
     let mut watch = Watch::default();
     let mut ticker = tokio::time::interval(SWEEP);
+    // Absences are timed on this rather than the wall clock. A hub started
+    // before NTP corrects a clock running hours fast, as an RTC kept in local
+    // time reads, would otherwise date them hours ahead and hold its offline
+    // alerts back by the correction as well as the grace period.
+    let started = std::time::Instant::now();
     loop {
         ticker.tick().await;
+        let (now, steady) = (Utc::now().timestamp(), started.elapsed().as_secs() as i64);
         // Synchronous database work, kept off the runtime threads like a report.
-        match tokio::task::block_in_place(|| sweep(&app, &mut watch, Utc::now().timestamp())) {
+        match tokio::task::block_in_place(|| sweep(&app, &mut watch, now, steady)) {
             Ok(notes) => notes.into_iter().for_each(|note| send(&app, note)),
             Err(e) => warn!("notification sweep failed: {e:#}"),
         }
@@ -541,7 +548,10 @@ pub async fn watch(app: Shared) {
 /// silent in both directions. Nothing is recorded as announced while no channel
 /// is configured, so configuring one afterwards still reports nodes already down
 /// and traffic already past a step.
-fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
+///
+/// `now` is the wall clock, against which `last_seen` and `down_since` are
+/// stamped; `steady` is monotonic seconds, on which [`Watch`] times absences.
+fn sweep(app: &App, watch: &mut Watch, now: i64, steady: i64) -> Result<Vec<Note>> {
     let online: HashSet<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     let nodes = app.db.nodes()?;
     // A deleted node's id is never issued again (`db::next_id`); this only
@@ -554,8 +564,8 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let (mut down, mut up) = (Vec::new(), Vec::new());
     for node in &nodes {
         if online.contains(&node.id) {
-            if watch.absent.remove(&node.id).is_some_and(|since| now - since >= grace) {
-                watch.returned.insert(node.id, now);
+            if watch.absent.remove(&node.id).is_some_and(|since| steady - since >= grace) {
+                watch.returned.insert(node.id, steady);
             }
             if node.down_since > 0 {
                 app.db.set_down_since(node.id, 0)?;
@@ -568,10 +578,10 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
         if node.last_seen == 0 {
             continue;
         }
-        let since = *watch.absent.entry(node.id).or_insert(now);
+        let since = *watch.absent.entry(node.id).or_insert(steady);
         let flapping = watch.returned.get(&node.id).is_some_and(|back| since - back < FLAP_WINDOW);
         let wait = if flapping { FLAP_GRACE } else { grace };
-        if armed && node.notify && node.down_since == 0 && now - since >= wait {
+        if armed && node.notify && node.down_since == 0 && steady - since >= wait {
             app.db.set_down_since(node.id, node.last_seen)?;
             down.push((node.name.as_str(), format!("最后上报 {}", clock(node.last_seen))));
         }
@@ -739,6 +749,8 @@ mod tests {
             "internal state is not a setting"
         );
         assert!(setting_error("notify_unknown", "").is_some(), "an empty value does not make a key known");
+        assert_eq!(setting_error("notify_grace", "30"), None);
+        assert!(setting_error("notify_grace", "31").is_some(), "the grace period stops at FLAP_GRACE");
 
         // A long list is cut to what Discord and WeCom accept; `node` stays whole.
         let names: Vec<String> = (0..60).map(|i| format!("n{i}")).collect();
@@ -762,29 +774,48 @@ mod tests {
 
         // Nothing is marked while no channel could carry the alert, so the nodes
         // are still reported once one is configured.
-        assert!(sweep(&app, &mut watch, now).unwrap().is_empty(), "the grace period starts when seen absent");
-        assert!(sweep(&app, &mut watch, now + 180).unwrap().is_empty(), "no channel");
+        assert!(
+            sweep(&app, &mut watch, now, now).unwrap().is_empty(),
+            "the grace period starts when seen absent"
+        );
+        assert!(sweep(&app, &mut watch, now + 180, now + 180).unwrap().is_empty(), "no channel");
         with_channel(&app);
         connect(&app, brief);
-        let notes = sweep(&app, &mut watch, now + 210).unwrap();
+        let notes = sweep(&app, &mut watch, now + 210, now + 210).unwrap();
         assert_eq!(notes.len(), 1, "two nodes down in one sweep are one alert");
         assert_eq!(notes[0].title, "🔴 2 台节点离线");
         assert_eq!(notes[0].node, "b, a", "not the opted-out node, nor one back within the grace period");
-        assert!(sweep(&app, &mut watch, now + 240).unwrap().is_empty(), "announced once");
+        assert!(sweep(&app, &mut watch, now + 240, now + 240).unwrap().is_empty(), "announced once");
 
         // A restart forgets nothing that was announced: the state is in the row.
         let mut restarted = Watch::default();
-        assert!(sweep(&app, &mut restarted, now + 300).unwrap().is_empty());
-        assert!(sweep(&app, &mut restarted, now + 900).unwrap().is_empty());
+        assert!(sweep(&app, &mut restarted, now + 300, now + 300).unwrap().is_empty());
+        assert!(sweep(&app, &mut restarted, now + 900, now + 900).unwrap().is_empty());
 
         connect(&app, a);
         connect(&app, quiet);
-        let notes = sweep(&app, &mut restarted, now + 900).unwrap();
+        let notes = sweep(&app, &mut restarted, now + 900, now + 900).unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].event, "online");
         assert_eq!(notes[0].title, "🟢 a 恢复在线", "only the node whose absence was announced");
         assert_eq!(notes[0].message, "离线 25 分钟");
-        assert!(sweep(&app, &mut restarted, now + 930).unwrap().is_empty());
+        assert!(sweep(&app, &mut restarted, now + 930, now + 930).unwrap().is_empty());
+    }
+
+    /// Absences are timed on the monotonic clock: a hub started on a clock hours
+    /// fast, which NTP then corrects, still reports within the grace period.
+    #[test]
+    fn a_clock_corrected_after_startup_does_not_hold_an_offline_alert_back() {
+        let app = app();
+        with_channel(&app);
+        let now = 1_000_000;
+        node(&app, "a", true, now - 600);
+        let mut watch = Watch::default();
+        assert!(sweep(&app, &mut watch, now + 8 * 3_600, 0).unwrap().is_empty());
+        assert!(sweep(&app, &mut watch, now + 150, 150).unwrap().is_empty(), "inside the grace period");
+        let notes = sweep(&app, &mut watch, now + 180, 180).unwrap();
+        assert_eq!(notes.len(), 1, "announced once the grace period has passed");
+        assert_eq!(notes[0].event, "offline");
     }
 
     #[test]
@@ -802,9 +833,15 @@ mod tests {
         let now = 1_000_000;
         node(&app, "n", true, now - 600);
         let mut watch = Watch::default();
-        assert!(sweep(&app, &mut watch, now).unwrap().is_empty(), "the grace period starts when seen absent");
-        assert!(sweep(&app, &mut watch, now + 150).unwrap().is_empty(), "inside the default three minutes");
-        assert_eq!(sweep(&app, &mut watch, now + 210).unwrap().len(), 1);
+        assert!(
+            sweep(&app, &mut watch, now, now).unwrap().is_empty(),
+            "the grace period starts when seen absent"
+        );
+        assert!(
+            sweep(&app, &mut watch, now + 150, now + 150).unwrap().is_empty(),
+            "inside the default three minutes"
+        );
+        assert_eq!(sweep(&app, &mut watch, now + 210, now + 210).unwrap().len(), 1);
     }
 
     /// `last_seen` is written once a minute at best, and once per report for an
@@ -819,11 +856,11 @@ mod tests {
         let id = node(&app, "slow", true, now - 240);
         connect(&app, id);
         let mut watch = Watch::default();
-        assert!(sweep(&app, &mut watch, now).unwrap().is_empty());
+        assert!(sweep(&app, &mut watch, now, now).unwrap().is_empty());
         app.agents.write().unwrap().remove(&id);
-        assert!(sweep(&app, &mut watch, now + 30).unwrap().is_empty(), "absent for one sweep");
+        assert!(sweep(&app, &mut watch, now + 30, now + 30).unwrap().is_empty(), "absent for one sweep");
         connect(&app, id);
-        assert!(sweep(&app, &mut watch, now + 60).unwrap().is_empty());
+        assert!(sweep(&app, &mut watch, now + 60, now + 60).unwrap().is_empty());
     }
 
     #[test]
@@ -834,7 +871,7 @@ mod tests {
         let id = node(&app, "flappy", true, t);
         let mut watch = Watch::default();
         let mut at = |now: i64| -> Vec<&'static str> {
-            sweep(&app, &mut watch, now).unwrap().into_iter().map(|n| n.event).collect()
+            sweep(&app, &mut watch, now, now).unwrap().into_iter().map(|n| n.event).collect()
         };
         let back = |now| {
             connect(&app, id);
@@ -895,7 +932,7 @@ mod tests {
         app.db.set(TRAFFIC_ALERTED, "{}").unwrap();
         let mut watch = Watch::default();
         let mut at = |now: i64| -> Vec<&'static str> {
-            sweep(&app, &mut watch, now).unwrap().into_iter().map(|n| n.event).collect()
+            sweep(&app, &mut watch, now, now).unwrap().into_iter().map(|n| n.event).collect()
         };
 
         let old = node(&app, "old", false, t);
@@ -930,7 +967,7 @@ mod tests {
             )
         };
         let titles = |watch: &mut Watch| -> Vec<String> {
-            let notes = sweep(&app, watch, 0).unwrap().into_iter().filter(|n| n.event == "traffic");
+            let notes = sweep(&app, watch, 0, 0).unwrap().into_iter().filter(|n| n.event == "traffic");
             notes.map(|n| format!("{} {}", n.title, n.message.split('，').next().unwrap())).collect()
         };
 
@@ -978,7 +1015,7 @@ mod tests {
             app.db.set_traffic(id, &patch).unwrap();
         };
         let shares = |watch: &mut Watch| -> Vec<String> {
-            let notes = sweep(&app, watch, 0).unwrap().into_iter().filter(|n| n.event == "traffic");
+            let notes = sweep(&app, watch, 0, 0).unwrap().into_iter().filter(|n| n.event == "traffic");
             notes.map(|n| n.message.split('，').next().unwrap().to_owned()).collect()
         };
 

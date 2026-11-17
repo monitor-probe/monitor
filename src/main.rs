@@ -1251,6 +1251,11 @@ mod tests {
         assert_eq!(renewed(d("2026-03-10"), "60m", d("2026-08-28")), Some(d("2031-03-10")));
         // Not yet due, and one-off billing: both left unchanged.
         assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
+        assert_eq!(
+            renewed(d("2026-08-28"), "monthly", d("2026-08-28")),
+            None,
+            "the last day is still paid for"
+        );
         assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
     }
 
