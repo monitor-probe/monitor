@@ -13,6 +13,9 @@ set -eu
 # lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH is set, and
 # Debian does not set it.
 PATH="$PATH:/usr/sbin:/sbin"
+# A signal becomes an exit, so the EXIT traps that remove staged files run:
+# dash runs none for a signal that kills it.
+trap 'exit 1' HUP INT TERM
 
 REPO="monitor-probe/monitor"
 SERVICE="monitor-hub"
@@ -136,11 +139,62 @@ check_port() {
 	[ "$1" -ge 1 ] && [ "$1" -le 65535 ] || die "端口必须是 1-65535 的整数：$1"
 }
 
+# The installed unit's ExecStart without the key, continuation lines joined;
+# empty when nothing is installed.
+old_line() {
+	sed -n '/^ExecStart=/{:a;/\\$/{N;s/\\\n[[:space:]]*/ /;ba;};s/^ExecStart=//p;}' "$UNIT" 2>/dev/null | tail -n 1
+}
+
 # The `--listen ...` tail of the installed unit's ExecStart, empty when nothing
 # is installed. An upgrade rewrites the unit, so anything not supplied on the
 # command line must be recovered from the old one, or re-running to upgrade
 # would silently reset the port and drop --site.
-old_exec() { sed -n 's/^ExecStart=.*--listen //p' "$UNIT" 2>/dev/null || true; }
+old_exec() {
+	line="$(old_line)"
+	case "$line" in *"--listen "*) printf '%s' "${line#*--listen }" ;; esac
+}
+
+# The value the installed unit gives the option named, empty when it gives none.
+old_arg() {
+	name="$1"
+	set -f
+	# shellcheck disable=SC2046 # split into words, as systemd does
+	set -- $(old_line)
+	set +f
+	while [ $# -ge 2 ]; do
+		if [ "$1" = "$name" ]; then
+			printf '%s' "$2"
+			return 0
+		fi
+		shift
+	done
+}
+
+# The arguments of the installed unit's ExecStart that the rewrite does not
+# carry over, empty when there are none. The rewrite keeps the port of a
+# loopback --listen and --site, and writes the default --db, so anything else
+# -- another listen address, a --themes -- is lost on upgrade, which is said
+# rather than done silently.
+dropped_args() {
+	set -f
+	# shellcheck disable=SC2046 # split into words, as systemd does
+	set -- $(old_line)
+	set +f
+	[ $# -gt 0 ] || return 0
+	shift
+	out=""
+	while [ $# -gt 0 ]; do
+		if [ $# -ge 2 ] && { [ "$1" = --site ] ||
+			{ [ "$1" = --listen ] && case "$2" in 127.0.0.1:*) true ;; *) false ;; esac; } ||
+			{ [ "$1" = --db ] && [ "$2" = "$DATA/monitor.db" ]; }; }; then
+			shift 2
+		else
+			out="$out $1"
+			shift
+		fi
+	done
+	printf '%s' "${out# }"
+}
 
 # The port that unit listens on, empty when there is none. Read twice: once for
 # the carry-over and once for the default the menu offers, since pressing Enter
@@ -176,6 +230,22 @@ install_hub() {
 		esac
 	fi
 	check_port "$PORT"
+	# The rewrite points the hub at the default database. One kept elsewhere
+	# would make this a first install on an empty database, with every node
+	# offline and the traffic totals apparently reset.
+	db="$(old_arg --db)"
+	[ -z "$db" ] || [ "$db" = "$DATA/monitor.db" ] ||
+		die "单元里的数据库是 $db，不是 $DATA/monitor.db：升级会换成一个空库。先停服务，把库连同 -wal、-shm 挪到 $DATA，再重跑"
+	dropped="$(dropped_args)"
+	[ -z "$dropped" ] ||
+		warn "单元里的 $dropped 不会保留：升级按新版重写单元，只沿用端口和 --site。要长期改单元，用 systemctl edit $SERVICE"
+	# A drop-in that sets ExecStart takes precedence over the unit written here,
+	# so the port and --site given to this script would not take effect.
+	for dropin in "$UNIT.d"/*.conf; do
+		if [ -f "$dropin" ] && grep -q '^ExecStart=' "$dropin"; then
+			warn "$dropin 里另写了 ExecStart，它优先于这里写的单元：端口和 --site 以它为准"
+		fi
+	done
 
 	# Before anything is stopped, replaced or downloaded: a port conflict must
 	# leave the running hub untouched. The hub's own socket is never a conflict,
@@ -196,6 +266,9 @@ install_hub() {
 		useradd --system --no-create-home --shell /usr/sbin/nologin "$USER_NAME" ||
 		die "无法创建系统用户 $USER_NAME"
 	install -d -m 0755 "$ROOT"
+	# A run killed outright leaves its staging directory, which holds a whole
+	# binary; one untouched for an hour belongs to no live run.
+	find "$ROOT" -maxdepth 1 -name '.hub-install-*' -mmin +60 -exec rm -rf {} + 2>/dev/null || true
 	# 0700 owned by the service user, so its group is irrelevant and nothing here
 	# depends on useradd having created one.
 	install -d -m 0700 -o "$USER_NAME" "$DATA"
@@ -216,40 +289,31 @@ install_hub() {
 	[ -n "$tag" ] || die "查不到最新发布版；GitHub 不可达，或还没有任何发布"
 	ok "版本" "$tag"
 
-	tmp="$(mktemp -d)"
-	trap 'rm -rf "$tmp"' EXIT
-	curl -fsSL --max-time 300 "$base/$asset" -o "$tmp/$asset" || die "二进制下载失败：$base/$asset"
-	ok "下载" "$(du -h "$tmp/$asset" | cut -f1)"
+	# Everything is written while the old hub still serves, under names of this
+	# run's own beside the final ones, the download included: a full disk then
+	# stops the script before the service is touched, a partial file never takes
+	# a final name, and the stop below is followed by renames, which need no
+	# space. The trap is reset on each call, since the menu installs more than
+	# once per run.
+	stage="$(mktemp -d "$ROOT/.hub-install-XXXXXX")"
+	unit_new=""
+	trap 'rm -rf "$stage"; [ -z "$unit_new" ] || rm -f "$unit_new"' EXIT
+	rc=0
+	curl -fsSL --max-time 300 "$base/$asset" -o "$stage/$asset" || rc=$?
+	# 23 is curl's write error.
+	[ "$rc" != 23 ] || die "写入新版本失败，磁盘可能满了；运行中的 hub 没有动"
+	[ "$rc" = 0 ] || die "二进制下载失败：$base/$asset"
+	ok "下载" "$(du -h "$stage/$asset" | cut -f1)"
 
 	# Verified against the release's own checksum file, so a truncated transfer or
 	# a substituted asset is caught before anything lands in /opt/monitor.
-	curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$tmp/sums" ||
+	curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$stage/sums" ||
 		die "校验文件下载失败"
-	want="$(sed -n "s/^\([0-9a-f]\{64\}\)  *$asset\$/\1/p" "$tmp/sums")"
+	want="$(sed -n "s/^\([0-9a-f]\{64\}\)  *$asset\$/\1/p" "$stage/sums")"
 	[ -n "$want" ] || die "sha256sums.txt 里没有 $asset 这一项"
-	got="$(sha256sum "$tmp/$asset" | cut -d' ' -f1)"
+	got="$(sha256sum "$stage/$asset" | cut -d' ' -f1)"
 	[ "$got" = "$want" ] || die "校验不通过，已丢弃下载的文件。期望 $want，实得 $got"
 	ok "校验" "sha256 一致"
-
-	# Keep the old binary until the new one has proved it starts: a failed upgrade
-	# must leave a running hub rather than a dead service.
-	backup=""
-	if [ -f "$BIN" ]; then
-		backup="$BIN.old"
-		# Never over an existing backup. A run that died between the install below
-		# and the health check left $BIN holding a binary that never proved it
-		# starts; copying that over the good backup would make the rollback restore
-		# the same broken binary while reporting success.
-		[ -f "$backup" ] || cp -f "$BIN" "$backup"
-	fi
-	# Stopped first so the copy does not land beneath a live process.
-	systemctl stop "$SERVICE" 2>/dev/null || true
-	install -m 0755 "$tmp/$asset" "$BIN"
-	# The download is complete. Cleared here as well as on EXIT because the menu
-	# calls this more than once per run and each call replaces the trap, leaving
-	# the previous directory and its binary uncollected.
-	rm -rf "$tmp"
-	trap - EXIT
 
 	# Loopback only: the panel and the agent tokens never traverse a network in
 	# the clear, and there is no port to firewall. Reaching it is the reverse
@@ -257,7 +321,8 @@ install_hub() {
 	# every proxy's default upstream; the hub binds one address, not both.
 	args="--listen 127.0.0.1:$PORT --db $DATA/monitor.db"
 	[ -z "$SITE" ] || args="$args --site $SITE"
-	cat >"$UNIT" <<UNIT
+	unit_new="$(mktemp "$UNIT.install-XXXXXX")"
+	cat >"$unit_new" <<UNIT
 [Unit]
 Description=monitor hub
 After=network-online.target
@@ -288,6 +353,39 @@ MemoryMax=256M
 [Install]
 WantedBy=multi-user.target
 UNIT
+	chmod 0644 "$unit_new"
+
+	# Keep the old binary until the new one has proved it starts: a failed upgrade
+	# must leave a running hub rather than a dead service.
+	backup=""
+	if [ -f "$BIN" ]; then
+		backup="$BIN.old"
+		# Never over an existing backup. A run that died between the install below
+		# and the health check left $BIN holding a binary that never proved it
+		# starts; copying that over the good backup would make the rollback restore
+		# the same broken binary while reporting success. A hard link: $BIN is
+		# replaced by a rename, which leaves this inode as it was, and a link takes
+		# no space.
+		if [ ! -f "$backup" ]; then
+			ln "$BIN" "$stage/old" 2>/dev/null || cp -f "$BIN" "$stage/old" ||
+				die "备份当前版本失败，磁盘可能满了；运行中的 hub 没有动"
+		fi
+	fi
+	chmod 0755 "$stage/$asset"
+	# From the stop to the health check the hub is down or unproven, and an
+	# interrupted run would leave it so: a signal there is ignored, until the
+	# hub serves again or the rollback has run.
+	trap '' HUP INT TERM
+	# Stopped first so the new binary does not land beneath a live process.
+	systemctl stop "$SERVICE" 2>/dev/null || true
+	[ ! -f "$stage/old" ] || mv -f "$stage/old" "$backup"
+	mv -f "$stage/$asset" "$BIN"
+	mv -f "$unit_new" "$UNIT"
+	# Cleared here as well as on EXIT because the menu calls this more than once
+	# per run and each call replaces the trap, leaving the previous directory
+	# uncollected.
+	rm -rf "$stage"
+	trap - EXIT
 
 	# Taken from the binary's stdout rather than the journal, which some hosts
 	# keep nowhere. Set before the service starts, so the hub finds a password in
@@ -323,14 +421,14 @@ UNIT
 			die "服务启动失败。日志：journalctl -u $SERVICE -n 50"
 		fi
 		if [ -n "$backup" ]; then
-			install -m 0755 "$backup" "$BIN"
-			rm -f "$backup"
+			mv -f "$backup" "$BIN"
 			systemctl restart "$SERVICE" 2>/dev/null || true
 			die "新版本没能启动，已回滚到上一版。日志：journalctl -u $SERVICE -n 50"
 		fi
 		die "服务启动失败。日志：journalctl -u $SERVICE -n 50"
 	fi
 	rm -f "$BIN.old"
+	trap 'exit 1' HUP INT TERM
 	ok "服务" "已启动并开机自启"
 
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
@@ -406,7 +504,8 @@ uninstall_hub() {
 		confirm "卸载 monitor hub？数据保留在 $DATA" || return 0
 	fi
 	systemctl disable --now "$SERVICE" 2>/dev/null || true
-	rm -f "$UNIT" "$BIN" "$BIN.old"
+	rm -f "$UNIT" "$BIN" "$BIN.old" "$UNIT".install-*
+	rm -rf "$ROOT"/.hub-install-*
 	systemctl daemon-reload
 	ok "服务" "已移除"
 	if [ -n "$PURGE" ]; then
@@ -529,13 +628,20 @@ fi
 [ "$(id -u)" = 0 ] || die "需要 root：sudo sh $0"
 command -v curl >/dev/null 2>&1 || die "需要 curl"
 command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum（装 coreutils）"
-command -v systemctl >/dev/null 2>&1 ||
+# systemd by the test sd_booted(3) performs: systemctl is also present where
+# systemd is installed but not PID 1 (WSL, a container), where installing would
+# fail after the system was changed. A password reset needs no service manager.
+need_systemd() {
+	[ ! -d /run/systemd/system ] || return 0
+	! command -v systemctl >/dev/null 2>&1 || warn "systemd 装了但没在运行（WSL、容器里常见）"
 	die "这个安装器只装 systemd 服务。手动运行：$BIN --listen 127.0.0.1:$PORT --db $DATA/monitor.db"
+}
 
 case "$ACTION" in
-uninstall) banner; uninstall_hub ;;
+uninstall) need_systemd; banner; uninstall_hub ;;
 reset) banner; reset_password ;;
 *)
+	need_systemd
 	check_self
 	if [ -t 0 ]; then
 		menu
