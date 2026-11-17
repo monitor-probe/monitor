@@ -341,6 +341,9 @@ esac
 # need no space. A run that stops early leaves nothing behind, and a concurrent
 # one cannot remove what this one staged.
 install -d -m 0755 "$ROOT"
+# A run killed outright leaves its staging directory, which holds a whole
+# binary; one untouched for an hour belongs to no live run.
+find "$ROOT" -maxdepth 1 -name '.install-*' -mmin +60 -exec rm -rf {} + 2>/dev/null || true
 STAGE=$(mktemp -d "$ROOT/.install-XXXXXX")
 # Kept until the new binary has proved it starts; see not_started. Never over
 # an existing copy: a run that died before that check left an unproven binary
@@ -499,6 +502,11 @@ fi
 # the new binary lands beneath a live process and only the restart at the end
 # picks it up. Placed after every write above, so a node that cannot fetch or
 # store the new files keeps running.
+#
+# From here to the health check the agent is down or unproven, and an
+# interrupted run would leave it so: a signal is ignored until the script ends,
+# by then reporting either a running agent or the rollback.
+trap '' HUP INT TERM
 if [ "$INIT" = openrc ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 else
