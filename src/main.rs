@@ -506,9 +506,9 @@ const NOFILE_TARGET: u64 = 65_536;
 /// Raises the soft open-file limit toward [`NOFILE_TARGET`], capped by the hard
 /// one. systemd and Docker start a process at a soft limit of 1024, which Rust
 /// does not raise as Go does: with about a thousand connections `accept` fails
-/// with EMFILE, which the server retries silently, and the hub stops answering
-/// without logging a line (measured: 846 of 1000 agents connected, `/api/me`
-/// unanswered).
+/// with EMFILE and the hub stops answering (measured: 846 of 1000 agents
+/// connected, `/api/me` unanswered). [`accept_failed`] logs each such failure
+/// and pauses before the next accept.
 fn raise_open_files() {
     use rustix::process::{getrlimit, setrlimit, Resource};
     let mut limit = getrlimit(Resource::Nofile);
@@ -621,7 +621,31 @@ async fn main() -> Result<()> {
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
 
-    let router = Router::new()
+    let listener = match tokio::net::TcpListener::bind(args.listen).await {
+        Ok(listener) => listener,
+        // A host that refuses the dual-stack wildcard must still start, and on
+        // such a host IPv4 is all there is to serve.
+        Err(e) if args.listen_defaulted && args.listen.is_ipv6() => {
+            let v4 = SocketAddr::from(([0, 0, 0, 0], args.listen.port()));
+            warn!("could not bind {} ({e}); falling back to {v4}", args.listen);
+            tokio::net::TcpListener::bind(v4).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    info!("listening on {} ({url})", listener.local_addr()?);
+    serve(listener, router(app)).await;
+    // The readings held back from the traffic rows. Unbooked, they cost nothing
+    // to a node that reports again under the same boot, but a node rebooting
+    // while the hub is down would take them with it.
+    agent_ws::book_held(&held, None);
+    Ok(())
+}
+
+/// Every route and the layers over it. The order of the layers decides which
+/// routes the body ceiling, the cross-site check and the Chinese error text
+/// cover; a test sends requests through the whole of it.
+fn router(app: Shared) -> Router {
+    Router::new()
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
@@ -693,26 +717,7 @@ async fn main() -> Result<()> {
                 .with_state(app.clone()),
         )
         .layer(tower_http::compression::CompressionLayer::new().compress_when(compressible()))
-        .with_state(app);
-
-    let listener = match tokio::net::TcpListener::bind(args.listen).await {
-        Ok(listener) => listener,
-        // A host that refuses the dual-stack wildcard must still start, and on
-        // such a host IPv4 is all there is to serve.
-        Err(e) if args.listen_defaulted && args.listen.is_ipv6() => {
-            let v4 = SocketAddr::from(([0, 0, 0, 0], args.listen.port()));
-            warn!("could not bind {} ({e}); falling back to {v4}", args.listen);
-            tokio::net::TcpListener::bind(v4).await?
-        }
-        Err(e) => return Err(e.into()),
-    };
-    info!("listening on {} ({url})", listener.local_addr()?);
-    serve(listener, router).await;
-    // The readings held back from the traffic rows. Unbooked, they cost nothing
-    // to a node that reports again under the same boot, but a node rebooting
-    // while the hub is down would take them with it.
-    agent_ws::book_held(&held, None);
-    Ok(())
+        .with_state(app)
 }
 
 /// Serves HTTP/1 until a stop signal, then lets in-flight requests finish.
@@ -1113,6 +1118,79 @@ mod tests {
             "soft limit {:?} below {wanted}",
             limit.current
         );
+    }
+
+    /// Each group of routes sits under the layers meant for it: the panel under
+    /// a form-sized ceiling, the cross-site check and Chinese error text; the
+    /// chunked uploads under a larger ceiling and the same check; the agents'
+    /// routes under neither the check nor the translation; all of them under
+    /// compression.
+    #[tokio::test]
+    async fn each_route_sits_under_the_layers_meant_for_it() {
+        use tower::ServiceExt;
+        let routes = router(Arc::new(App::for_test(Db::open(":memory:").unwrap())));
+        let request = |method: &str, path: &str, len: usize, site: &str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, len)
+                .header("sec-fetch-site", site)
+                .extension(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
+                .body(axum::body::Body::from(vec![b' '; len]))
+                .unwrap()
+        };
+        let send = |method: &str, path: &str, len: usize, site: &str| {
+            let served = routes.clone().oneshot(request(method, path, len, site));
+            async move {
+                let r = served.await.unwrap();
+                let status = r.status();
+                let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let (form, over) = (2 * 1024, 65 * 1024);
+        let too_large = (StatusCode::PAYLOAD_TOO_LARGE, "提交的内容过大".to_owned());
+        let refused = (StatusCode::FORBIDDEN, "请求来自其他网站，已拒绝".to_owned());
+
+        // A form-sized body reaches the handler, which refuses blank JSON.
+        assert_eq!(
+            send("POST", "/api/auth/login", form, "same-origin").await,
+            (StatusCode::BAD_REQUEST, "请求格式不对".into())
+        );
+        assert_eq!(send("POST", "/api/auth/login", over, "same-origin").await, too_large);
+        assert_eq!(send("POST", "/api/auth/login", form, "same-site").await, refused);
+        assert_eq!(
+            send("GET", "/api/nope", 0, "same-origin").await,
+            (StatusCode::NOT_FOUND, "没有这个接口：/api/nope".into())
+        );
+
+        for upload in ["/api/db/restore", "/api/themes"] {
+            assert_eq!(
+                send("POST", upload, over, "same-origin").await.0,
+                StatusCode::UNAUTHORIZED,
+                "{upload}"
+            );
+            assert_eq!(send("POST", upload, api::MAX_CHUNK + 1, "same-origin").await, too_large, "{upload}");
+            assert_eq!(send("POST", upload, form, "same-site").await, refused, "{upload}");
+        }
+
+        let agent = send("POST", "/api/agent/register", form, "same-site").await;
+        assert!(agent.0 != StatusCode::PAYLOAD_TOO_LARGE && agent != refused, "{agent:?}");
+        // The body limit's 413 and an extractor's rejection, both bare, keep
+        // their English: install.sh and the agent print them beside their own.
+        for (method, path, len) in [("POST", "/api/agent/register", over), ("GET", "/api/agent/ws", 0)] {
+            let (status, body) = send(method, path, len, "same-origin").await;
+            assert!(
+                status.is_client_error() && !body.is_empty() && body.is_ascii(),
+                "{path}: {status} {body}"
+            );
+        }
+
+        let mut script = request("GET", "/install.sh", 0, "none");
+        script.headers_mut().insert(header::ACCEPT_ENCODING, header::HeaderValue::from_static("gzip"));
+        let script = routes.clone().oneshot(script).await.unwrap();
+        assert_eq!(script.headers().get(header::CONTENT_ENCODING).map(|v| v.as_bytes()), Some(&b"gzip"[..]));
     }
 
     fn app(site: &str) -> App {
