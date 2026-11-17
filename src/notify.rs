@@ -109,8 +109,7 @@ pub fn settings(app: &App, out: &mut serde_json::Map<String, Value>) {
     for (key, ..) in NUMBERS {
         out.insert(key.into(), json!(number(app, key).to_string()));
     }
-    let login = if app.db.get("notify_login").as_deref() == Some("off") { "off" } else { "on" };
-    out.insert("notify_login".into(), json!(login));
+    out.insert("notify_login".into(), json!(if login_alerts(app) { "on" } else { "off" }));
     out.insert("notify_telegram_chat".into(), json!(app.db.get("notify_telegram_chat").unwrap_or_default()));
     out.insert("notify_telegram_text".into(), json!(template(app, "notify_telegram_text", DEFAULT_TEXT)));
     out.insert("notify_webhook_body".into(), json!(template(app, "notify_webhook_body", DEFAULT_BODY)));
@@ -421,8 +420,15 @@ pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
     }
 }
 
+/// Whether sign-ins are announced: unless switched off, so a hub that never
+/// saved the switch announces them. One rule for the panel's readback and for
+/// sending.
+fn login_alerts(app: &App) -> bool {
+    app.db.get("notify_login").as_deref() != Some("off")
+}
+
 pub fn signed_in(app: &App, how: &str, ip: IpAddr) {
-    if app.db.get("notify_login").as_deref() != Some("off") {
+    if login_alerts(app) {
         let message = format!("{how} · 来自 {ip}");
         send(app, Note { event: "login", title: "🔑 面板登录".into(), message, ..Default::default() });
     }
