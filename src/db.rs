@@ -878,25 +878,30 @@ fn rolled(conn: &Connection) -> Result<Option<i64>> {
 
 /// The earliest `ts` across `tables`; see [`edge`].
 fn oldest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
-    edge(conn, tables, "MIN")
+    edge(conn, tables, false, i64::MIN)
 }
 
 /// The latest `ts` across `tables`; see [`edge`].
 fn newest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
-    edge(conn, tables, "MAX")
+    edge(conn, tables, true, i64::MIN)
 }
 
-/// `MIN` or `MAX` of `ts` across `tables`, sought node by node: every key
-/// here begins with `node_id`, and `MIN(ts)` over a whole table scans it,
-/// 15.9 s at 90 days of 100 nodes against 1.8 ms this way. `tables` are names
-/// from [`TABLES`].
-fn edge(conn: &Connection, tables: &[&str], aggregate: &str) -> Result<Option<i64>> {
+/// The earliest, or with `latest` the latest, `ts` at or after `from` across
+/// `tables`, sought node by node: every key here begins with `node_id`, and
+/// `MIN(ts)` over a whole table scans it, 15.9 s at 90 days of 100 nodes
+/// against 1.8 ms this way. `tables` are names from [`TABLES`].
+fn edge(conn: &Connection, tables: &[&str], latest: bool, from: i64) -> Result<Option<i64>> {
+    let aggregate = if latest { "MAX" } else { "MIN" };
     let per_node: Vec<String> = tables
         .iter()
-        .map(|t| format!("SELECT (SELECT {aggregate}(ts) FROM {t} WHERE node_id=n.id) AS ts FROM node n"))
+        .map(|t| {
+            format!(
+                "SELECT (SELECT {aggregate}(ts) FROM {t} WHERE node_id=n.id AND ts>=?1) AS ts FROM node n"
+            )
+        })
         .collect();
     let sql = format!("SELECT {aggregate}(ts) FROM ({})", per_node.join(" UNION ALL "));
-    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+    Ok(conn.query_row(&sql, [from], |r| r.get(0))?)
 }
 
 /// Probe results as the latency fold receives them. A stored result is a
@@ -1918,8 +1923,9 @@ impl Db {
         let Some(hour) = rolled(&tx)?.map(|h| h.max(floor)).filter(|&h| h <= last) else {
             return Ok(false);
         };
-        tx.prepare_cached(
-            "INSERT OR REPLACE INTO metric_hour
+        let mut wrote = tx
+            .prepare_cached(
+                "INSERT OR REPLACE INTO metric_hour
                (node_id, ts, minutes, cpu, cpu_max, mem_used, swap_used, disk_used, net_rx, net_tx,
                 net_rx_max, net_tx_max, tcp, udp, procs)
              SELECT node_id, ?1, COUNT(*), AVG(cpu), MAX(MAX(cpu, cpu_max)), CAST(AVG(mem_used) AS INTEGER),
@@ -1930,8 +1936,8 @@ impl Db {
                     CAST(ROUND(AVG(procs)) AS INTEGER)
              FROM metric WHERE node_id IN (SELECT id FROM node) AND ts>=?1 AND ts<?1+3600
              GROUP BY node_id",
-        )?
-        .execute([hour])?;
+            )?
+            .execute([hour])?;
         let nodes: Vec<i64> = tx
             .prepare_cached("SELECT id FROM node")?
             .query_map([], |r| r.get(0))?
@@ -1952,12 +1958,22 @@ impl Db {
             )?;
             for (task, mut t) in probes {
                 let median = t.median();
-                write.execute(params![node, task, hour, t.answered(), t.lost, median, t.lo, t.hi])?;
+                wrote +=
+                    write.execute(params![node, task, hour, t.answered(), t.lost, median, t.lo, t.hi])?;
             }
         }
+        // An empty hour moves the watermark to the next hour holding a row, so a
+        // fleet silent for months, or a hub stopped as long, resumes in one
+        // step rather than a transaction per hour it missed.
+        let next = if wrote == 0 {
+            edge(&tx, &["metric", "ping_record"], false, hour + 3_600)?
+                .map_or(hour + 3_600, |ts| (ts.div_euclid(3_600) * 3_600).max(hour + 3_600))
+        } else {
+            hour + 3_600
+        };
         tx.execute(
             "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
-            params![ROLLED, (hour + 3_600).to_string()],
+            params![ROLLED, next.to_string()],
         )?;
         tx.commit()?;
         Ok(true)
@@ -4194,6 +4210,32 @@ mod tests {
             assert_eq!(db.roll_up(0, 30).unwrap(), 0);
             assert_eq!(watermark(), held);
         }
+    }
+
+    /// A fleet silent for months resumes in a step per stretch of empty hours,
+    /// not a transaction per hour it missed.
+    #[test]
+    fn a_long_silence_is_crossed_in_one_step() {
+        let db = db();
+        let id = node(&db, 1);
+        let t = 472_224 * 3_600;
+        (0..60).for_each(|m| {
+            db.insert_metric(id, t - 3_600 + m * 60, &serde_json::json!({"cpu": 1.0})).unwrap()
+        });
+        let back = t + 100 * 86_400;
+        (0..120).for_each(|m| db.insert_metric(id, back + m * 60, &serde_json::json!({"cpu": 2.0})).unwrap());
+        // The hour before the silence, the silence itself, the first hour back.
+        assert_eq!(db.roll_up(back + 2 * 3_600 + LATE, 365).unwrap(), 3);
+        let hours: Vec<i64> = db
+            .conn()
+            .prepare("SELECT ts FROM metric_hour ORDER BY ts")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(hours, [t - 3_600, back]);
+        assert_eq!(rolled(&db.conn()).unwrap(), Some(back + 3_600));
     }
 
     #[test]
