@@ -648,7 +648,7 @@ fn country_source(ip: &str, ipv4: &str, ipv6: &str) -> Option<IpAddr> {
 /// acquires its badge when the hour is up, and an empty column is already a
 /// permitted state. Returning to the last address answered before the current
 /// one is not a change: `Db::save_facts` restores that answer without asking.
-static ASKED: OnceLock<Mutex<HashMap<i64, Instant>>> = OnceLock::new();
+static ASKED: OnceLock<Mutex<HashMap<i64, Option<Instant>>>> = OnceLock::new();
 const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 
 /// Resolves a node's lookup address (see [`country_source`]) to a country, at
@@ -660,13 +660,12 @@ const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 /// hidden until the retry.
 ///
 /// ponytail: no backoff beyond that one window, and the record is per process. A
-/// hub restart repeats the lookup once per node.
+/// hub restart reopens the gate for every node still owed a country.
 fn locate(app: Shared, node_id: i64, source: String) {
     let mut asked = ASKED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if asked.get(&node_id).is_some_and(|at| at.elapsed() < LOCATE_RETRY) {
+    if !spaced(asked.entry(node_id).or_default(), Instant::now(), LOCATE_RETRY) {
         return;
     }
-    asked.insert(node_id, Instant::now());
     drop(asked);
 
     tokio::spawn(async move {
@@ -674,17 +673,25 @@ fn locate(app: Shared, node_id: i64, source: String) {
             let url = format!("https://ipinfo.io/{source}/country");
             anyhow::Ok(app.http.get(url).send().await?.error_for_status()?.text().await?)
         };
-        let cc = match lookup.await {
-            Ok(body) => body.trim().to_ascii_uppercase(),
+        let body = match lookup.await {
+            Ok(body) => body,
             Err(e) => return debug!("node {node_id}: no country for {source}: {e:#}"),
         };
-        if cc.len() != 2 || !cc.bytes().all(|b| b.is_ascii_uppercase()) {
+        let Some(cc) = country_code(&body) else {
             return debug!("node {node_id}: {source} resolved to no country");
-        }
+        };
         if let Err(e) = app.db.set_country(node_id, &cc, &source) {
             warn!("node {node_id}: storing country {cc} failed: {e:#}");
         }
     });
+}
+
+/// The country in a lookup's reply. The reply reaches the public page, so
+/// nothing but two ASCII letters passes: a proxy's error page or an empty body
+/// is no answer.
+fn country_code(body: &str) -> Option<String> {
+    let cc = body.trim();
+    (cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_alphabetic())).then(|| cc.to_ascii_uppercase())
 }
 
 /// Figures `api::node_view` fills into `metrics` from the traffic row. They never
@@ -1546,6 +1553,14 @@ mod tests {
             ["1.1.1.1", "100.128.0.1", "172.32.0.1", "192.0.1.1", "198.20.0.1", "2401:b60:1c::5", "3fff::1"]
         {
             assert!(public(ip), "{ip}");
+        }
+    }
+
+    #[test]
+    fn a_lookup_reply_counts_only_as_two_letters() {
+        assert_eq!(country_code(" us\n").as_deref(), Some("US"));
+        for body in ["", "U", "USA", "U1", "U-", "é", " - ", "<!doctype html>", "ÜS"] {
+            assert_eq!(country_code(body), None, "{body:?}");
         }
     }
 
