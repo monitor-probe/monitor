@@ -876,16 +876,26 @@ fn rolled(conn: &Connection) -> Result<Option<i64>> {
     Ok(value.and_then(|v| v.parse().ok()))
 }
 
-/// The earliest `ts` across `tables`, sought node by node: every key here
-/// begins with `node_id`, and `MIN(ts)` over a whole table scans it, 15.9 s at
-/// 90 days of 100 nodes against 1.8 ms this way. `tables` are names from
-/// [`TABLES`].
+/// The earliest `ts` across `tables`; see [`edge`].
 fn oldest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
+    edge(conn, tables, "MIN")
+}
+
+/// The latest `ts` across `tables`; see [`edge`].
+fn newest(conn: &Connection, tables: &[&str]) -> Result<Option<i64>> {
+    edge(conn, tables, "MAX")
+}
+
+/// `MIN` or `MAX` of `ts` across `tables`, sought node by node: every key
+/// here begins with `node_id`, and `MIN(ts)` over a whole table scans it,
+/// 15.9 s at 90 days of 100 nodes against 1.8 ms this way. `tables` are names
+/// from [`TABLES`].
+fn edge(conn: &Connection, tables: &[&str], aggregate: &str) -> Result<Option<i64>> {
     let per_node: Vec<String> = tables
         .iter()
-        .map(|t| format!("SELECT (SELECT MIN(ts) FROM {t} WHERE node_id=n.id) AS ts FROM node n"))
+        .map(|t| format!("SELECT (SELECT {aggregate}(ts) FROM {t} WHERE node_id=n.id) AS ts FROM node n"))
         .collect();
-    let sql = format!("SELECT MIN(ts) FROM ({})", per_node.join(" UNION ALL "));
+    let sql = format!("SELECT {aggregate}(ts) FROM ({})", per_node.join(" UNION ALL "));
     Ok(conn.query_row(&sql, [], |r| r.get(0))?)
 }
 
@@ -1847,47 +1857,35 @@ impl Db {
     /// writes through between hours. At 100 nodes and four probes an hour takes
     /// about 15 ms.
     ///
+    /// An hour is complete once `now` is `LATE` past its end and a row stamped
+    /// after it is stored. The rows bound a clock running fast, as when the hub
+    /// starts before NTP corrects an RTC kept in local time: on that clock alone
+    /// the watermark would pass hours whose rows had not yet arrived, which then
+    /// stay out of the tier. A fleet with nothing reporting folds nothing, and
+    /// its last rows wait as minute rows until reports resume.
+    ///
     /// Without a watermark it records one at the hour of the oldest minute row,
-    /// or with none at all at the current hour, so that `prune` has a watermark
-    /// to respect. Hours before `keep_days` are skipped rather than folded, as
-    /// `prune` would drop them next. A watermark past the last hour `now` could
-    /// have folded is pulled back.
+    /// so that `prune` has a watermark to respect; with no rows there is none
+    /// to record, and `prune` keeps every minute row. Hours before `keep_days`
+    /// are skipped rather than folded, as `prune` would drop them next.
     pub fn roll_up(&self, now: i64, keep_days: i64) -> Result<usize> {
-        {
+        let newest = {
             let conn = self.conn();
-            let hour = |ts: i64| ts.div_euclid(3_600) * 3_600;
-            let set = |at: i64| {
-                conn.execute(
-                    "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
-                    params![ROLLED, at.to_string()],
-                )
-            };
-            match rolled(&conn)? {
-                None => {
-                    set(hour(oldest(&conn, &["metric", "ping_record"])?.unwrap_or(now)))?;
+            if rolled(&conn)?.is_none() {
+                if let Some(from) = oldest(&conn, &["metric", "ping_record"])? {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
+                        params![ROLLED, (from.div_euclid(3_600) * 3_600).to_string()],
+                    )?;
                 }
-                // Past the last hour this clock could have folded, the watermark
-                // was moved by a clock running fast, as when the hub starts
-                // before NTP corrects an RTC kept in local time. The hours it
-                // passed were folded before their rows arrived and would stay
-                // empty; pulled back, they fold again once complete and replace
-                // those rows. It stops after the hour of the oldest minute row:
-                // the rows before it are pruned, and a clock far behind, such as
-                // a dead RTC at 1970, would refold the whole window and fold the
-                // hour a prune cut through from part of its rows.
-                Some(at) if at > hour(now - LATE) => {
-                    let kept = oldest(&conn, &["metric", "ping_record"])?.map(|ts| hour(ts) + 3_600);
-                    let back = hour(now - LATE).max(kept.unwrap_or(i64::MIN)).min(at);
-                    if back < at {
-                        set(back)?;
-                    }
-                }
-                Some(_) => {}
             }
-        }
+            newest(&conn, &["metric", "ping_record"])?
+        };
+        let Some(newest) = newest else { return Ok(0) };
         let floor = (now - keep_days * 86_400).div_euclid(3_600) * 3_600;
+        let last = (now - 3_600 - LATE).min(newest - 3_600);
         let mut folded = 0;
-        while !halted() && self.fold_next(floor, now - 3_600 - LATE)? {
+        while !halted() && self.fold_next(floor, last)? {
             let_waiters_in();
             folded += 1;
         }
@@ -3260,9 +3258,13 @@ mod tests {
         let _ = db.conn().query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         let fat = on_disk(&scratch.0);
         // Folded first, as the hourly pass does: minute rows outlive the window
-        // until their hour is folded. Dated past the lateness allowance so the
-        // last hour counts as complete.
+        // until their hour is folded. Dated past the lateness allowance, and
+        // with a later row from a node removed afterwards, so the last hour
+        // counts as complete.
+        let later = node(&db, 2);
+        db.insert_metric(later, now + 2 * 3_600, &sample).unwrap();
         db.roll_up(now + 3 * 3_600, 1).unwrap();
+        db.delete_node(later).unwrap();
         db.prune(0).unwrap();
 
         let freed = db.vacuum().unwrap();
@@ -3717,9 +3719,18 @@ mod tests {
         let hour = (now - 3 * 3_600).div_euclid(3_600) * 3_600;
         db.conn().execute("INSERT INTO ping_record VALUES (?1, 999, ?2, 42)", params![id, hour]).unwrap();
         db.insert_metric(id, hour, &serde_json::json!({"cpu": 1.0})).unwrap();
+        // Still reporting: an hour folds once a later row is stored.
+        db.insert_metric(id, now - 60, &serde_json::json!({"cpu": 1.0})).unwrap();
         assert!(db.roll_up(now, 1).unwrap() > 0);
-        let span = Span { since: hour, step: 3_600, hourly: true };
-        assert_eq!(db.metrics(id, span).unwrap().len(), 1, "the hour is folded");
+        let folded: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM metric_hour WHERE node_id=?1 AND ts=?2",
+                params![id, hour],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(folded, 1, "the hour is folded");
     }
 
     /// Counted directly from the table rather than read back through
@@ -4043,6 +4054,10 @@ mod tests {
             .unwrap();
         }
         let end = start + 6 * 3_600;
+        // Another node still reporting after the six hours: an hour folds once
+        // a later row is stored.
+        let other = node(&db, 2);
+        db.insert_metric(other, end, &serde_json::json!({"cpu": 1.0})).unwrap();
 
         let compare = |step: i64| {
             let hourly = Span { since: start, step, hourly: true };
@@ -4140,38 +4155,45 @@ mod tests {
 
     #[test]
     fn a_clock_running_fast_leaves_no_gap_in_the_hourly_tier() {
-        let db = db();
-        let id = node(&db, 1);
-        let row = |ts: i64| db.insert_metric(id, ts, &serde_json::json!({"cpu": 5.0})).unwrap();
-        let watermark = || rolled(&db.conn()).unwrap().unwrap();
         // The hub restarts at `t` on a clock 8 hours fast, then NTP corrects
-        // it and the agents report for 12 hours, folded on the hour.
+        // it and the agents report for 12 hours, folded on the hour: once with
+        // ten hours of history before the restart, once on a fresh install.
         let t = 472_224 * 3_600;
-        (0..10 * 60).for_each(|m| row(t - 10 * 3_600 + m * 60));
-        db.roll_up(t, 30).unwrap();
-        db.roll_up(t + 8 * 3_600, 30).unwrap();
-        assert!(watermark() > t, "the fast clock folds hours ahead of the rows");
-        for m in 0..12 * 60 {
-            row(t + m * 60);
-            if m % 60 == 59 {
-                db.roll_up(t + m * 60 + 60, 30).unwrap();
+        for history in [10, 0] {
+            let db = db();
+            let id = node(&db, 1);
+            let row = |ts: i64| db.insert_metric(id, ts, &serde_json::json!({"cpu": 5.0})).unwrap();
+            let watermark = || rolled(&db.conn()).unwrap();
+            (0..history * 60).for_each(|m| row(t - history * 3_600 + m * 60));
+            if history > 0 {
+                db.roll_up(t, 30).unwrap();
             }
-        }
-        let wide = db.metrics(id, Span { since: t - 3 * 3_600, step: 3_600, hourly: true }).unwrap();
-        let drawn: Vec<(i64, i64)> =
-            wide.iter().map(|p| (p["ts"].as_i64().unwrap(), p["minutes"].as_i64().unwrap())).collect();
-        let want: Vec<(i64, i64)> = (-3..12).map(|h| (t + h * 3_600, 60)).collect();
-        assert_eq!(drawn, want, "every hour drawn whole");
-        let folded: i64 = db
-            .conn()
-            .query_row("SELECT count(*) FROM metric_hour WHERE ts >= ?1", [t], |r| r.get(0))
-            .unwrap();
-        assert_eq!(folded, 10, "the hours after the restart are in the tier");
+            // On a fresh install this is the first pass, with no rows yet.
+            db.roll_up(t + 8 * 3_600, 30).unwrap();
+            assert!(watermark().is_none_or(|w| w <= t), "{history}: folded no hour ahead of the rows");
+            for m in 0..12 * 60 {
+                row(t + m * 60);
+                if m % 60 == 59 {
+                    db.roll_up(t + m * 60 + 60, 30).unwrap();
+                }
+            }
+            let since = t - history.min(3) * 3_600;
+            let wide = db.metrics(id, Span { since, step: 3_600, hourly: true }).unwrap();
+            let drawn: Vec<(i64, i64)> =
+                wide.iter().map(|p| (p["ts"].as_i64().unwrap(), p["minutes"].as_i64().unwrap())).collect();
+            let want: Vec<(i64, i64)> = (-history.min(3)..12).map(|h| (t + h * 3_600, 60)).collect();
+            assert_eq!(drawn, want, "{history}: every hour drawn whole");
+            let folded: i64 = db
+                .conn()
+                .query_row("SELECT count(*) FROM metric_hour WHERE ts >= ?1", [t], |r| r.get(0))
+                .unwrap();
+            assert_eq!(folded, 10, "{history}: the hours after the restart are in the tier");
 
-        // A clock far behind pulls the watermark back no further than the hour
-        // after the oldest minute row.
-        db.roll_up(0, 30).unwrap();
-        assert_eq!(watermark(), t - 10 * 3_600 + 3_600);
+            // A clock far behind moves nothing back.
+            let held = watermark();
+            assert_eq!(db.roll_up(0, 30).unwrap(), 0);
+            assert_eq!(watermark(), held);
+        }
     }
 
     #[test]
