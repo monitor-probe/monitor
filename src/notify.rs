@@ -499,7 +499,7 @@ fn batch(event: &'static str, mark: &str, what: &str, items: Vec<(&str, String)>
 /// return and one announced before is not repeated. Read every sweep rather
 /// than held in memory, so a restored database brings its own. Outside
 /// `notify_`, whose keys the panel reads and writes.
-const TRAFFIC_ALERTED: &str = "traffic_alerted";
+pub(crate) const TRAFFIC_ALERTED: &str = "traffic_alerted";
 
 /// Sweep state that need not outlive the process.
 #[derive(Default)]

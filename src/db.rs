@@ -821,7 +821,7 @@ const LATE: i64 = 3_600 + 60;
 
 /// Setting holding the start of the first hour not yet folded into the hourly
 /// tier. Internal: the settings routes neither return nor accept it.
-const ROLLED: &str = "history_rolled";
+pub(crate) const ROLLED: &str = "history_rolled";
 
 /// One chart window as the database answers it.
 #[derive(Clone, Copy, Debug)]
@@ -2761,7 +2761,7 @@ fn issued(conn: &Connection, table: &str) -> Result<i64> {
 }
 
 /// The tables whose ids [`next_id`] issues.
-const ID_TABLES: [&str; 2] = ["node", "ping_task"];
+pub(crate) const ID_TABLES: [&str; 2] = ["node", "ping_task"];
 
 fn setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()?)
