@@ -111,12 +111,16 @@
   [data-slot="switch"], input[type="checkbox"] { cursor: pointer; }
   /* The dialog places its close button in the corner of the content box without
      reserving room for it, so a title long enough to reach that corner runs
-     under the button. The header is inset by the button's width, on both sides
-     below `sm` where it is centred. A title or description with no break
-     opportunity, such as a node named like a host (`hk01.vps.example.com`),
-     wraps anywhere rather than widening the dialog into a sideways scroll. */
-  [data-slot="dialog-content"]:has(> [data-slot="dialog-close"]) [data-slot="dialog-header"] {
-    padding-inline: 1.25rem;
+     under the button. components/ui/dialog.tsx puts a 1rem icon at `top-4
+     right-4` inside `p-6`, so it reaches 0.5rem into the content, and its focus
+     ring 4px further; the title alone is inset by 1rem, on both sides below
+     `sm` where it is centred. The description below sits clear of the button.
+     A title or description with no break opportunity, such as a node named like
+     a host (`hk01.vps.example.com`), wraps anywhere rather than widening the
+     dialog into a sideways scroll; node names in titles also go through
+     `nameText`, which prefers the dots. */
+  [data-slot="dialog-content"]:has(> [data-slot="dialog-close"]) [data-slot="dialog-title"] {
+    padding-inline: 1rem;
     @variant sm { padding-left: 0; }
   }
   [data-slot="dialog-title"], [data-slot="dialog-description"] { overflow-wrap: anywhere; }
