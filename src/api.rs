@@ -1099,8 +1099,7 @@ pub async fn agent_register(
         answer(StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
     };
     let until = register_until(&app);
-    let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && Utc::now().timestamp() < until)
-    else {
+    let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && register_left(&app) > 0) else {
         return closed();
     };
     if agent_ws::bearer(&headers) != Some(key.as_str()) {
@@ -1171,12 +1170,22 @@ pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderM
 /// eight hours fast -- Windows and Linux sharing a machine in UTC+8 -- would hide
 /// the command of an open window, and one eight hours slow would show it for
 /// eight hours after the key stopped working.
+///
+/// Also the gate in `agent_register`, so the two cannot disagree. A deadline
+/// further ahead than one window was set under a clock running fast -- an RTC
+/// kept in local time, read before NTP corrects it -- and counts as closed:
+/// taken at face value, a window opened eight hours fast would admit the key
+/// for nine hours once the clock is corrected.
 fn register_left(app: &App) -> i64 {
-    (register_until(app) - Utc::now().timestamp()).clamp(0, REGISTER_WINDOW)
+    let left = register_until(app) - Utc::now().timestamp();
+    if left > REGISTER_WINDOW {
+        0
+    } else {
+        left.max(0)
+    }
 }
 
-/// The stored deadline, 0 when none was ever set. One reading for the gate in
-/// `agent_register` and the panel's countdown, so the two cannot disagree.
+/// The stored deadline, 0 when none was ever set.
 fn register_until(app: &App) -> i64 {
     app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)
 }
@@ -3758,6 +3767,13 @@ mod tests {
         // An hour later the same key is worthless, which is what makes leaving the
         // window open harmless.
         app.db.set("register_until", &(Utc::now().timestamp() - 1).to_string()).unwrap();
+        assert_eq!(register_left(&app), 0);
+        assert_eq!(register(Some(&key), "b").await.status(), StatusCode::FORBIDDEN);
+
+        // Opened under a clock eight hours fast, then corrected: a deadline
+        // further ahead than one window counts as closed.
+        let skewed = Utc::now().timestamp() + REGISTER_WINDOW + 8 * 3_600;
+        app.db.set("register_until", &skewed.to_string()).unwrap();
         assert_eq!(register_left(&app), 0);
         assert_eq!(register(Some(&key), "b").await.status(), StatusCode::FORBIDDEN);
 
