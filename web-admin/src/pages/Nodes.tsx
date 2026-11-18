@@ -124,7 +124,7 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
   const showChips = status !== "all" || ATTENTION.some(([, , test]) => nodes.some((n) => test(n, warnAt, expiryDays)))
   const chips = attention
     .filter((a) => a.key === status || a.rows.length)
-    .map((a) => ({ key: a.key, label: <>{a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span></> }))
+    .map((a) => ({ key: a.key, label: <>{a.label} <span className="tnum ml-0.5 text-xs font-normal">{a.rows.length}</span></> }))
   const visible = picked?.rows ?? found
   useEffect(() => {
     if (!reveal.current) return

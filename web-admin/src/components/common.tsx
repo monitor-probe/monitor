@@ -22,7 +22,9 @@ export function Segments<K extends string>({ label, options, value, onPick }: {
           type="button"
           aria-pressed={value === o.key}
           onClick={() => onPick(o.key)}
-          className={`rounded-md px-3 py-1 text-sm transition-colors ${value === o.key ? "bg-background font-medium shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+          // Unpicked labels in foreground at 60 %: 5.23:1 on the muted track, where
+          // `text-muted-foreground` reaches 4.35:1, short of 4.5:1 for text.
+          className={`rounded-md px-3 py-1 text-sm transition-colors ${value === o.key ? "bg-background font-medium shadow-sm" : "text-foreground/60 hover:text-foreground"}`}
         >
           {o.label}
         </button>
