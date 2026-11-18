@@ -129,7 +129,7 @@ export function Data() {
         <div>
           <h3 className="text-sm font-medium">备份</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，当前节点、设置、历史全部作废，所有设备需要重新登录。
+            导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，当前节点、设置、历史全部作废，其它设备需要重新登录。
             <br />
             请用这里导出的文件恢复：直接复制 <code>monitor.db</code> 会丢掉预写日志里还没落盘的那部分。
           </p>
