@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 
 import { Command, ConfirmDialog, copy, Field, OptionRow } from "@/components/common"
+import { nameText } from "@/components/pickers"
 import { api, badIfaceName, currentIface, type IfaceChoice, ifaceChoice, ifaceSpec, type Node } from "@/lib/api"
 import { installCommand, registerCommand } from "@/lib/commands"
 import type { Settings } from "@/lib/settings"
@@ -286,7 +287,7 @@ export function InstallDialog({ node, site, onClose, onRotated }: {
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>{node.name}</DialogTitle>
+          <DialogTitle>{nameText(node.name)}</DialogTitle>
           {/* The one place a single node's agent version is shown, and what an
               issue report asks for. Empty until the node has reported once. */}
           {node.agent_version && <DialogDescription>当前 agent v{node.agent_version}</DialogDescription>}

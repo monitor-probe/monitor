@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 
 import { Field, OptionRow } from "@/components/common"
-import { NodePicker } from "@/components/pickers"
+import { nameText, NodePicker } from "@/components/pickers"
 import { api, changes, GIB, type Node, trafficCorrection } from "@/lib/api"
 import { addMonths, cycleMonths } from "@/lib/format"
 
@@ -342,7 +342,7 @@ export function NodeForm({ node, nodes, onClose, onSaved }: {
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{node.name}</DialogTitle>
+          <DialogTitle>{nameText(node.name)}</DialogTitle>
         </DialogHeader>
         {/* noValidate here and in the other dialogs: save() checks every field.
             The browser's own check would refuse a fractional GB against the
@@ -514,7 +514,7 @@ export function BillingForm({ node, onClose, onSaved }: {
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>{node.name}</DialogTitle>
+          <DialogTitle>{nameText(node.name)}</DialogTitle>
         </DialogHeader>
         <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
           <div className="space-y-5">

@@ -159,7 +159,7 @@ function NodeProbesForm({ node, tasks, onClose, onSaved }: {
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle className="break-all">「{node.name}」的延迟监控</DialogTitle>
+          <DialogTitle>「{nameText(node.name)}」的延迟监控</DialogTitle>
         </DialogHeader>
         <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
           {/* min-w-0: as a grid item the list would otherwise grow to its
