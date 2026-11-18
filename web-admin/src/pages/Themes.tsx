@@ -360,7 +360,9 @@ export function Themes() {
       {/* items-start：有预览图和没有的卡片不该为了等高而留白 */}
       <div className="grid items-start gap-3 sm:grid-cols-2">
         {themes.map((theme) => (
-          <Card key={theme.short} className="gap-4 p-5">
+          // Name, description and author come from the theme's manifest: a run
+          // without spaces wraps anywhere instead of widening the card.
+          <Card key={theme.short} className="gap-4 p-5 wrap-anywhere">
             {/* 缩略图被压到卡片那点宽度，比例不是 16:9 的还会被 object-cover
                 裁掉边，所以图本身要能点开看原尺寸——就地开一个对话框，不跳走。 */}
             {theme.preview && (
@@ -374,7 +376,7 @@ export function Themes() {
             )}
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
+                <div className="flex items-baseline gap-2">
                   <h3 className="font-medium">{theme.name}</h3>
                   {theme.selected && <Badge>当前</Badge>}
                   {theme.builtin && <Badge variant="secondary" className="font-normal">内置</Badge>}
