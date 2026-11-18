@@ -124,7 +124,9 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
   const showChips = status !== "all" || ATTENTION.some(([, , test]) => nodes.some((n) => test(n, warnAt, expiryDays)))
   const chips = attention
     .filter((a) => a.key === status || a.rows.length)
-    .map((a) => ({ key: a.key, label: <>{a.label} <span className="tnum ml-0.5 text-xs font-normal text-muted-foreground">{a.rows.length}</span></> }))
+    // The count dimmed only on the picked chip's white face; on the muted
+    // track it takes the label's colour, which already clears 4.5:1 there.
+    .map((a) => ({ key: a.key, label: <>{a.label} <span className={`tnum ml-0.5 text-xs font-normal ${a.key === status ? "text-muted-foreground" : ""}`}>{a.rows.length}</span></> }))
   const visible = picked?.rows ?? found
   useEffect(() => {
     if (!reveal.current) return
