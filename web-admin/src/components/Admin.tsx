@@ -44,12 +44,12 @@ export function Admin({
   const { versions, reload } = useVersions()
   // Below `md` the sections are one scrolling row about twice the width of a
   // phone, so a page opened directly would otherwise have its button out of
-  // view. Only the row scrolls, never the window, and only when it overflows.
+  // view. Only the row scrolls, never the window.
   const navRef = useRef<HTMLElement>(null)
   useEffect(() => {
     const nav = navRef.current
     const current = nav?.querySelector<HTMLElement>("[aria-current=page]")
-    if (!nav || !current || nav.scrollWidth <= nav.clientWidth) return
+    if (!nav || !current) return
     const row = nav.getBoundingClientRect()
     const button = current.getBoundingClientRect()
     if (button.left < row.left || button.right > row.right) {

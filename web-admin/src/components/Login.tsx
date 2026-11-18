@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -20,9 +20,13 @@ function GithubMark() {
 // The hub redirects a failed GitHub sign-in back here with the reason in a
 // short-lived cookie, so it is readable in context rather than as a bare 401
 // page. A cookie rather than the query string: any link could carry a query
-// string, but another site cannot set a cookie for this one. Read once, then
-// deleted so a reload does not show it again.
+// string, but a site on another domain cannot set a cookie for this one.
+// Read and deleted as the panel loads, whether or not the sign-in page then
+// shows: a reason left in the browser would surface on a later, unrelated
+// sign-in page, or expire while a failed /api/me is being retried. The Path
+// below must match the one the hub sets (`failure_cookie` in auth.rs).
 const FAILURE_COOKIE = "monitor_login_error"
+let pendingError = callbackError()
 
 function callbackError(): string {
   const entry = document.cookie.split("; ").find((c) => c.startsWith(`${FAILURE_COOKIE}=`))
@@ -38,7 +42,11 @@ function callbackError(): string {
 
 export function Login({ github, onDone }: { github: boolean; onDone: () => void }) {
   const [password, setPassword] = useState("")
-  const [error, setError] = useState(callbackError)
+  const [error, setError] = useState(pendingError)
+  // Shown by this sign-in page only, not by one mounted after signing out.
+  useEffect(() => {
+    pendingError = ""
+  }, [])
   const [busy, setBusy] = useState(false)
 
   async function submit(e: React.FormEvent) {

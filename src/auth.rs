@@ -300,9 +300,10 @@ fn sign_in_failed(app: &App, headers: &HeaderMap, e: anyhow::Error) -> Response 
 
 /// Carries a failed sign-in's reason to the sign-in page, which reads it once
 /// and deletes it. A query string would let any link print text of its choosing
-/// in red on the panel's own sign-in page; another site cannot set a cookie for
-/// this one. Readable by script, scoped to the panel, and short-lived so a
-/// later visit does not show a stale reason.
+/// in red on the panel's own sign-in page; a site on another domain cannot set a
+/// cookie for this one. Readable by script, scoped to the panel, and
+/// short-lived so a later visit does not show a stale reason. The panel deletes
+/// it by writing the same name and Path.
 fn failure_cookie(reason: &str, secure: bool) -> String {
     let mut cookie = format!("{FAILURE_COOKIE}={}; SameSite=Lax; Path=/admin; Max-Age=60", urlencode(reason));
     if secure {
