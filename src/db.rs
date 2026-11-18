@@ -2095,6 +2095,10 @@ impl Db {
     /// results an honest node can send.
     pub const MIN_PROBE_INTERVAL: i64 = 5;
 
+    /// A ticked node deleted before the save reached the hub. The panel's list
+    /// drops it within one push, so saving again succeeds.
+    const DELETED_TICKED: &str = "勾选的节点里有已被删除的，等列表刷新后再保存";
+
     /// Replaces the assignments wholesale, or with `base` applies only what
     /// changed from it. Either way in one transaction: failing between the
     /// deletes and the inserts would unassign nodes from a probe the panel still
@@ -2139,15 +2143,17 @@ impl Db {
         for node in &added {
             // OR IGNORE covers a node that joined while the editor was open and
             // was then ticked. It does not cover the foreign key, which remains
-            // the check; naming the node turns SQLite's "FOREIGN KEY constraint
-            // failed" into something the panel can show.
+            // the check, turned from SQLite's "FOREIGN KEY constraint failed"
+            // into something the panel can show. Not by id, which the panel never
+            // shows, nor by name, which went with the row; the panel drops a
+            // deleted node from what it sends once its list catches up.
             tx.execute(
                 "INSERT OR IGNORE INTO ping_node (task_id, node_id) VALUES (?1,?2)",
                 params![id, node],
             )
             .map_err(|e| match e.sqlite_error_code() {
                 Some(rusqlite::ErrorCode::ConstraintViolation) => {
-                    anyhow::Error::from(e).context(crate::Shown(format!("节点 {node} 不存在，可能已被删除")))
+                    anyhow::Error::from(e).context(crate::Shown(Self::DELETED_TICKED.to_owned()))
                 }
                 _ => e.into(),
             })?;
@@ -3617,12 +3623,11 @@ mod tests {
         assert_eq!(pings, 0, "ping_record has no foreign key to cascade through");
         assert_eq!(db.metrics(id, Span::minutes(0, 60)).unwrap().len(), 0);
         assert!(!db.all_traffic().contains_key(&id));
-        // Ticked in an editor opened before the delete: named, not a 500.
+        // Ticked in an editor opened before the delete: a sentence, not a 500.
         let gone = db.save_ping_task(&probe(vec![id])).unwrap_err();
-        let expected = format!("节点 {id} 不存在，可能已被删除");
         assert_eq!(
             gone.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()),
-            Some(expected.as_str()),
+            Some(Db::DELETED_TICKED),
             "{gone:#}"
         );
 
