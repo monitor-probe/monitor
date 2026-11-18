@@ -31,6 +31,7 @@
   --destructive: oklch(0.577 0.245 27.325);
   --border: oklch(0.929 0.013 255.508);
   --input: oklch(0.929 0.013 255.508);
+  --switch-off: oklch(0.64 0.04 257);
   --ring: oklch(0.704 0.04 256.788);
   --near: oklch(0.575 0.12 55);
   --over: oklch(0.5 0.14 27);
@@ -57,6 +58,7 @@
   --destructive: oklch(0.704 0.191 22.216);
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
+  --switch-off: oklch(1 0 0 / 12%);
   --ring: oklch(0.551 0.027 264.364);
   --near: oklch(0.8 0.1 65);
   --over: oklch(0.7 0.11 25);
@@ -129,6 +131,13 @@
 /* A drag keeps the grabbing cursor wherever the pointer goes. Unlayered, so it
    outranks the utilities. */
 :root[data-dragging] * { cursor: grabbing; }
+
+/* An unchecked switch on its own track. The component's `bg-input` puts the
+   white thumb on a track 1.23:1 from it and from the card, below the 3:1 a
+   control must show; this track is 3.37:1 against white and 5.29:1 from a
+   checked one. The dark value is the component's own `bg-input/80`, which
+   already clears it. Unlayered, so it outranks the utilities. */
+[data-slot="switch"][data-state="unchecked"] { background-color: var(--switch-off); }
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
