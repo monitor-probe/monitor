@@ -11,8 +11,9 @@ import { api, provisionRefusal, useNodes } from "@/lib/api"
 
 type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
 
-// `/admin` alone is not a page; it is normalised to the first section so that a
-// bookmark and the OAuth redirect both resolve to a real route.
+// `/admin` alone is not a page. The hub redirects it to the first section; this
+// applies the same alias where no such redirect ran, and drops a trailing slash
+// from a section.
 function normalise(p: string) {
   return p === "/admin" || p === "/admin/" ? "/admin/nodes" : p.replace(/\/$/, "") || "/admin/nodes"
 }

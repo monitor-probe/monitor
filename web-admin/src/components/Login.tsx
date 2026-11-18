@@ -17,12 +17,23 @@ function GithubMark() {
   )
 }
 
-// The hub redirects a failed GitHub sign-in back here with the reason attached,
-// so it is readable in context rather than as a bare 401 page.
+// The hub redirects a failed GitHub sign-in back here with the reason in a
+// short-lived cookie, so it is readable in context rather than as a bare 401
+// page. A cookie rather than the query string: any link could carry a query
+// string, but another site cannot set a cookie for this one. Read once, then
+// deleted so a reload does not show it again.
+const FAILURE_COOKIE = "monitor_login_error"
+
 function callbackError(): string {
-  const reason = new URLSearchParams(location.search).get("login_error")
-  if (reason) history.replaceState({}, "", location.pathname)
-  return reason ?? ""
+  const entry = document.cookie.split("; ").find((c) => c.startsWith(`${FAILURE_COOKIE}=`))
+  if (!entry) return ""
+  const secure = location.protocol === "https:" ? "; Secure" : ""
+  document.cookie = `${FAILURE_COOKIE}=; Path=/admin; Max-Age=0${secure}`
+  try {
+    return decodeURIComponent(entry.slice(FAILURE_COOKIE.length + 1))
+  } catch {
+    return ""
+  }
 }
 
 export function Login({ github, onDone }: { github: boolean; onDone: () => void }) {
