@@ -13,27 +13,29 @@ import { NodePicker } from "@/components/pickers"
 import { api, type Node } from "@/lib/api"
 import { useSettings } from "@/lib/settings"
 
+// The placeholders the hub's `render` knows, in the order the hints list them.
+const KEYS = ["title", "message", "node", "event", "site", "time"] as const
+
 // One offline alert, filled in the way the hub fills a template: in a single pass,
-// JSON-escaped for the webhook body. Previews only; nothing here is sent. Its keys
-// are the placeholders the hub's `render` knows, in the order the hints list
-// them; `site` is the site name, filled in when previewed.
-const SAMPLE_NOTE: Record<string, string> = {
+// JSON-escaped for the webhook body. Previews only; nothing here is sent. Every
+// key but `site`, the site name, which the preview fills in.
+const SAMPLE_NOTE: Record<Exclude<(typeof KEYS)[number], "site">, string> = {
   title: "🔴 香港 · 甲商家 离线",
   message: "最后上报 09-15 20:13 +08:00",
   node: "香港 · 甲商家",
   event: "offline",
-  site: "",
   time: "09-15 20:16 +08:00",
 }
 
-const PLACEHOLDERS = Object.keys(SAMPLE_NOTE).map((key) => `{{${key}}}`).join(" ")
+const PLACEHOLDERS = KEYS.map((key) => `{{${key}}}`).join(" ")
 
 function TemplatePreview({ template, site, json = false }: { template: string; site: string; json?: boolean }) {
   if (!template.trim()) return <p className="text-xs text-muted-foreground">留空保存即恢复默认模板</p>
   const values: Record<string, string> = { ...SAMPLE_NOTE, site }
-  // An unknown placeholder is left as written, as the hub leaves it.
-  let out = template.replace(/\{\{(\w+)\}\}/g, (whole, key: string) =>
-    !Object.hasOwn(values, key) ? whole : json ? JSON.stringify(values[key]).slice(1, -1) : values[key],
+  // Scanned as the hub scans: from each `{{`, a known placeholder or the two
+  // braces alone, so `{{{title}}` and an unknown `{{other}}` stay as written.
+  let out = template.replace(/\{\{(?:(\w+)\}\})?/g, (whole, key?: string) =>
+    !key || !Object.hasOwn(values, key) ? whole : json ? JSON.stringify(values[key]).slice(1, -1) : values[key],
   )
   if (json) {
     try {
