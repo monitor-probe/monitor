@@ -113,6 +113,29 @@ export function byName<T extends Pick<Node, "id" | "name" | "group">>(nodes: T[]
     Number(!a.group) - Number(!b.group) || compare(a.group, b.group) || compare(a.name, b.name) || a.id - b.id)
 }
 
+/**
+ * The items in the order of `ids`, those no longer listed skipped. One the hub
+ * has listed since keeps the place the hub gave it: first when the hub lists it
+ * ahead of every ordered item, last when after every one, and otherwise right
+ * after the ordered item it follows there. A new node then lands first, a new
+ * probe last, and a node created in a group behind that group's last member, as
+ * the hub places each, rather than wherever the next saved order would carry it.
+ */
+export function keepOrder<T extends { id: number }>(ids: number[], items: T[]): T[] {
+  const byId = new Map(items.map((item) => [item.id, item]))
+  const order = ids.flatMap((id) => byId.get(id) ?? [])
+  const ordered = new Set(ids)
+  const first = items.findIndex((item) => ordered.has(item.id))
+  const last = items.findLastIndex((item) => ordered.has(item.id))
+  if (first < 0) return items
+  let previous = items[first]
+  for (const item of items.slice(first + 1, last)) {
+    if (!ordered.has(item.id)) order.splice(order.indexOf(previous) + 1, 0, item)
+    previous = item
+  }
+  return [...items.slice(0, first), ...order, ...items.slice(last + 1)]
+}
+
 /** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */
 export function inGroup<T extends Pick<Node, "group">>(nodes: T[], filter: string): T[] {
   if (filter === "all") return nodes
