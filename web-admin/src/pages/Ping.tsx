@@ -38,9 +38,10 @@ function PingForm({ task, nodes, onClose, onSaved }: {
     setForm((f) => ({ ...f, nodes: [...(f.nodes ?? []), ...fresh] }))
   }, [nodes, task.auto_join])
   const chosen = new Set(form.nodes)
-  // Counted against the live list: `form.nodes` can still name a node deleted
-  // since the probes were loaded.
-  const chosenCount = nodes.filter((n) => chosen.has(n.id)).length
+  // Taken from the live list: `form.nodes` can still name a node deleted since
+  // the dialog opened, which the hub refuses and the list no longer shows to
+  // untick.
+  const ticked = nodes.filter((n) => chosen.has(n.id)).map((n) => n.id)
 
   const pick = (list: Node[], on: boolean) =>
     setForm((f) => {
@@ -60,7 +61,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
     try {
       // `base` limits the save to what was ticked or unticked here; a node that
       // joined through auto_join while the dialog was open keeps its assignment.
-      const body = { ...form, interval, ...(task.id ? { base: base.current } : {}) }
+      const body = { ...form, nodes: ticked, interval, ...(task.id ? { base: base.current } : {}) }
       await api("/ping-tasks", { method: "POST", body: JSON.stringify(body) })
       toast.success("已保存，正在下发")
       onClose()
@@ -98,7 +99,7 @@ function PingForm({ task, nodes, onClose, onSaved }: {
             <section className="space-y-3 border-t pt-5">
               <div className="flex items-baseline justify-between gap-2">
                 <h3 className="text-sm font-medium">运行节点</h3>
-                <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
+                <span className="tnum text-xs text-muted-foreground">已选 {ticked.length} / {nodes.length}</span>
               </div>
               <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
               <OptionRow title="新节点自动加入" hint="以后添加的节点自动运行此监控" toggle>
