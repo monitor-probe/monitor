@@ -109,6 +109,17 @@
      this a clickable row loses its pointer exactly where the control sits. The
      component's own `disabled:cursor-not-allowed` is more specific and wins. */
   [data-slot="switch"], input[type="checkbox"] { cursor: pointer; }
+  /* The dialog places its close button in the corner of the content box without
+     reserving room for it, so a title long enough to reach that corner runs
+     under the button. The header is inset by the button's width, on both sides
+     below `sm` where it is centred. A title or description with no break
+     opportunity, such as a node named like a host (`hk01.vps.example.com`),
+     wraps anywhere rather than widening the dialog into a sideways scroll. */
+  [data-slot="dialog-content"]:has(> [data-slot="dialog-close"]) [data-slot="dialog-header"] {
+    padding-inline: 1.25rem;
+    @variant sm { padding-left: 0; }
+  }
+  [data-slot="dialog-title"], [data-slot="dialog-description"] { overflow-wrap: anywhere; }
 }
 
 /* A drag keeps the grabbing cursor wherever the pointer goes. Unlayered, so it
