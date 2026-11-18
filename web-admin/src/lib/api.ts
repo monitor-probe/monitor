@@ -113,6 +113,28 @@ export function byName<T extends Pick<Node, "id" | "name" | "group">>(nodes: T[]
     Number(!a.group) - Number(!b.group) || compare(a.group, b.group) || compare(a.name, b.name) || a.id - b.id)
 }
 
+/**
+ * The items in the order of `ids`, those no longer listed skipped. One the hub
+ * has listed since keeps the place it was given: first when the hub lists it
+ * ahead of every ordered item, otherwise ahead of the ordered item that follows
+ * it there, or last when none does. A new node then lands first and a new probe
+ * last, as the hub puts them, rather than wherever the next saved order would
+ * carry them.
+ */
+export function keepOrder<T extends { id: number }>(ids: number[], items: T[]): T[] {
+  const byId = new Map(items.map((item) => [item.id, item]))
+  const order = ids.flatMap((id) => byId.get(id) ?? [])
+  const ordered = new Set(ids)
+  const lead = items.findIndex((item) => ordered.has(item.id))
+  const head = lead < 0 ? items : items.slice(0, lead)
+  let next: T | undefined
+  for (const item of items.slice(head.length).reverse()) {
+    if (!ordered.has(item.id)) order.splice(next ? order.indexOf(next) : order.length, 0, item)
+    next = item
+  }
+  return [...head, ...order]
+}
+
 /** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */
 export function inGroup<T extends Pick<Node, "group">>(nodes: T[], filter: string): T[] {
   if (filter === "all") return nodes
