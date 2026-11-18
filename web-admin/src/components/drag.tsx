@@ -3,7 +3,7 @@ import { flushSync } from "react-dom"
 import { GripVertical } from "lucide-react"
 import { toast } from "sonner"
 
-import { api } from "@/lib/api"
+import { api, keepOrder } from "@/lib/api"
 
 // Displaced rows slide from where they were drawn to their new place: each is
 // offset back by the distance it moved, then released. Transforms leave layout
@@ -40,10 +40,7 @@ export function useDragOrder<T extends { id: number }>(items: T[], path: string,
   const saving = useRef<Promise<unknown>>(Promise.resolve())
   const byId = new Map(items.map((item) => [item.id, item]))
   const orderedIds = new Set(manualOrder)
-  const order = [
-    ...manualOrder.map((id) => byId.get(id)).filter((item): item is T => Boolean(item)),
-    ...items.filter((item) => !orderedIds.has(item.id)),
-  ]
+  const order = keepOrder(manualOrder, items)
   const ids = () => order.map((item) => item.id)
 
   // Once the hub lists this order, its list is followed again, so a reorder made
@@ -73,7 +70,10 @@ export function useDragOrder<T extends { id: number }>(items: T[], path: string,
   function save(next: number[]) {
     setDragging(null)
     const before = orderBeforeDrag.current
-    if (!before.length || next.join() === before.join()) return
+    // Compared on the rows held when the drag began: one the hub listed since is
+    // not a move, and a drag that ended where it started saves nothing.
+    const held = new Set(before)
+    if (!before.length || next.filter((id) => held.has(id)).join() === before.join()) return
     commit(next)
   }
 

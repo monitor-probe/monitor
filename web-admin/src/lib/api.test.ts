@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection, upload, CHUNK } from "./api.ts"
+import { badIfaceName, behind, byName, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, keepOrder, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection, upload, CHUNK } from "./api.ts"
 import { addMonths } from "./format.ts"
 
 // The same results as the hub's roll-over, which uses chrono's checked_add_months.
@@ -163,6 +163,20 @@ for (const start of [close, [...close].reverse()]) {
 const twins = [{ id: 2, name: "备用机" }, { id: 1, name: "备用机" }]
 for (const start of [twins, [...twins].reverse()]) {
   assert.deepEqual(byName(start).map((n) => n.id), [1, 2])
+}
+
+// A row the hub listed while an order was held stays where the hub put it: a
+// node registered mid-drag first, a probe added last, a node created in a group
+// behind that group's last member even when the drag moved the next group ahead.
+// A row deleted meanwhile is skipped.
+{
+  const rows = (...ids: number[]) => ids.map((id) => ({ id }))
+  const kept = (ids: number[], hub: number[]) => keepOrder(ids, rows(...hub)).map((r) => r.id)
+  assert.deepEqual(kept([3, 1, 2], [9, 8, 1, 2, 3]), [9, 8, 3, 1, 2])
+  assert.deepEqual(kept([3, 1, 2], [1, 2, 3, 8, 9]), [3, 1, 2, 8, 9])
+  assert.deepEqual(kept([3, 4, 1, 2], [1, 2, 9, 8, 3, 4]), [3, 4, 1, 2, 9, 8])
+  assert.deepEqual(kept([3, 1, 2], [2, 3]), [3, 2])
+  assert.deepEqual(kept([], [2, 1]), [2, 1])
 }
 
 // Every chunk but the last can be aborted. Once the last lands the hub applies
