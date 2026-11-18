@@ -95,7 +95,7 @@ export function Security({ site }: { site: string }) {
         <div>
           <h3 className="text-sm font-medium">GitHub 单点登录</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            OAuth App 回调地址 <code className="rounded bg-muted px-1 break-all">{callback}</code>
+            OAuth App 回调地址 <code className="rounded bg-muted px-1 text-foreground break-all">{callback}</code>
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">

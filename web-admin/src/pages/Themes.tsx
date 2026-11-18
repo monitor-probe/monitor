@@ -373,13 +373,15 @@ export function Themes() {
               </button>
             )}
             <div className="flex items-start gap-3">
+              {/* Name, description and author come from the theme's manifest: a
+                  run without spaces wraps anywhere instead of widening the card. */}
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <h3 className="font-medium">{theme.name}</h3>
+                  <h3 className="min-w-0 font-medium wrap-anywhere">{theme.name}</h3>
                   {theme.selected && <Badge>当前</Badge>}
                   {theme.builtin && <Badge variant="secondary" className="font-normal">内置</Badge>}
                 </div>
-                <p className="mt-1 text-sm text-muted-foreground">{theme.description}</p>
+                <p className="mt-1 text-sm text-muted-foreground wrap-anywhere">{theme.description}</p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
                 <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
@@ -412,7 +414,7 @@ export function Themes() {
                 )}
               </div>
             </div>
-            <p className="text-xs text-muted-foreground">
+            <p className="text-xs text-muted-foreground wrap-anywhere">
               {theme.author} · {theme.version}
               {theme.url && <> · <a className="hover:underline" href={theme.url} target="_blank" rel="noreferrer">源码</a></>}
             </p>
@@ -427,7 +429,7 @@ export function Themes() {
           <DialogContent className="sm:max-w-4xl">
             <DialogHeader>
               <DialogTitle>{zoomed.name} 预览图</DialogTitle>
-              <DialogDescription>{zoomed.author} · {zoomed.version}</DialogDescription>
+              <DialogDescription className="wrap-anywhere">{zoomed.author} · {zoomed.version}</DialogDescription>
             </DialogHeader>
             <img
               src={`/api/themes/${zoomed.short}/preview`}
