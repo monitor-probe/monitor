@@ -12,7 +12,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Command, ConfirmDialog, copy, Segments } from "@/components/common"
 import { DragHandle, useDragOrder } from "@/components/drag"
 import { GroupFilter, nameText, NodeSearch, searchNodes, useGroupFilter } from "@/components/pickers"
-import { api, byName, groupsOf, inGroup, type Node, shortAddress, type Source } from "@/lib/api"
+import { api, byName, groupsOf, inGroup, keepOrder, type Node, shortAddress, type Source } from "@/lib/api"
 import { uninstallCommand } from "@/lib/commands"
 import { bytes, FOREVER, money, uptime } from "@/lib/format"
 import { useSettings } from "@/lib/settings"
@@ -197,11 +197,8 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
     const before = drag.order.map((n) => n.id)
     if (!await drag.arrange(byName(drag.order).map((n) => n.id), rows)) return
     // Against the list as it is by then, which the hub requires in full: a node
-    // added since goes first, where the hub placed it.
-    const undo = () => {
-      const now = latest.current.map((n) => n.id)
-      drag.arrange([...now.filter((id) => !before.includes(id)), ...before.filter((id) => now.includes(id))], rows)
-    }
+    // added since keeps the place the hub gave it.
+    const undo = () => drag.arrange(keepOrder(before, latest.current).map((n) => n.id), rows)
     toast.success("已按名称排序", { duration: 15_000, action: { label: "撤销", onClick: undo } })
   }
 

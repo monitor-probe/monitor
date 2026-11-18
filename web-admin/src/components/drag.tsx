@@ -70,7 +70,10 @@ export function useDragOrder<T extends { id: number }>(items: T[], path: string,
   function save(next: number[]) {
     setDragging(null)
     const before = orderBeforeDrag.current
-    if (!before.length || next.join() === before.join()) return
+    // Compared on the rows held when the drag began: one the hub listed since is
+    // not a move, and a drag that ended where it started saves nothing.
+    const held = new Set(before)
+    if (!before.length || next.filter((id) => held.has(id)).join() === before.join()) return
     commit(next)
   }
 

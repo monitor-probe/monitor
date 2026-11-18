@@ -115,24 +115,25 @@ export function byName<T extends Pick<Node, "id" | "name" | "group">>(nodes: T[]
 
 /**
  * The items in the order of `ids`, those no longer listed skipped. One the hub
- * has listed since keeps the place it was given: first when the hub lists it
- * ahead of every ordered item, otherwise ahead of the ordered item that follows
- * it there, or last when none does. A new node then lands first and a new probe
- * last, as the hub puts them, rather than wherever the next saved order would
- * carry them.
+ * has listed since keeps the place the hub gave it: first when the hub lists it
+ * ahead of every ordered item, last when after every one, and otherwise right
+ * after the ordered item it follows there. A new node then lands first, a new
+ * probe last, and a node created in a group behind that group's last member, as
+ * the hub places each, rather than wherever the next saved order would carry it.
  */
 export function keepOrder<T extends { id: number }>(ids: number[], items: T[]): T[] {
   const byId = new Map(items.map((item) => [item.id, item]))
   const order = ids.flatMap((id) => byId.get(id) ?? [])
   const ordered = new Set(ids)
-  const lead = items.findIndex((item) => ordered.has(item.id))
-  const head = lead < 0 ? items : items.slice(0, lead)
-  let next: T | undefined
-  for (const item of items.slice(head.length).reverse()) {
-    if (!ordered.has(item.id)) order.splice(next ? order.indexOf(next) : order.length, 0, item)
-    next = item
+  const first = items.findIndex((item) => ordered.has(item.id))
+  const last = items.findLastIndex((item) => ordered.has(item.id))
+  if (first < 0) return items
+  let previous = items[first]
+  for (const item of items.slice(first + 1, last)) {
+    if (!ordered.has(item.id)) order.splice(order.indexOf(previous) + 1, 0, item)
+    previous = item
   }
-  return [...head, ...order]
+  return [...items.slice(0, first), ...order, ...items.slice(last + 1)]
 }
 
 /** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */

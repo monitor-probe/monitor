@@ -166,15 +166,15 @@ for (const start of [twins, [...twins].reverse()]) {
 }
 
 // A row the hub listed while an order was held stays where the hub put it: a
-// node registered mid-drag first, a probe added last, one placed between two
-// ordered rows ahead of the one that follows it there. A row deleted meanwhile
-// is skipped.
+// node registered mid-drag first, a probe added last, a node created in a group
+// behind that group's last member even when the drag moved the next group ahead.
+// A row deleted meanwhile is skipped.
 {
   const rows = (...ids: number[]) => ids.map((id) => ({ id }))
   const kept = (ids: number[], hub: number[]) => keepOrder(ids, rows(...hub)).map((r) => r.id)
   assert.deepEqual(kept([3, 1, 2], [9, 8, 1, 2, 3]), [9, 8, 3, 1, 2])
   assert.deepEqual(kept([3, 1, 2], [1, 2, 3, 8, 9]), [3, 1, 2, 8, 9])
-  assert.deepEqual(kept([3, 1, 2], [1, 9, 2, 3]), [3, 1, 9, 2])
+  assert.deepEqual(kept([3, 4, 1, 2], [1, 2, 9, 8, 3, 4]), [3, 4, 1, 2, 9, 8])
   assert.deepEqual(kept([3, 1, 2], [2, 3]), [3, 2])
   assert.deepEqual(kept([], [2, 1]), [2, 1])
 }
