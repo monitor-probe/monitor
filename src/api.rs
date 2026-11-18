@@ -1099,7 +1099,8 @@ pub async fn agent_register(
         answer(StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
     };
     let until = register_until(&app);
-    let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && register_left(&app) > 0) else {
+    let open = left_of(until, Utc::now().timestamp()) > 0;
+    let Some(key) = app.db.get("register_key").filter(|k| open && !k.is_empty()) else {
         return closed();
     };
     if agent_ws::bearer(&headers) != Some(key.as_str()) {
@@ -1170,18 +1171,28 @@ pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderM
 /// eight hours fast -- Windows and Linux sharing a machine in UTC+8 -- would hide
 /// the command of an open window, and one eight hours slow would show it for
 /// eight hours after the key stopped working.
-///
-/// Also the gate in `agent_register`, so the two cannot disagree. A deadline
-/// further ahead than one window was set under a clock running fast -- an RTC
-/// kept in local time, read before NTP corrects it -- and counts as closed:
-/// taken at face value, a window opened eight hours fast would admit the key
-/// for nine hours once the clock is corrected.
 fn register_left(app: &App) -> i64 {
-    let left = register_until(app) - Utc::now().timestamp();
-    if left > REGISTER_WINDOW {
+    left_of(register_until(app), Utc::now().timestamp())
+}
+
+/// How far past one window a deadline may lie and still count as open. NTP
+/// steps rather than slews an offset above a fraction of a second, and such a
+/// step back must not shut a window opened under a correct clock.
+const REGISTER_SKEW: i64 = 300;
+
+/// Seconds left of a window ending at `until`, read at `now`. The panel's
+/// countdown and the gate in `agent_register` both answer from this, so the two
+/// cannot disagree. A deadline further ahead than one window plus
+/// [`REGISTER_SKEW`] was set under a clock running fast -- an RTC kept in local
+/// time, read before NTP corrects it -- and counts as closed: taken at face
+/// value, a window opened eight hours fast would admit the key for nine hours
+/// once the clock is corrected.
+fn left_of(until: i64, now: i64) -> i64 {
+    let left = until - now;
+    if left > REGISTER_WINDOW + REGISTER_SKEW {
         0
     } else {
-        left.max(0)
+        left.clamp(0, REGISTER_WINDOW)
     }
 }
 
@@ -4012,6 +4023,18 @@ mod tests {
         let saved = save(json!({"public_page": "off", "retention_days": "7"})).await;
         assert_eq!(saved.status(), StatusCode::OK);
         assert_eq!(app.db.get("retention_days").as_deref(), Some("7"));
+    }
+
+    /// A step of seconds back keeps a window open; a deadline hours ahead, left
+    /// by a clock that ran fast when the window opened, closes it.
+    #[test]
+    fn a_deadline_past_one_window_counts_as_closed_beyond_the_slack() {
+        let now = 1_700_000_000;
+        assert_eq!(left_of(now + 10, now), 10);
+        assert_eq!(left_of(now - 1, now), 0);
+        assert_eq!(left_of(now + REGISTER_WINDOW + 2, now), REGISTER_WINDOW, "a clock stepped back 2 s");
+        assert_eq!(left_of(now + REGISTER_WINDOW + REGISTER_SKEW, now), REGISTER_WINDOW);
+        assert_eq!(left_of(now + REGISTER_WINDOW + REGISTER_SKEW + 1, now), 0);
     }
 
     /// The install script and the sign-in page keep separate counters: five
