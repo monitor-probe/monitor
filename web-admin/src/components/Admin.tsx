@@ -1,4 +1,5 @@
 import { ArrowUpCircle, Bell, Database, Palette, Radio, Server, Settings, Shield } from "lucide-react"
+import { useEffect, useRef } from "react"
 
 import { behind, type Node, outdatedAgents } from "@/lib/api"
 import { Data } from "@/pages/Data"
@@ -41,6 +42,20 @@ export function Admin({
   reloadMe: () => void
 }) {
   const { versions, reload } = useVersions()
+  // Below `md` the sections are one scrolling row about twice the width of a
+  // phone, so a page opened directly would otherwise have its button out of
+  // view. Only the row scrolls, never the window.
+  const navRef = useRef<HTMLElement>(null)
+  useEffect(() => {
+    const nav = navRef.current
+    const current = nav?.querySelector<HTMLElement>("[aria-current=page]")
+    if (!nav || !current) return
+    const row = nav.getBoundingClientRect()
+    const button = current.getBoundingClientRect()
+    if (button.left < row.left || button.right > row.right) {
+      nav.scrollLeft += button.left - row.left - (row.width - button.width) / 2
+    }
+  }, [path])
   // One dot for both; the page separates them. Absent when switched off on that
   // page, or when the lookup failed and the page has nothing to say.
   const updates =
@@ -48,7 +63,7 @@ export function Admin({
     && (behind(versions.hub, versions.hub_latest) || outdatedAgents(nodes, versions.agent_latest).length > 0)
   return (
     <div className="flex flex-col gap-6 md:flex-row">
-      <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
+      <nav ref={navRef} className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
         {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
           const active = path === to
           return (
