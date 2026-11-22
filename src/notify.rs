@@ -548,23 +548,48 @@ pub struct Watch {
 
 pub async fn watch(app: Shared) {
     let mut watch = Watch::default();
-    let mut ticker = tokio::time::interval(SWEEP);
-    // Absences are timed on the ticks rather than the wall clock. A hub started
-    // before NTP corrects a clock running hours fast, as an RTC kept in local
-    // time reads, would otherwise date them hours ahead and hold its offline
-    // alerts back by the correction as well as the grace period. Each tick is
-    // its scheduled instant, so sweeps lie whole multiples of SWEEP apart and a
-    // grace period of whole sweeps is never cut short by a rounded second.
-    let first = ticker.tick().await;
-    let mut tick = first;
+    let mut pace = Pace::new();
     loop {
-        let (now, steady) = (Utc::now().timestamp(), tick.duration_since(first).as_secs() as i64);
+        let steady = pace.next().await;
+        let now = Utc::now().timestamp();
         // Synchronous database work, kept off the runtime threads like a report.
         match tokio::task::block_in_place(|| sweep(&app, &mut watch, now, steady)) {
             Ok(notes) => notes.into_iter().for_each(|note| send(&app, note)),
             Err(e) => warn!("notification sweep failed: {e:#}"),
         }
-        tick = ticker.tick().await;
+    }
+}
+
+/// The sweep schedule and the monotonic clock absences are timed on. A hub
+/// started before NTP corrects a clock running hours fast, as an RTC kept in
+/// local time reads, would otherwise date absences hours ahead and hold its
+/// offline alerts back by the correction as well as the grace period.
+struct Pace {
+    ticker: tokio::time::Interval,
+    first: tokio::time::Instant,
+}
+
+impl Pace {
+    fn new() -> Self {
+        let first = tokio::time::Instant::now();
+        let mut ticker = tokio::time::interval_at(first, SWEEP);
+        // A sweep held up past its successors' slots, as by a vacuum holding the
+        // database, runs once on release rather than once per slot missed.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self { ticker, first }
+    }
+
+    /// Waits for the next sweep and returns the seconds since the first, the
+    /// time actually elapsed rounded down to a whole number of sweeps. A tick
+    /// never fires early, so an on-time sweep reads exactly its slot and a grace
+    /// period of whole sweeps is not cut short by a rounded second. Read from
+    /// the tick's scheduled instant instead, the sweeps run on release after a
+    /// stall would each read a later slot within the same moment, and a node
+    /// that dropped during the stall would pass the grace period at once.
+    async fn next(&mut self) -> i64 {
+        self.ticker.tick().await;
+        let sweeps = self.first.elapsed().as_secs() / SWEEP.as_secs();
+        (sweeps * SWEEP.as_secs()) as i64
     }
 }
 
@@ -851,6 +876,22 @@ mod tests {
         let notes = sweep(&app, &mut watch, now + 180, 180).unwrap();
         assert_eq!(notes.len(), 1, "announced once the grace period has passed");
         assert_eq!(notes[0].event, "offline");
+    }
+
+    /// A sweep held up by a stall reads the time actually elapsed, so a node that
+    /// dropped during the stall is not taken to have been away since it began.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_sweep_reads_the_time_it_runs_at() {
+        let mut pace = Pace::new();
+        assert_eq!(pace.next().await, 0);
+        assert_eq!(pace.next().await, 30);
+        // Held up for 240 s, as by a vacuum holding the database.
+        tokio::time::advance(Duration::from_secs(240)).await;
+        let stalled = tokio::time::Instant::now();
+        assert_eq!(pace.next().await, 270, "the slot it runs in, not the first one missed");
+        let next = pace.next().await;
+        assert!(stalled.elapsed() >= SWEEP, "one sweep on release, not one per slot missed");
+        assert_eq!(next, 300);
     }
 
     /// The wall clock jumping forward neither shortens the grace period nor the
