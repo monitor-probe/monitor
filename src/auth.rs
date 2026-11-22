@@ -426,8 +426,8 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
 fn admit(app: &App, login: &str, account: &str) -> Result<()> {
     match app.db.bind_github(&login.to_lowercase(), account)? {
         None => {
-            // The list stays in the log and out of the reason, which travels back in
-            // a query string: any GitHub account can reach that page, and a reason
+            // The list stays in the log and out of the reason, which the sign-in
+            // page shows: any GitHub account can reach that page, and a reason
             // carrying the allow list would disclose the accounts worth phishing.
             let list = app.db.get("github_allowed_users").unwrap_or_default();
             warn!("GitHub user {login} is not on the allowed list {list:?}");
@@ -658,8 +658,8 @@ mod tests {
     }
 
     /// The binding rules are `Db::bind_github`'s and tested there. What `admit`
-    /// adds is the case GitHub ignores, and refusals whose reason, which travels
-    /// in a query string, names neither the list nor the bound account.
+    /// adds is the case GitHub ignores, and refusals whose reason, which any
+    /// GitHub account can be shown, names neither the list nor the bound account.
     #[test]
     fn github_admits_only_a_listed_name_and_only_the_account_it_first_bound() {
         let app = shared();
