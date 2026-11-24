@@ -837,9 +837,7 @@ impl Reading {
 fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
     let book =
         |r: &Reading| blocking(|| app.db.accumulate(node_id, &r.epoch, r.counters, r.arrival.at, r.booted));
-    // A booking holds this lock across a database call: a frame finding it
-    // taken waits as `db::lock` waits for the connection.
-    let mut held = crate::db::lock(&app.readings);
+    let mut held = held(app);
     // Whether the held reading, then this one, is booked.
     let (book_last, book_this) = match held.get(&node_id) {
         None => (false, true),
@@ -857,11 +855,25 @@ fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
     Ok(())
 }
 
+/// The held readings, locked. A booking holds this lock across a database call:
+/// a frame finding it taken waits as `db::lock` waits for the connection.
+///
+/// A booking that returned can still be undone by its batch failing to commit
+/// (`Db::batched`). All of them then count as unbooked: booking a reading
+/// already stored again adds nothing.
+fn held(app: &App) -> std::sync::MutexGuard<'_, HashMap<i64, Reading>> {
+    let mut held = crate::db::lock(&app.readings);
+    if app.db.batch_lost() {
+        held.values_mut().for_each(|r| r.booked = false);
+    }
+    held
+}
+
 /// Books held readings not yet booked: one node's as its session ends, every
 /// node's as the hub stops. Otherwise a node that reboots before reporting again
 /// takes the bytes since its last booking with it.
 pub fn book_held(app: &App, node: Option<i64>) {
-    let mut held = crate::db::lock(&app.readings);
+    let mut held = held(app);
     for (id, reading) in held.iter_mut().filter(|(id, r)| !r.booked && node.is_none_or(|n| n == **id)) {
         match app.db.accumulate(*id, &reading.epoch, reading.counters, reading.arrival.at, reading.booted) {
             Ok(_) => reading.booked = true,
@@ -1504,6 +1516,25 @@ mod tests {
         // The comparison is only as good as the boundary it spans.
         assert_eq!(booked.month_start, "2026-02-01", "the period turned at midnight");
         assert!(booked.day_rx > 0 && booked.total_rx > booked.day_rx, "bytes fell on both sides of midnight");
+    }
+
+    /// A booking whose batch is rolled back is booked again at the break that
+    /// follows; otherwise the bytes up to it would be lost with the old span.
+    #[test]
+    fn a_booking_rolled_back_with_its_batch_is_booked_again() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let mut session = Session::default();
+        send(&app, id, &mut session, 0, &report_json("boot-a", 1_000, 0)).unwrap();
+        app.db.execute_for_test(
+            "CREATE TRIGGER fail BEFORE INSERT ON metric BEGIN SELECT RAISE(ROLLBACK, 'disk full'); END",
+        );
+        // The minute turns: the reading is booked, then the history row fails
+        // and takes the batch with it.
+        assert!(send(&app, id, &mut session, 60, &report_json("boot-a", 5_000, 0)).is_err());
+        app.db.execute_for_test("DROP TRIGGER fail");
+        send(&app, id, &mut session, 70, &report_json("boot-b", 100, 0)).unwrap();
+        assert_eq!(total_rx(&app, id), 4_000);
     }
 
     #[test]

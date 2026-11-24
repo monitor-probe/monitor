@@ -3,6 +3,7 @@
 //! The history charts, whose scans are not, read through a second connection.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use anyhow::{Context, Result};
@@ -40,6 +41,8 @@ pub struct Db {
     // `api::HISTORY_SLOTS` deep; a pool if that wait becomes visible.
     reader: Option<Mutex<Connection>>,
     conn: Mutex<Connection>,
+    /// Set when the reports' batch was rolled back; see [`Db::batch_lost`].
+    lost: AtomicBool,
 }
 
 const SCHEMA: &str = r#"
@@ -974,6 +977,35 @@ impl Tally {
     }
 }
 
+/// The longest the reports' writes wait for their commit; see `Db::batched`.
+pub const BATCH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The writer, holding the reports' open batch; see [`Db::batched`].
+struct Batch<'a> {
+    conn: MutexGuard<'a, Connection>,
+    lost: &'a AtomicBool,
+}
+
+impl std::ops::Deref for Batch<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+/// A statement that fails on a full disk or an I/O error can take the whole
+/// batch with it, including bookings that already returned. Nothing else ends
+/// the batch while this is held, so a connection back in autocommit means it
+/// was rolled back.
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        if self.conn.is_autocommit() {
+            self.lost.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Locks `mutex`, and when it is taken, waits with this thread's share of the
 /// runtime handed to another.
 ///
@@ -988,22 +1020,6 @@ impl Tally {
 /// arriving meanwhile. Past tokio's default of 512 the next waiter stalls a
 /// worker again; refuse waiters past a limit, as the history charts do, if
 /// hubs reach that.
-/// The longest the reports' writes wait for their commit; see `Db::batched`.
-pub const BATCH: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Commits the open batch, if any. One that fails to commit is rolled back
-/// rather than left open, where every later write would join a transaction
-/// that cannot commit.
-fn settle(conn: &Connection) {
-    if conn.is_autocommit() {
-        return;
-    }
-    if let Err(e) = conn.execute_batch("COMMIT") {
-        warn!("committing the reports' writes failed: {e:#}");
-        let _ = conn.execute_batch("ROLLBACK");
-    }
-}
-
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.try_lock() {
         Ok(guard) => guard,
@@ -1053,7 +1069,7 @@ impl Db {
             file if file.is_empty() => None,
             file => Some(Mutex::new(read_only(&file)?)),
         };
-        Ok(Self { reader, conn: Mutex::new(conn) })
+        Ok(Self { reader, conn: Mutex::new(conn), lost: AtomicBool::new(false) })
     }
 
     /// The writer, with the reports' batch committed first: a transaction of
@@ -1061,7 +1077,7 @@ impl Db {
     /// restore, a vacuum, an export -- must include it.
     fn conn(&self) -> MutexGuard<'_, Connection> {
         let conn = lock(&self.conn);
-        settle(&conn);
+        self.settle(&conn);
         conn
     }
 
@@ -1073,18 +1089,24 @@ impl Db {
     /// Every node writes three rows a minute, each a commit that appends whole
     /// pages to the WAL: at 300 nodes reporting each second, 15 commits a second
     /// writing 76.6 KiB/s to disk, against 5.2 KiB/s batched. A hub stopped
-    /// without warning loses the open batch, up to
-    /// one [`BATCH`] of writes, on top of the minute a held reading already
-    /// risks (`agent_ws::file`); the traffic totals stay as they were, since an
-    /// uncommitted booking leaves the baseline the next one subtracts from.
-    fn batched(&self) -> Result<MutexGuard<'_, Connection>> {
+    /// without warning loses the open batch, up to one [`BATCH`] of writes, on
+    /// top of the minute a held reading already risks (`agent_ws::file`); the
+    /// traffic totals stay as they were, since an uncommitted booking leaves the
+    /// baseline the next one subtracts from. A batch rolled back while the hub
+    /// runs is reported by [`Db::batch_lost`], so the held readings it booked
+    /// are booked again.
+    ///
+    /// Begun IMMEDIATE, taking the write lock at once. A deferred batch whose
+    /// first statement reads holds only that snapshot, and a write from another
+    /// process meanwhile -- `--reset-password` against a running hub -- would
+    /// fail every write in the batch until its commit.
+    fn batched(&self) -> Result<Batch<'_>> {
         let conn = lock(&self.conn);
-        // Also true after SQLite rolled a failed batch back on its own (a full
-        // disk, an I/O error): the next write opens a new one.
+        // Also true after a batch was rolled back: the next write opens a new one.
         if conn.is_autocommit() {
-            conn.execute_batch("BEGIN")?;
+            conn.execute_batch("BEGIN IMMEDIATE")?;
         }
-        Ok(conn)
+        Ok(Batch { conn, lost: &self.lost })
     }
 
     /// The writer with the reports' batch left open, for reads on the reports'
@@ -1095,7 +1117,27 @@ impl Db {
 
     /// Commits the reports' open batch, if any; see [`Db::batched`].
     pub fn commit_batch(&self) {
-        settle(&lock(&self.conn));
+        self.settle(&lock(&self.conn));
+    }
+
+    /// Commits the open batch, if any. One that fails to commit is rolled back
+    /// rather than left open, where every later write would join a transaction
+    /// that cannot commit.
+    fn settle(&self, conn: &Connection) {
+        if conn.is_autocommit() {
+            return;
+        }
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            warn!("committing the reports' writes failed: {e:#}");
+            let _ = conn.execute_batch("ROLLBACK");
+            self.lost.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether a batch was rolled back since the last call: the bookings in it
+    /// returned, but none of them is stored.
+    pub fn batch_lost(&self) -> bool {
+        self.lost.swap(false, Ordering::SeqCst)
     }
 
     /// The connection the history charts read through: the read-only one, or
@@ -1122,7 +1164,7 @@ impl Db {
         // waited for: behind a vacuum or a restore the chart would wait out the
         // writer, for rows at most one `BATCH` newer.
         if let Ok(conn) = self.conn.try_lock() {
-            settle(&conn);
+            self.settle(&conn);
         }
         if bytes_of(&format!("{}-wal", reader.path().unwrap_or_default())) > 4 << 20 {
             let conn = self.conn();
@@ -3093,6 +3135,28 @@ mod tests {
         let (metrics, pings, names) = read.expect("history is read while the writer is held");
         assert_eq!((metrics.len(), pings.len()), (1, 1), "and it sees what the writer committed");
         assert_eq!(names[&task.to_string()], "probe");
+    }
+
+    /// A write committed from another process -- `--reset-password` against a
+    /// running hub -- is waited for, and the batch's writes go on.
+    #[test]
+    fn a_write_from_another_process_does_not_fail_the_batch() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        db.accumulate(id, "boot", (100, 0), Local::now(), None).unwrap();
+        db.commit_batch();
+        let other = Connection::open(&scratch.0).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        put_setting(&other, "x", "1").unwrap();
+        let commit = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        db.accumulate(id, "boot", (200, 0), Local::now(), None).unwrap();
+        commit.join().unwrap();
+        db.touch_seen(id, 1, &serde_json::json!({})).unwrap();
+        db.insert_metric(id, 60, &serde_json::json!({"cpu": 1.0})).unwrap();
     }
 
     /// The reports' writes share one commit: until it, only the writer sees
