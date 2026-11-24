@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -17,13 +18,35 @@ use crate::api::answer;
 use crate::auth::random_token;
 use crate::{App, Shared};
 
+// A release build takes `assets/` from the tables `build.rs` writes instead,
+// compressed ahead of time; see [`packed`].
 #[derive(RustEmbed)]
 #[folder = "web-admin/dist"]
+#[cfg_attr(not(debug_assertions), exclude = "assets/*")]
 struct AdminAssets;
 
 #[derive(RustEmbed)]
 #[folder = "target/theme/dist"]
+#[cfg_attr(not(debug_assertions), exclude = "assets/*")]
 struct DefaultThemeAssets;
+
+/// One file under a built frontend's `assets/`, as `build.rs` embeds it.
+// A debug build's tables are empty, and a release build has a `Plain` entry
+// only when some asset does not compress, so either variant may go unused.
+#[allow(dead_code)]
+enum Body {
+    /// Stored as it is: gzip did not make it smaller.
+    Plain(&'static [u8]),
+    /// Brotli at quality 11 and gzip at level 9, each checked at build time to
+    /// expand to the original.
+    Packed { br: &'static [u8], gzip: &'static [u8] },
+}
+
+/// `ADMIN` and `THEME`: (path below the dist directory, body), sorted by path.
+mod packed {
+    use super::Body;
+    include!(concat!(env!("OUT_DIR"), "/packed.rs"));
+}
 
 /// The built-in theme's thumbnail, which sits beside `theme.json` rather than
 /// inside `dist/` and so is not among the assets above. The file is optional in
@@ -63,14 +86,22 @@ pub struct Theme {
 
 pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
     let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
-    respond(&app, uri.path().trim_start_matches('/'), uri.query(), known, &|html| stamp_icons(&app, html))
+    let path = uri.path().trim_start_matches('/');
+    respond(&app, path, uri.query(), known, &headers, &|html| stamp_icons(&app, html))
 }
 
 /// What `serve` answers for `path`. `shell` rewrites the HTML shell on its way
 /// out; [`stamp_icons`] resolves each icon through here with the shell left
 /// as it is, which also keeps an icon a theme lacks, answered with the shell,
 /// from recursing.
-fn respond(app: &App, path: &str, query: Option<&str>, known: Option<&str>, shell: Shell) -> Response {
+fn respond(
+    app: &App,
+    path: &str,
+    query: Option<&str>,
+    known: Option<&str>,
+    accept: &HeaderMap,
+    shell: Shell,
+) -> Response {
     if is_api_path(path) {
         return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
@@ -97,6 +128,7 @@ fn respond(app: &App, path: &str, query: Option<&str>, known: Option<&str>, shel
             path,
             "面板没有构建，在 web-admin/ 下运行 npm run build",
             known,
+            (packed::ADMIN, accept),
             shell,
         );
     }
@@ -107,7 +139,13 @@ fn respond(app: &App, path: &str, query: Option<&str>, known: Option<&str>, shel
             return response;
         }
     }
-    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known, shell)
+    embedded::<DefaultThemeAssets>(
+        path,
+        "默认主题缺失，运行 scripts/theme.sh",
+        known,
+        (packed::THEME, accept),
+        shell,
+    )
 }
 
 /// Names each icon in an HTML shell after the bytes served for it -- the ETag,
@@ -127,7 +165,7 @@ fn stamp_icons(app: &App, html: Vec<u8>) -> Vec<u8> {
         if !text.contains(&quoted) {
             continue;
         }
-        let served = respond(app, path, None, None, &|html| html);
+        let served = respond(app, path, None, None, &HeaderMap::new(), &|html| html);
         let Some(etag) = served.headers().get(header::ETAG).and_then(|v| v.to_str().ok()) else { continue };
         text = text
             .replace(&quoted, &format!("\"/{path}?v={}\"", etag.trim_matches('"').get(..8).unwrap_or(etag)));
@@ -219,8 +257,17 @@ fn page(path: &str, data: Vec<u8>, known: Option<&str>, shell: Shell) -> Respons
     asset(path, if path == "index.html" { shell(data) } else { data }, known)
 }
 
-fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>, shell: Shell) -> Response {
+fn embedded<T: RustEmbed>(
+    requested: &str,
+    remedy: &str,
+    known: Option<&str>,
+    (table, accept): (&[(&str, Body)], &HeaderMap),
+    shell: Shell,
+) -> Response {
     let path = if requested.is_empty() { "index.html" } else { requested };
+    if let Some(response) = packed(table, path, accept) {
+        return response;
+    }
     if let Some(file) = T::get(path) {
         return page(path, file.data.into_owned(), known, shell);
     }
@@ -231,6 +278,36 @@ fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>, sh
         Some(index) => page("index.html", index.data.into_owned(), known, shell),
         None => answer(StatusCode::NOT_FOUND, remedy),
     }
+}
+
+/// A file of `table` in the first encoding the request accepts of brotli and
+/// gzip, or expanded from the gzip copy for a client accepting neither. No
+/// compression happens per request, which would cost a first visit about 44 ms
+/// of CPU for the five files a page loads; brotli is a further 15% smaller.
+/// Browsers offer brotli over HTTPS only, so a hub reached by plain HTTP sends
+/// the gzip copy. Every answer varies on `Accept-Encoding`, which a cache in
+/// front must key on, the URL being the same for all three.
+fn packed(table: &[(&str, Body)], path: &str, accept: &HeaderMap) -> Option<Response> {
+    let index = table.binary_search_by_key(&path, |&(name, _)| name).ok()?;
+    let (data, coding) = match table[index].1 {
+        Body::Plain(data) => return Some(asset(path, Bytes::from_static(data), None)),
+        Body::Packed { br, .. } if crate::api::accepts(accept, "br") => (Bytes::from_static(br), Some("br")),
+        Body::Packed { gzip, .. } if crate::api::accepts(accept, "gzip") => {
+            (Bytes::from_static(gzip), Some("gzip"))
+        }
+        Body::Packed { gzip, .. } => {
+            let mut plain = Vec::new();
+            flate2::read::GzDecoder::new(gzip).read_to_end(&mut plain).ok()?;
+            (plain.into(), None)
+        }
+    };
+    let mut response = asset(path, data, None);
+    let headers = response.headers_mut();
+    if let Some(coding) = coding {
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(coding));
+    }
+    headers.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+    Some(response)
 }
 
 fn disk(root: &Path, requested: &str, known: Option<&str>, shell: Shell) -> Option<Response> {
@@ -257,7 +334,8 @@ fn disk(root: &Path, requested: &str, known: Option<&str>, shell: Shell) -> Opti
 /// shell, which invites a timed `s-maxage` at the CDN and makes a theme switch
 /// take a minute to appear. With one, revalidation costs a 304 and the switch
 /// lands on the next request.
-fn asset(path: &str, data: Vec<u8>, known: Option<&str>) -> Response {
+fn asset(path: &str, data: impl Into<Bytes>, known: Option<&str>) -> Response {
+    let data: Bytes = data.into();
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     if is_asset(path) {
         let cache = "public, max-age=31536000, immutable";
@@ -644,6 +722,49 @@ pub fn remove(themes: &Path, short: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build-time compressed asset goes out as brotli or gzip by what the
+    /// request offers, and expanded for a client offering neither; each answer
+    /// varies on `Accept-Encoding`.
+    #[test]
+    fn a_packed_asset_goes_out_in_an_encoding_the_request_accepts() {
+        use std::io::Write;
+        let raw = b"console.log('packed');".repeat(40);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(&raw).unwrap();
+        let gzip: &'static [u8] = Box::leak(gz.finish().unwrap().into_boxed_slice());
+        let table: &[(&str, Body)] = &[
+            ("assets/a.js", Body::Packed { br: b"brotli bytes", gzip }),
+            ("assets/b.png", Body::Plain(b"png bytes")),
+        ];
+        let ask = |offer: &str| {
+            let mut headers = HeaderMap::new();
+            if !offer.is_empty() {
+                headers.insert(header::ACCEPT_ENCODING, offer.parse().unwrap());
+            }
+            let response = packed(table, "assets/a.js", &headers).unwrap();
+            let coding =
+                response.headers().get(header::CONTENT_ENCODING).map(|v| v.to_str().unwrap().to_owned());
+            assert_eq!(response.headers()[header::VARY], "accept-encoding", "{offer}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript", "{offer}");
+            let body = block_on(axum::body::to_bytes(response.into_body(), usize::MAX)).unwrap();
+            (coding, body.to_vec())
+        };
+        assert_eq!(ask("gzip, deflate, br, zstd"), (Some("br".into()), b"brotli bytes".to_vec()));
+        assert_eq!(ask("gzip, deflate"), (Some("gzip".into()), gzip.to_vec()));
+        assert_eq!(ask("br;q=0, x-gzip"), (Some("gzip".into()), gzip.to_vec()));
+        for offer in ["", "identity", "br;q=0, gzip;q=0", "*"] {
+            assert_eq!(ask(offer), (None, raw.clone()), "{offer}");
+        }
+
+        let plain = packed(table, "assets/b.png", &HeaderMap::new()).unwrap();
+        assert!(plain.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(packed(table, "assets/missing.js", &HeaderMap::new()).is_none());
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+    }
 
     #[test]
     fn theme_files_cannot_escape_their_dist_directory() {
