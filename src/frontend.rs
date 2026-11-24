@@ -22,12 +22,12 @@ use crate::{App, Shared};
 // compressed ahead of time; see [`packed`].
 #[derive(RustEmbed)]
 #[folder = "web-admin/dist"]
-#[cfg_attr(not(debug_assertions), exclude = "assets/*")]
+#[cfg_attr(packed_assets, exclude = "assets/*")]
 struct AdminAssets;
 
 #[derive(RustEmbed)]
 #[folder = "target/theme/dist"]
-#[cfg_attr(not(debug_assertions), exclude = "assets/*")]
+#[cfg_attr(packed_assets, exclude = "assets/*")]
 struct DefaultThemeAssets;
 
 /// One file under a built frontend's `assets/`, as `build.rs` embeds it.

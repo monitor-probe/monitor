@@ -27,22 +27,30 @@ fn main() {
 
     // A debug build leaves both tables empty: rust-embed then reads every file
     // from disk, so a rebuilt panel is served without recompiling the hub. The
-    // same switch decides which of the two `frontend.rs` embeds `assets/` from.
+    // `packed_assets` cfg carries the same decision to `frontend.rs`, which
+    // then leaves `assets/` out of rust-embed.
     let release = env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_none();
+    println!("cargo:rustc-check-cfg=cfg(packed_assets)");
+    if release {
+        println!("cargo:rustc-cfg=packed_assets");
+    }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
     let mut code = String::new();
     for (table, dist) in [("ADMIN", "web-admin/dist"), ("THEME", "target/theme/dist")] {
         let mut files = Vec::new();
         if release {
             println!("cargo:rerun-if-changed={dist}");
-            list(Path::new(dist), Path::new("assets"), &mut files);
+            list(Path::new(dist), "assets", &mut files);
         }
+        // Sorted as strings, the order `frontend::packed` searches in; paths
+        // compare by component, which puts `x/a.js` before `x-1.js`.
         files.sort();
+        // The previous build's files carry other hashes and would accumulate.
+        let _ = fs::remove_dir_all(out.join(table));
         writeln!(code, "pub static {table}: &[(&str, Body)] = &[").expect("String");
-        for relative in files {
-            let source = Path::new(dist).join(&relative).canonicalize().expect("listed file");
-            let name = relative.to_str().expect("asset names are ASCII");
-            let body = pack(&source, &out.join(table).join(&relative));
+        for name in files {
+            let source = Path::new(dist).join(&name).canonicalize().expect("listed file");
+            let body = pack(&source, &out.join(table).join(&name));
             writeln!(code, "    ({name:?}, {body}),").expect("String");
         }
         writeln!(code, "];").expect("String");
@@ -50,13 +58,15 @@ fn main() {
     fs::write(out.join("packed.rs"), code).expect("write packed.rs");
 }
 
-/// Every file below `dir`/`relative`, as paths relative to `dir`. A frontend
-/// that has not been built has no directory and contributes nothing.
-fn list(dir: &Path, relative: &Path, files: &mut Vec<PathBuf>) {
+/// Every file below `dir`/`relative`, named as a request names it: the path
+/// from `dir` with `/` between components. A frontend that has not been built
+/// has no directory and contributes nothing.
+fn list(dir: &Path, relative: &str, files: &mut Vec<String>) {
     let Ok(entries) = fs::read_dir(dir.join(relative)) else { return };
     for entry in entries {
         let entry = entry.expect("read_dir entry");
-        let path = relative.join(entry.file_name());
+        let name = entry.file_name().into_string().expect("asset names are UTF-8");
+        let path = format!("{relative}/{name}");
         if entry.file_type().expect("file type").is_dir() {
             list(dir, &path, files);
         } else {
