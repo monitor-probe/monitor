@@ -258,6 +258,8 @@ struct Session {
     /// Probe results as `(task_id, ts, latency)`, filed a minute at a time
     /// because each commit writes at least one page.
     results: Vec<(i64, i64, i64)>,
+    /// The last value of each [`STICKY`] field this connection carried.
+    sticky: [Option<serde_json::Value>; STICKY.len()],
 }
 
 impl Session {
@@ -275,6 +277,23 @@ impl Session {
             self.held_hello.take()
         } else {
             None
+        }
+    }
+
+    /// Fills each [`STICKY`] field a report leaves out from the last value this
+    /// connection carried, and records the ones it carries. Called before the
+    /// spacing check: a value in a dropped report is still the agent's latest,
+    /// and the agent does not send it again while it is unchanged.
+    fn fill_sticky(&mut self, report: &mut serde_json::Value) {
+        let Some(fields) = report.as_object_mut() else { return };
+        for (key, held) in STICKY.iter().zip(&mut self.sticky) {
+            match (fields.get(*key), &held) {
+                (Some(value), _) if held.as_ref() != Some(value) => *held = Some(value.clone()),
+                (None, Some(value)) => {
+                    fields.insert((*key).to_owned(), value.clone());
+                }
+                _ => {}
+            }
         }
     }
 
@@ -319,6 +338,22 @@ impl Session {
         }
         app.db.insert_pings(node_id, &results)
     }
+}
+
+/// Report fields an agent may leave out while they are unchanged, which this
+/// hub then fills from the last value the connection carried, so that every
+/// step past `dispatch` reads whole reports. Each is a capacity or an identity
+/// that changes with a reboot, a resize or a reinstall: together 142 of a
+/// report's 471 bytes (measured).
+///
+/// Offered by [`capabilities_message`] at the start of each connection rather
+/// than assumed from a version: an agent leaves a field out only when the hub
+/// has named it, so an older hub, which names none, keeps receiving whole
+/// reports. Older agents ignore the frame.
+const STICKY: [&str; 5] = ["boot_id", "iface", "mem_total", "swap_total", "disk_total"];
+
+fn capabilities_message() -> String {
+    json!({"method": "capabilities", "params": {"sticky": STICKY}}).to_string()
 }
 
 #[derive(Deserialize)]
@@ -422,7 +457,9 @@ async fn serve(app: Shared, node_id: i64, token: &str, ip: String, mut socket: W
         let mut owed: Option<String> = None;
         // Whether the last read of the probe list failed; see [`tasks_frame`].
         let mut tasks_failing = false;
-        // Sent before the first report arrives.
+        // Both sent before the first report arrives, which carries every field
+        // whatever the agent has learnt by then.
+        socket.send(Message::Text(capabilities_message().into())).await?;
         send_tasks(&app, node_id, &mut socket, &mut tasks_failing).await?;
 
         loop {
@@ -582,7 +619,10 @@ fn dispatch(
     session: &mut Session,
     arrival: Arrival,
 ) -> Result<Option<String>> {
-    let rpc: Rpc = serde_json::from_str(text)?;
+    let mut rpc: Rpc = serde_json::from_str(text)?;
+    if rpc.method == "report" {
+        session.fill_sticky(&mut rpc.params);
+    }
     // Results gathered in an earlier minute are filed on the next frame of any
     // kind: reports arrive every few seconds even where every probe runs once an
     // hour. A failure is logged rather than returned, which would discard the
@@ -975,7 +1015,7 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
 
 fn ping_tasks_message(app: &App, node_id: i64) -> Result<String> {
     let tasks = app.db.ping_tasks_for(node_id)?;
-    Ok(json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string())
+    Ok(json!({"method": "ping.tasks", "params": tasks}).to_string())
 }
 
 /// The node's probe list as a frame, or `None` while it cannot be read, which
@@ -1852,6 +1892,34 @@ mod tests {
         connect(2);
         assert!(release(&app, id, 1).is_none(), "a stale session must release nothing");
         assert!(live(), "the reconnected agent stays online and keeps receiving probe pushes");
+    }
+
+    #[test]
+    fn a_report_leaves_out_what_its_connection_already_carried() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let mut session = Session::default();
+        let report = |params: serde_json::Value| json!({"method": "report", "params": params}).to_string();
+        let live = || app.agents.read().unwrap()[&id].metrics.clone();
+        let whole = json!({"boot_id": "b1", "iface": "eth0", "mem_total": 1_000, "swap_total": 0,
+                           "disk_total": 5_000, "cpu": 1.0, "net_rx_total": 10, "net_tx_total": 10});
+        dispatch(&app, id, "ip", &report(whole), &mut session, at_ms(0)).unwrap();
+        // Dropped for its spacing, yet the agent will not send this disk total again.
+        let resized = json!({"disk_total": 6_000, "cpu": 2.0, "net_rx_total": 20, "net_tx_total": 20});
+        dispatch(&app, id, "ip", &report(resized), &mut session, at_ms(300)).unwrap();
+        let sparse = json!({"cpu": 3.0, "net_rx_total": 30, "net_tx_total": 30});
+        dispatch(&app, id, "ip", &report(sparse.clone()), &mut session, at_ms(1_000)).unwrap();
+        let m = live();
+        assert_eq!(
+            (m["cpu"].clone(), m["boot_id"].clone(), m["iface"].clone()),
+            (json!(3.0), json!("b1"), json!("eth0"))
+        );
+        assert_eq!(m["disk_total"], 6_000, "the value the dropped report carried");
+        assert_eq!(m["swap_total"], 0);
+
+        // Another connection fills from nothing it has not itself carried.
+        dispatch(&app, id, "ip", &report(sparse), &mut Session::default(), at_ms(2_000)).unwrap();
+        assert!(live().get("boot_id").is_none());
     }
 
     #[test]
