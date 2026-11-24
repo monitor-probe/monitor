@@ -958,8 +958,8 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
     }
     // "Offline since" is read from this column, so a session ending before its
     // first minute boundary must still leave a mark. The report itself moves
-    // into the live view: a copy with every report was 44% of the allocations
-    // on this path at 300 nodes reporting each second.
+    // into the live view: copying every report would account for 44% of the
+    // allocations on this path at 300 nodes reporting each second.
     let seen = (row.is_some() || first).then(|| metrics.clone());
     entry.metrics = metrics;
     drop(agents);
