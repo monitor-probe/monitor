@@ -988,6 +988,22 @@ impl Tally {
 /// arriving meanwhile. Past tokio's default of 512 the next waiter stalls a
 /// worker again; refuse waiters past a limit, as the history charts do, if
 /// hubs reach that.
+/// The longest the reports' writes wait for their commit; see `Db::batched`.
+pub const BATCH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Commits the open batch, if any. One that fails to commit is rolled back
+/// rather than left open, where every later write would join a transaction
+/// that cannot commit.
+fn settle(conn: &Connection) {
+    if conn.is_autocommit() {
+        return;
+    }
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        warn!("committing the reports' writes failed: {e:#}");
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+}
+
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.try_lock() {
         Ok(guard) => guard,
@@ -1003,6 +1019,14 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
                 _ => wait(),
             }
         }
+    }
+}
+
+/// Closing a connection rolls back its open transaction: the batch is committed
+/// first.
+impl Drop for Db {
+    fn drop(&mut self) {
+        self.commit_batch();
     }
 }
 
@@ -1032,8 +1056,46 @@ impl Db {
         Ok(Self { reader, conn: Mutex::new(conn) })
     }
 
+    /// The writer, with the reports' batch committed first: a transaction of
+    /// its own cannot begin inside the batch, and what it reads or replaces -- a
+    /// restore, a vacuum, an export -- must include it.
     fn conn(&self) -> MutexGuard<'_, Connection> {
+        let conn = lock(&self.conn);
+        settle(&conn);
+        conn
+    }
+
+    /// The writer for what agents' reports write: the traffic booking, the
+    /// minute's history row, `last_seen` and probe results. These join one open
+    /// transaction, committed by [`Db::commit_batch`] every [`BATCH`] or by the
+    /// next use of [`Db::conn`], rather than each committing on its own.
+    ///
+    /// Every node writes three rows a minute, each a commit that appends whole
+    /// pages to the WAL: at 300 nodes reporting each second, 15 commits a second
+    /// writing 76.6 KiB/s to disk, against 5.2 KiB/s batched. A hub stopped
+    /// without warning loses the open batch, up to
+    /// one [`BATCH`] of writes, on top of the minute a held reading already
+    /// risks (`agent_ws::file`); the traffic totals stay as they were, since an
+    /// uncommitted booking leaves the baseline the next one subtracts from.
+    fn batched(&self) -> Result<MutexGuard<'_, Connection>> {
+        let conn = lock(&self.conn);
+        // Also true after SQLite rolled a failed batch back on its own (a full
+        // disk, an I/O error): the next write opens a new one.
+        if conn.is_autocommit() {
+            conn.execute_batch("BEGIN")?;
+        }
+        Ok(conn)
+    }
+
+    /// The writer with the reports' batch left open, for reads on the reports'
+    /// own path: through [`Db::conn`] they would commit it at their own rate.
+    fn current(&self) -> MutexGuard<'_, Connection> {
         lock(&self.conn)
+    }
+
+    /// Commits the reports' open batch, if any; see [`Db::batched`].
+    pub fn commit_batch(&self) {
+        settle(&lock(&self.conn));
     }
 
     /// The connection the history charts read through: the read-only one, or
@@ -1056,6 +1118,12 @@ impl Db {
     fn reader(&self) -> MutexGuard<'_, Connection> {
         let Some(reader) = &self.reader else { return self.conn() };
         let reader = reader.lock().unwrap_or_else(|e| e.into_inner());
+        // The open batch is invisible to this connection until committed. Not
+        // waited for: behind a vacuum or a restore the chart would wait out the
+        // writer, for rows at most one `BATCH` newer.
+        if let Ok(conn) = self.conn.try_lock() {
+            settle(&conn);
+        }
         if bytes_of(&format!("{}-wal", reader.path().unwrap_or_default())) > 4 << 20 {
             let conn = self.conn();
             let _ = conn.busy_timeout(std::time::Duration::ZERO);
@@ -1203,7 +1271,7 @@ impl Db {
     /// connected with. A capacity absent from `metrics` keeps its stored value.
     pub fn touch_seen(&self, id: i64, ts: i64, metrics: &serde_json::Value) -> Result<()> {
         let n = |k: &str| metrics.get(k).and_then(serde_json::Value::as_i64);
-        self.conn()
+        self.batched()?
             .prepare_cached(
                 "UPDATE node SET last_seen=?2, mem_total=COALESCE(?3,mem_total),
                                  swap_total=COALESCE(?4,swap_total), disk_total=COALESCE(?5,disk_total)
@@ -1426,13 +1494,12 @@ impl Db {
     /// Whether the node still lacks a country for `source`: false once a lookup
     /// has landed, or once the node has moved to another address.
     pub fn country_owed(&self, id: i64, source: &str) -> Result<bool> {
+        // Asked with every heartbeat of a node whose country no lookup has
+        // answered, so cached, and on the batch rather than committing it.
         let owed = self
-            .conn()
-            .query_row(
-                "SELECT country = '' FROM node WHERE id=?1 AND country_ip=?2",
-                params![id, source],
-                |r| r.get(0),
-            )
+            .current()
+            .prepare_cached("SELECT country = '' FROM node WHERE id=?1 AND country_ip=?2")?
+            .query_row(params![id, source], |r| r.get(0))
             .optional()?;
         Ok(owed.unwrap_or(false))
     }
@@ -1553,7 +1620,7 @@ impl Db {
         at: DateTime<Local>,
         booted: Option<i64>,
     ) -> Result<Traffic> {
-        let conn = self.conn();
+        let conn = self.batched()?;
         let (
             prev_boot,
             last_rx,
@@ -1724,7 +1791,7 @@ impl Db {
     pub fn insert_metric(&self, node_id: i64, ts: i64, m: &serde_json::Value) -> Result<()> {
         let f = |k: &str| m.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
         let n = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-        self.conn()
+        self.batched()?
             .prepare_cached(
                 "INSERT OR REPLACE INTO metric
                (node_id, ts, cpu, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs,
@@ -2310,19 +2377,15 @@ impl Db {
     /// The chart's `task_id IN (assignments)` filter hides both afterwards, but
     /// does not prevent the write or its storage.
     pub fn insert_pings(&self, node_id: i64, results: &[(i64, i64, i64)]) -> Result<()> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
-                 SELECT ?1, ?2, ?3, ?4
-                 WHERE EXISTS (SELECT 1 FROM ping_node WHERE task_id = ?2 AND node_id = ?1)",
-            )?;
-            for (task_id, ts, latency) in results {
-                insert.execute(params![node_id, task_id, ts, latency])?;
-            }
+        let conn = self.batched()?;
+        let mut insert = conn.prepare_cached(
+            "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE EXISTS (SELECT 1 FROM ping_node WHERE task_id = ?2 AND node_id = ?1)",
+        )?;
+        for (task_id, ts, latency) in results {
+            insert.execute(params![node_id, task_id, ts, latency])?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -3030,6 +3093,27 @@ mod tests {
         let (metrics, pings, names) = read.expect("history is read while the writer is held");
         assert_eq!((metrics.len(), pings.len()), (1, 1), "and it sees what the writer committed");
         assert_eq!(names[&task.to_string()], "probe");
+    }
+
+    /// The reports' writes share one commit: until it, only the writer sees
+    /// them, and a hub closing commits what is open rather than rolling it back.
+    #[test]
+    fn reports_writes_are_committed_together() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        let rows =
+            |c: &Connection| c.query_row("SELECT count(*) FROM metric", [], |r| r.get::<_, i64>(0)).unwrap();
+        db.insert_metric(id, 60, &serde_json::json!({"cpu": 1.0})).unwrap();
+        db.accumulate(id, "boot", (100, 0), Local::now(), None).unwrap();
+        let other = read_only(&scratch.0).unwrap();
+        assert_eq!(rows(&other), 0, "not yet committed");
+        assert_eq!(rows(&db.current()), 1, "the writer reads its own batch");
+        db.commit_batch();
+        assert_eq!(rows(&other), 1);
+        db.insert_metric(id, 120, &serde_json::json!({"cpu": 1.0})).unwrap();
+        drop(db);
+        assert_eq!(rows(&read_only(&scratch.0).unwrap()), 2, "closing commits the open batch");
     }
 
     /// Chart reads kept back to back leave no commit an idle reader to

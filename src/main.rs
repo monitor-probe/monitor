@@ -621,6 +621,7 @@ async fn main() -> Result<()> {
         warn!("clearing a Telegram text stored as the default failed: {e:#}");
     }
     tokio::spawn(housekeeping(app.clone()));
+    tokio::spawn(commit_batches(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
 
@@ -641,7 +642,19 @@ async fn main() -> Result<()> {
     // to a node that reports again under the same boot, but a node rebooting
     // while the hub is down would take them with it.
     agent_ws::book_held(&held, None);
+    held.db.commit_batch();
     Ok(())
+}
+
+/// Commits the reports' writes every `db::BATCH`; see `Db::batched`. Off the
+/// runtime, as the writer may be held for seconds by a vacuum or a restore.
+async fn commit_batches(app: Shared) {
+    let mut tick = tokio::time::interval(db::BATCH);
+    loop {
+        tick.tick().await;
+        let app = app.clone();
+        let _ = tokio::task::spawn_blocking(move || app.db.commit_batch()).await;
+    }
 }
 
 /// Every route and the layers over it. The order of the layers decides which
