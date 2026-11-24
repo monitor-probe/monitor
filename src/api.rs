@@ -361,7 +361,7 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     // request deflates the whole list again, about 6 ms of CPU for a thousand
     // nodes, and this route answers anyone. Already encoded, the layer passes
     // it through without adding the Vary it adds to what it compresses.
-    if !full && accepts_gzip(&headers) {
+    if !full && accepts(&headers, "gzip") {
         return (
             [
                 (header::CONTENT_TYPE, "application/json"),
@@ -588,22 +588,24 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     current(app, full, |frame| frame.json.clone())
 }
 
-/// Whether `Accept-Encoding` lists gzip with a nonzero weight. A wildcard is
-/// not read as gzip: browsers name gzip itself, and any other request is still
-/// compressed by the compression layer.
-fn accepts_gzip(headers: &HeaderMap) -> bool {
+/// Whether `Accept-Encoding` lists `coding` with a nonzero weight (`x-gzip`
+/// counting as gzip). Weights are not otherwise compared: browsers give none.
+/// A wildcard is not read as either coding: browsers name both, and any other
+/// request is still compressed by the compression layer.
+pub(crate) fn accepts(headers: &HeaderMap, coding: &str) -> bool {
     headers
         .get_all(header::ACCEPT_ENCODING)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .any(|coding| {
-            let mut parts = coding.split(';').map(str::trim);
+        .any(|offered| {
+            let mut parts = offered.split(';').map(str::trim);
             let name = parts.next().unwrap_or_default();
             let weight = parts
                 .find_map(|p| p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")))
                 .map_or(1.0, |q| q.parse::<f32>().unwrap_or(0.0));
-            (name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip")) && weight > 0.0
+            let gzip_alias = coding == "gzip" && name.eq_ignore_ascii_case("x-gzip");
+            (name.eq_ignore_ascii_case(coding) || gzip_alias) && weight > 0.0
         })
 }
 
