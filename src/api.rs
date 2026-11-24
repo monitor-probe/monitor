@@ -1306,7 +1306,7 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // order holds in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     // Its held reading as well, which no node would book.
-    app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    crate::db::lock(&app.readings).remove(&id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
 }

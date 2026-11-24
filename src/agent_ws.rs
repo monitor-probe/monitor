@@ -564,9 +564,9 @@ fn close(app: &App, node_id: i64, ended: Option<&Agent>, session: &mut Session) 
 /// hands this worker's other tasks to another thread, where waiting outside it
 /// would stall them -- the panel, the public page, the shutdown signal. Only
 /// the frames that write pay for the handoff, about one a minute per node:
-/// wrapping every frame cost about 12% of the hub's CPU at 300 nodes reporting
-/// each second (4.02% of a core against 3.50%), and kept up to 213 threads
-/// parked in the blocking pool against 7.
+/// wrapping every frame would cost about 12% of the hub's CPU at 300 nodes
+/// reporting each second (4.02% of a core against 3.50%) and would keep the
+/// hub at 154 threads against 7.
 fn blocking<R>(f: impl FnOnce() -> R) -> R {
     tokio::task::block_in_place(f)
 }
@@ -861,7 +861,7 @@ fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
 /// node's as the hub stops. Otherwise a node that reboots before reporting again
 /// takes the bytes since its last booking with it.
 pub fn book_held(app: &App, node: Option<i64>) {
-    let mut held = app.readings.lock().unwrap_or_else(|e| e.into_inner());
+    let mut held = crate::db::lock(&app.readings);
     for (id, reading) in held.iter_mut().filter(|(id, r)| !r.booked && node.is_none_or(|n| n == **id)) {
         match app.db.accumulate(*id, &reading.epoch, reading.counters, reading.arrival.at, reading.booted) {
             Ok(_) => reading.booked = true,
