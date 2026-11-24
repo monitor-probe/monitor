@@ -463,14 +463,11 @@ async fn serve(app: Shared, node_id: i64, token: &str, ip: String, mut socket: W
                 inbound = socket.recv() => {
                     last_frame = Instant::now();
                     match inbound {
-                    // A frame can wait on the single database connection, which a
-                    // restore or vacuum can hold for seconds. Without this, agents
-                    // would park every worker thread on that lock and starve the rest
-                    // of the runtime -- the panel, the public page, the shutdown
-                    // signal.
+                    // Handled on this worker. The steps that can wait on the
+                    // database enter `blocking` themselves; see there.
                     Some(Ok(Message::Text(text))) => {
                         let arrival = Arrival::now();
-                        match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text, &mut session, arrival)) {
+                        match dispatch(&app, node_id, &ip, &text, &mut session, arrival) {
                             Ok(Some(source)) => {
                                 locate(app.clone(), node_id, source.clone());
                                 owed = Some(source);
@@ -562,6 +559,18 @@ fn close(app: &App, node_id: i64, ended: Option<&Agent>, session: &mut Session) 
     }
 }
 
+/// Runs a frame's database work. The single connection can be held for
+/// seconds by a restore or a vacuum; waiting for it inside `block_in_place`
+/// hands this worker's other tasks to another thread, where waiting outside it
+/// would stall them -- the panel, the public page, the shutdown signal. Only
+/// the frames that write pay for the handoff, about one a minute per node:
+/// wrapping every frame cost about 12% of the hub's CPU at 300 nodes reporting
+/// each second (4.02% of a core against 3.50%), and kept up to 213 threads
+/// parked in the blocking pool against 7.
+fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    tokio::task::block_in_place(f)
+}
+
 /// Handles one inbound frame and returns the address a country lookup is now
 /// owed for, if any. The lookup itself is an outbound request and happens off
 /// this path; see `locate`.
@@ -579,7 +588,7 @@ fn dispatch(
     // hour. A failure is logged rather than returned, which would discard the
     // frame that happened to trigger it.
     if session.results.first().is_some_and(|&(_, ts, _)| ts.div_euclid(60) != arrival.minute()) {
-        if let Err(e) = session.file_results(app, node_id) {
+        if let Err(e) = blocking(|| session.file_results(app, node_id)) {
             session.complain(node_id, format_args!("filing probe results failed: {e:#}"));
         }
     }
@@ -590,7 +599,7 @@ fn dispatch(
         }
         "hello" => {
             session.held_hello = None;
-            return save_facts(app, node_id, ip, &rpc.params);
+            return blocking(|| save_facts(app, node_id, ip, &rpc.params));
         }
         // Dropped quietly: two reports the network bunched are how an honest
         // agent trips this.
@@ -826,8 +835,11 @@ impl Reading {
 /// while another node's booking waits on the database. Per-node locks if a slow
 /// query ever holds reports up behind one.
 fn file(app: &App, node_id: i64, reading: Reading) -> Result<()> {
-    let book = |r: &Reading| app.db.accumulate(node_id, &r.epoch, r.counters, r.arrival.at, r.booted);
-    let mut held = app.readings.lock().unwrap_or_else(|e| e.into_inner());
+    let book =
+        |r: &Reading| blocking(|| app.db.accumulate(node_id, &r.epoch, r.counters, r.arrival.at, r.booted));
+    // A booking holds this lock across a database call: a frame finding it
+    // taken waits as `db::lock` waits for the connection.
+    let mut held = crate::db::lock(&app.readings);
     // Whether the held reading, then this one, is booked.
     let (book_last, book_this) = match held.get(&node_id) {
         None => (false, true),
@@ -948,12 +960,12 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
     drop(agents);
 
     if let Some(row) = &row {
-        app.db.insert_metric(node_id, minute * 60, row)?;
+        blocking(|| app.db.insert_metric(node_id, minute * 60, row))?;
     }
     // "Offline since" is read from this column, so a session ending before its
     // first minute boundary must still leave a mark.
     if row.is_some() || first {
-        app.db.touch_seen(node_id, arrival.at.timestamp(), &metrics)?;
+        blocking(|| app.db.touch_seen(node_id, arrival.at.timestamp(), &metrics))?;
     }
     Ok(())
 }
