@@ -533,8 +533,21 @@ fn raise_open_files() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Transparent huge pages are refused before the runtime starts any thread.
+/// Under THP `always`, the default of Debian's kernel, a thread stack whose top
+/// 2 MiB is 2 MiB-aligned is backed by one huge page on first touch. The release
+/// binary's segments are 2 MiB-aligned, which places the first worker's stack
+/// exactly so: 2 MiB resident for a few KiB of stack, 7.3 MiB against 5.3 MiB
+/// for a hub with ten nodes. The setting covers the whole process but not pages
+/// already faulted in, hence before the runtime. The heap is too small for huge
+/// pages to pay off; a refusal (a seccomp filter, a kernel before 3.15) leaves
+/// the default.
+fn main() -> Result<()> {
+    let _ = rustix::thread::disable_transparent_huge_pages(true);
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("MONITOR_LOG")
