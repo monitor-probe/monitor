@@ -1234,7 +1234,7 @@ impl Db {
 
     pub fn nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT * FROM node ORDER BY sort, id")?;
+        let mut stmt = conn.prepare(&format!("SELECT {NODE_COLUMNS} FROM node ORDER BY sort, id"))?;
         let rows = stmt.query_map([], |r| Ok(row_to_node(r)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1242,7 +1242,9 @@ impl Db {
     pub fn node(&self, id: i64) -> Result<Option<Node>> {
         Ok(self
             .conn()
-            .query_row("SELECT * FROM node WHERE id = ?1", [id], |r| Ok(row_to_node(r)))
+            .query_row(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?1"), [id], |r| {
+                Ok(row_to_node(r))
+            })
             .optional()?)
     }
 
@@ -2930,48 +2932,65 @@ fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The columns [`row_to_node`] reads, in the order it reads them. Selected by
+/// name and read by position: a lookup by name compares against every column of
+/// the row in turn, case-insensitively, which measured 42,000 instructions per
+/// node row and 6% of all the hub executed with 30 nodes reporting each second.
+/// Every read of the node list -- the public page, the live push, each sweep --
+/// maps all rows.
+const NODE_COLUMNS: &str = "id, name, public, sort, price, currency, billing_cycle, expires_at, remark, \
+     public_remark, traffic_limit, traffic_mode, traffic_reset_day, hostname, os, kernel, arch, virt, cpu_name, \
+     cpu_cores, mem_total, swap_total, disk_total, agent_version, ip, ip_other, ipv4, ipv6, country, country_pin, \
+     group_name, ipv4_pin, ipv6_pin, last_seen, notify, down_since, token";
+
 fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
-    let s = |i: &str| r.get::<_, String>(i).unwrap_or_default();
-    let n = |i: &str| r.get::<_, i64>(i).unwrap_or(0);
-    Node {
-        id: n("id"),
-        name: s("name"),
-        public: r.get::<_, bool>("public").unwrap_or(true),
-        sort: n("sort"),
-        price: r.get::<_, f64>("price").unwrap_or(0.0),
-        currency: s("currency"),
-        billing_cycle: s("billing_cycle"),
-        expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
-        remark: s("remark"),
-        public_remark: s("public_remark"),
-        traffic_limit: n("traffic_limit"),
-        traffic_mode: s("traffic_mode"),
-        traffic_reset_day: n("traffic_reset_day") as u32,
-        hostname: s("hostname"),
-        os: s("os"),
-        kernel: s("kernel"),
-        arch: s("arch"),
-        virt: s("virt"),
-        cpu_name: s("cpu_name"),
-        cpu_cores: n("cpu_cores"),
-        mem_total: n("mem_total"),
-        swap_total: n("swap_total"),
-        disk_total: n("disk_total"),
-        agent_version: s("agent_version"),
-        ip: s("ip"),
-        ip_other: s("ip_other"),
-        ipv4: s("ipv4"),
-        ipv6: s("ipv6"),
-        country: s("country"),
-        country_pin: s("country_pin"),
-        group: s("group_name"),
-        ipv4_pin: s("ipv4_pin"),
-        ipv6_pin: s("ipv6_pin"),
-        last_seen: n("last_seen"),
-        notify: n("notify") != 0,
-        down_since: n("down_since"),
-        token: s("token"),
-    }
+    // A struct expression evaluates its fields in the order written, which is
+    // the order of NODE_COLUMNS.
+    let next = std::cell::Cell::new(0);
+    let col = || next.replace(next.get() + 1);
+    let s = || r.get::<_, String>(col()).unwrap_or_default();
+    let n = || r.get::<_, i64>(col()).unwrap_or(0);
+    let node = Node {
+        id: n(),
+        name: s(),
+        public: r.get::<_, bool>(col()).unwrap_or(true),
+        sort: n(),
+        price: r.get::<_, f64>(col()).unwrap_or(0.0),
+        currency: s(),
+        billing_cycle: s(),
+        expires_at: r.get::<_, Option<String>>(col()).unwrap_or(None),
+        remark: s(),
+        public_remark: s(),
+        traffic_limit: n(),
+        traffic_mode: s(),
+        traffic_reset_day: n() as u32,
+        hostname: s(),
+        os: s(),
+        kernel: s(),
+        arch: s(),
+        virt: s(),
+        cpu_name: s(),
+        cpu_cores: n(),
+        mem_total: n(),
+        swap_total: n(),
+        disk_total: n(),
+        agent_version: s(),
+        ip: s(),
+        ip_other: s(),
+        ipv4: s(),
+        ipv6: s(),
+        country: s(),
+        country_pin: s(),
+        group: s(),
+        ipv4_pin: s(),
+        ipv6_pin: s(),
+        last_seen: n(),
+        notify: n() != 0,
+        down_since: n(),
+        token: s(),
+    };
+    debug_assert_eq!(next.get(), r.as_ref().column_count(), "row_to_node reads every column of NODE_COLUMNS");
+    node
 }
 
 /// Start of the billing period containing `today`, given a reset day of month.
@@ -3002,6 +3021,77 @@ mod tests {
 
     fn db() -> Db {
         Db::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn a_node_row_maps_each_column_to_its_own_field() {
+        let db = db();
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "t").unwrap();
+        let cols: Vec<&str> = NODE_COLUMNS.split(',').map(str::trim).collect();
+        let numeric =
+            ["sort", "price", "traffic_limit", "traffic_reset_day", "cpu_cores", "mem_total", "swap_total"];
+        let numeric = [&numeric[..], &["disk_total", "last_seen", "down_since"]].concat();
+        let at = |c: &str| 100 + cols.iter().position(|x| *x == c).unwrap() as i64;
+        {
+            let conn = db.conn();
+            for &c in cols.iter().filter(|c| !["id", "public", "notify"].contains(*c)) {
+                let sql = format!("UPDATE node SET {c} = ?1 WHERE id = ?2");
+                if numeric.contains(&c) {
+                    conn.execute(&sql, rusqlite::params![at(c), id]).unwrap();
+                } else {
+                    conn.execute(&sql, rusqlite::params![c, id]).unwrap();
+                }
+            }
+            conn.execute("UPDATE node SET public = 0, notify = 1 WHERE id = ?1", [id]).unwrap();
+        }
+        let n = db.node(id).unwrap().unwrap();
+        let text = [
+            (&n.name, "name"),
+            (&n.currency, "currency"),
+            (&n.billing_cycle, "billing_cycle"),
+            (&n.remark, "remark"),
+            (&n.public_remark, "public_remark"),
+            (&n.traffic_mode, "traffic_mode"),
+            (&n.hostname, "hostname"),
+            (&n.os, "os"),
+            (&n.kernel, "kernel"),
+            (&n.arch, "arch"),
+            (&n.virt, "virt"),
+            (&n.cpu_name, "cpu_name"),
+            (&n.agent_version, "agent_version"),
+            (&n.ip, "ip"),
+            (&n.ip_other, "ip_other"),
+            (&n.ipv4, "ipv4"),
+            (&n.ipv6, "ipv6"),
+            (&n.country, "country"),
+            (&n.country_pin, "country_pin"),
+            (&n.group, "group_name"),
+            (&n.ipv4_pin, "ipv4_pin"),
+            (&n.ipv6_pin, "ipv6_pin"),
+            (&n.token, "token"),
+        ];
+        for (got, want) in text {
+            assert_eq!(got, want);
+        }
+        let numbers = [
+            (n.sort, "sort"),
+            (n.price as i64, "price"),
+            (n.traffic_limit, "traffic_limit"),
+            (i64::from(n.traffic_reset_day), "traffic_reset_day"),
+            (n.cpu_cores, "cpu_cores"),
+            (n.mem_total, "mem_total"),
+            (n.swap_total, "swap_total"),
+            (n.disk_total, "disk_total"),
+            (n.last_seen, "last_seen"),
+            (n.down_since, "down_since"),
+        ];
+        for (got, want) in numbers {
+            assert_eq!(got, at(want), "{want}");
+        }
+        assert_eq!(
+            (n.id, n.public, n.notify, n.expires_at.as_deref()),
+            (id, false, true, Some("expires_at"))
+        );
     }
 
     #[test]
