@@ -577,8 +577,16 @@ fn current<T>(app: &App, full: bool, read: impl FnOnce(&mut Frame) -> T) -> T {
     if !(0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(frame.at)) {
         let nodes = visible_nodes(app, full).unwrap_or_default();
         // `admin` is included so the panel's first fetch and its stream share one
-        // cached frame.
-        let json = json!({"nodes": nodes, "admin": full}).to_string().into();
+        // cached frame. Serialized from a borrow: `json!` would copy every node's
+        // tree into a new `Value` first, a fifth of building the frame. The fields
+        // are in the order that object's sorted keys gave them.
+        #[derive(serde::Serialize)]
+        struct Snapshot<'a> {
+            admin: bool,
+            nodes: &'a [Value],
+        }
+        // Into a String, which cannot fail.
+        let json = serde_json::to_string(&Snapshot { admin: full, nodes: &nodes }).unwrap_or_default().into();
         *frame = Frame { at: now, json, gzip: None };
     }
     read(frame)
@@ -3677,6 +3685,8 @@ mod tests {
 
         let public = live_snapshot(&app, false);
         let admin = live_snapshot(&app, true);
+        let built = |full| json!({"nodes": visible_nodes(&app, full).unwrap(), "admin": full}).to_string();
+        assert_eq!((public.as_str(), admin.as_str()), (built(false).as_str(), built(true).as_str()));
         // Caching must never let one audience's payload reach the other.
         assert!(!public.as_str().contains("198.51.100.9"), "the public frame must carry no address");
         assert!(!public.as_str().contains("hidden"), "the public frame must carry no private node");
