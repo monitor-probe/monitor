@@ -1112,6 +1112,8 @@ mod tests {
     /// The reports' writes reach the file within a `db::BATCH` while nothing
     /// else touches the database. Otherwise they would wait for the next panel
     /// or chart request, and a hub killed meanwhile would lose all of them.
+    /// The paused clock does not advance while the tick's `spawn_blocking`
+    /// runs, so the commit has finished by the time the second sleep ends.
     #[tokio::test(start_paused = true)]
     async fn the_reports_writes_are_committed_every_batch() {
         let dir = TempDir::new("batches");
