@@ -259,12 +259,45 @@ impl Report {
         Ok(serde_json::from_str(params)?)
     }
 
+    /// The [`STICKY`] fields alone, from parameters [`Report::parse`] refused
+    /// over some other field. The agent does not resend a sticky value while it
+    /// is unchanged, so one arriving in a refused report would otherwise be lost
+    /// for the rest of the connection: a new `boot_id` among them, and the next
+    /// reports would be filled with the old epoch.
+    fn sticky_of(params: &str) -> Option<Report> {
+        #[derive(Deserialize)]
+        struct Sticky {
+            #[serde(default, deserialize_with = "present")]
+            boot_id: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "present")]
+            iface: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "present")]
+            mem_total: Option<Number>,
+            #[serde(default, deserialize_with = "present")]
+            swap_total: Option<Number>,
+            #[serde(default, deserialize_with = "present")]
+            disk_total: Option<Number>,
+        }
+        if !params.trim_start().starts_with('{') {
+            return None;
+        }
+        let s: Sticky = serde_json::from_str(params).ok()?;
+        Some(Report {
+            boot_id: s.boot_id,
+            iface: s.iface,
+            mem_total: s.mem_total,
+            swap_total: s.swap_total,
+            disk_total: s.disk_total,
+            ..Report::default()
+        })
+    }
+
     /// Whether the report carries `key` in a usable form, for [`check_contract`].
     /// An empty `boot_id` counts as left out.
     fn carries(&self, key: &str) -> bool {
         match key {
             "boot_id" => self.boot_id.as_ref().is_some_and(|v| !v.is_null() && *v != ""),
-            "iface" => self.iface.is_some(),
+            "iface" => self.iface.as_ref().is_some_and(|v| !v.is_null()),
             "load" => self.load.is_some(),
             _ => self.figure(key).is_some(),
         }
@@ -400,8 +433,9 @@ impl Session {
 
     /// Fills each [`STICKY`] field a report leaves out from the last value this
     /// connection carried, and records the ones it carries. Called before the
-    /// spacing check: a value in a dropped report is still the agent's latest,
-    /// and the agent does not send it again while it is unchanged.
+    /// spacing check and for a refused report too: a value in a dropped or
+    /// refused report is still the agent's latest, and the agent does not send it
+    /// again while it is unchanged.
     fn fill_sticky(&mut self, report: &mut Report) {
         report.fill_sticky(&mut self.sticky);
     }
@@ -736,11 +770,17 @@ fn dispatch(
     let value = || serde_json::from_str::<serde_json::Value>(params);
     // Parsed here and failed only in its own arm below, so that a malformed
     // report is dropped for its spacing and still files the results before it.
-    let parsed = (rpc.method == "report").then(|| {
-        Report::parse(params).map(|mut report| {
+    let parsed = (rpc.method == "report").then(|| match Report::parse(params) {
+        Ok(mut report) => {
             session.fill_sticky(&mut report);
-            report
-        })
+            Ok(report)
+        }
+        Err(e) => {
+            if let Some(mut sticky) = Report::sticky_of(params) {
+                session.fill_sticky(&mut sticky);
+            }
+            Err(e)
+        }
     });
     // Results gathered in an earlier minute are filed on the next frame of any
     // kind: reports arrive every few seconds even where every probe runs once an
@@ -2107,6 +2147,14 @@ mod tests {
             sparse.fill_sticky(&mut held);
             assert_eq!(sparse, whole, "{key}");
         }
+        // A report refused over another field still records every sticky one.
+        let mut refused = json!(&whole);
+        refused["cpu"] = serde_json::Value::Null;
+        let refused = refused.to_string();
+        assert!(Report::parse(&refused).is_err());
+        let mut from_refused = Report::default();
+        Report::sticky_of(&refused).unwrap().fill_sticky(&mut from_refused);
+        assert_eq!(from_refused, held);
     }
 
     #[test]
