@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react"
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { ArrowDownAZ, CalendarClock, Copy, Download, Layers, Pencil, Plus, Server, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -120,8 +120,9 @@ type RowProps = {
 // One node's row, drawn from what it shows rather than from the node: every push
 // replaces every node, while the figures a row shows rarely change between two.
 // Redrawing all of them would cost the page 84 ms per push against 25 at 200
-// nodes in desktop Chromium, 379 against 77 with its CPU slowed fourfold. The handlers in `events` are created once and read the list's state
-// when they run, so a row left as it was holds no stale ones.
+// nodes in desktop Chromium, 379 against 77 with its CPU slowed fourfold. The
+// handlers in `events` are created once and read the list's state when they
+// run, so a row left as it was holds no stale ones.
 const NodeRow = memo(
   function NodeRow(p: RowProps) {
     return (
@@ -317,9 +318,10 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
     },
   }
   // What the rows' handlers read when they run: the drag as of this render, and
-  // the node a button opens as the list now has it.
+  // the node a button opens as the list now has it. Updated before paint, so a
+  // press on what is on screen never reads the render before it.
   const live = useRef({ drag, searching, locked, nodes })
-  useEffect(() => { live.current = { drag, searching, locked, nodes } })
+  useLayoutEffect(() => { live.current = { drag, searching, locked, nodes } })
   const [events] = useState<RowEvents>(() => {
     const target = (id: number) => (live.current.searching ? live.current.locked : live.current.drag.handle(id))
     const open = { install: setInstalling, edit: setEditing, billing: setBilling, delete: setDeleting }
