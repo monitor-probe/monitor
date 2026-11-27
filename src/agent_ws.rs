@@ -2,6 +2,7 @@
 //! notifications. A single long-lived connection on which either end may speak
 //! first, with self-describing frames readable via curl or a browser console.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +15,9 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use chrono::{DateTime, Local};
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use serde_json::{json, Number};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -84,8 +86,8 @@ pub struct Agent {
     /// Asks the session to resend the node's probe list; see [`push_ping_tasks`].
     /// Closed, it ends the session.
     pub tx: mpsc::Sender<()>,
-    /// The latest report, or `Null` between connecting and the first one.
-    pub metrics: serde_json::Value,
+    /// The latest report, or `None` between connecting and the first one.
+    pub metrics: Option<Report>,
     pub last_seen: i64,
     /// The wall-clock minute this session last wrote a history row for, or the
     /// one it opened in. A row is written when a report arrives past it.
@@ -106,11 +108,16 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// The latest report as JSON, `Null` before the first one.
+    pub fn metrics_json(&self) -> serde_json::Value {
+        self.metrics.as_ref().map_or(serde_json::Value::Null, |m| json!(m))
+    }
+
     pub fn new(session: u64, tx: mpsc::Sender<()>) -> Self {
         Self {
             session,
             tx,
-            metrics: serde_json::Value::Null,
+            metrics: None,
             last_seen: 0,
             last_minute: None,
             mark: None,
@@ -171,6 +178,149 @@ const MEAN_INT: [&str; 6] = ["mem_used", "swap_used", "disk_used", "tcp", "udp",
 const PEAK_FLOAT: [(&str, &str); 1] = [("cpu", "cpu_max")];
 const PEAK_INT: [(&str, &str); 2] = [("net_rx", "net_rx_max"), ("net_tx", "net_tx_max")];
 
+/// Declares [`Report`] with one optional field per name, so that the struct and
+/// [`Report::numbers`] cannot list different figures.
+macro_rules! report {
+    ($($number:ident),* $(,)?) => {
+        /// One report, read into the fields the hub uses rather than into a
+        /// generic tree: at 300 nodes reporting each second, building a `Value`
+        /// cost 28% of the hub's instructions and looking keys up in it another
+        /// 14% (callgrind, 2026-11-25). Fields the hub does not know are skipped.
+        ///
+        /// Each figure keeps the agent's own `Number`, so [`report`] judges what
+        /// was sent: a counter beyond `i64`, a fraction or a negative value is
+        /// no reading rather than a different one. A field left out is `None`;
+        /// one sent as `null` fails the parse like any other malformed figure.
+        #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+        pub struct Report {
+            #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+            boot_id: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+            iface: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+            load: Option<[Number; 3]>,
+            $(
+                #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+                $number: Option<Number>,
+            )*
+        }
+
+        impl Report {
+            /// Every plain figure under its key.
+            fn numbers(&self) -> [(&'static str, &Option<Number>); [$(stringify!($number)),*].len()] {
+                [$((stringify!($number), &self.$number)),*]
+            }
+
+            /// The plain figure under `key`, if the report carried it.
+            pub(crate) fn figure(&self, key: &str) -> Option<&Number> {
+                match key {
+                    $(stringify!($number) => self.$number.as_ref(),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+report!(
+    uptime,
+    cpu,
+    mem_total,
+    mem_used,
+    swap_total,
+    swap_used,
+    disk_total,
+    disk_used,
+    net_rx_total,
+    net_tx_total,
+    net_rx,
+    net_tx,
+    tcp,
+    udp,
+    procs,
+);
+
+/// Hands a key's value, `null` included, to the field's own type. `Option`'s
+/// impl would read `null` as absent, and a figure sent as `null` would pass
+/// as one left out.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
+impl Report {
+    /// Reads a report's parameters. Only an object is a report: serde would also
+    /// accept an array, taking its elements as the fields in declaration order.
+    fn parse(params: &str) -> Result<Report> {
+        anyhow::ensure!(params.trim_start().starts_with('{'), "report must be an object");
+        Ok(serde_json::from_str(params)?)
+    }
+
+    /// The [`STICKY`] fields alone, from parameters [`Report::parse`] refused
+    /// over some other field. The agent does not resend a sticky value while it
+    /// is unchanged, so one arriving in a refused report would otherwise be lost
+    /// for the rest of the connection: a new `boot_id` among them, and the next
+    /// reports would be filled with the old epoch.
+    fn sticky_of(params: &str) -> Option<Report> {
+        #[derive(Deserialize)]
+        struct Sticky {
+            #[serde(default, deserialize_with = "present")]
+            boot_id: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "present")]
+            iface: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "present")]
+            mem_total: Option<Number>,
+            #[serde(default, deserialize_with = "present")]
+            swap_total: Option<Number>,
+            #[serde(default, deserialize_with = "present")]
+            disk_total: Option<Number>,
+        }
+        if !params.trim_start().starts_with('{') {
+            return None;
+        }
+        let s: Sticky = serde_json::from_str(params).ok()?;
+        Some(Report {
+            boot_id: s.boot_id,
+            iface: s.iface,
+            mem_total: s.mem_total,
+            swap_total: s.swap_total,
+            disk_total: s.disk_total,
+            ..Report::default()
+        })
+    }
+
+    /// Whether the report carries `key` in a usable form, for [`check_contract`].
+    /// An empty `boot_id` counts as left out.
+    fn carries(&self, key: &str) -> bool {
+        match key {
+            "boot_id" => self.boot_id.as_ref().is_some_and(|v| !v.is_null() && *v != ""),
+            "iface" => self.iface.as_ref().is_some_and(|v| !v.is_null()),
+            "load" => self.load.is_some(),
+            _ => self.figure(key).is_some(),
+        }
+    }
+
+    /// Fills each [`STICKY`] field this report leaves out from `held`, and
+    /// records in `held` the ones it carries.
+    fn fill_sticky(&mut self, held: &mut Report) {
+        fn one<T: Clone + PartialEq>(field: &mut Option<T>, held: &mut Option<T>) {
+            match (&*field, &*held) {
+                (Some(value), _) if held.as_ref() != Some(value) => *held = Some(value.clone()),
+                (None, Some(value)) => *field = Some(value.clone()),
+                _ => {}
+            }
+        }
+        one(&mut self.boot_id, &mut held.boot_id);
+        one(&mut self.iface, &mut held.iface);
+        one(&mut self.mem_total, &mut held.mem_total);
+        one(&mut self.swap_total, &mut held.swap_total);
+        one(&mut self.disk_total, &mut held.disk_total);
+    }
+}
+
 /// Running sums for the minute in progress, one slot per averaged field, and
 /// the highest of each peak figure.
 #[derive(Debug, Default)]
@@ -181,12 +331,13 @@ struct Minute {
 }
 
 impl Minute {
-    fn add(&mut self, metrics: &serde_json::Value) {
+    fn add(&mut self, metrics: &Report) {
+        let figure = |key: &str| metrics.figure(key).and_then(Number::as_f64).unwrap_or(0.0);
         for (slot, key) in MEAN_FLOAT.iter().chain(&MEAN_INT).enumerate() {
-            self.sums[slot] += metrics.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            self.sums[slot] += figure(key);
         }
         for (peak, (key, _)) in self.peaks.iter_mut().zip(PEAK_FLOAT.iter().chain(&PEAK_INT)) {
-            *peak = peak.max(metrics.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0));
+            *peak = peak.max(figure(key));
         }
         self.reports += 1.0;
     }
@@ -259,7 +410,7 @@ struct Session {
     /// because each commit writes at least one page.
     results: Vec<(i64, i64, i64)>,
     /// The last value of each [`STICKY`] field this connection carried.
-    sticky: [Option<serde_json::Value>; STICKY.len()],
+    sticky: Report,
 }
 
 impl Session {
@@ -282,19 +433,11 @@ impl Session {
 
     /// Fills each [`STICKY`] field a report leaves out from the last value this
     /// connection carried, and records the ones it carries. Called before the
-    /// spacing check: a value in a dropped report is still the agent's latest,
-    /// and the agent does not send it again while it is unchanged.
-    fn fill_sticky(&mut self, report: &mut serde_json::Value) {
-        let Some(fields) = report.as_object_mut() else { return };
-        for (key, held) in STICKY.iter().zip(&mut self.sticky) {
-            match (fields.get(*key), &held) {
-                (Some(value), _) if held.as_ref() != Some(value) => *held = Some(value.clone()),
-                (None, Some(value)) => {
-                    fields.insert((*key).to_owned(), value.clone());
-                }
-                _ => {}
-            }
-        }
+    /// spacing check and for a refused report too: a value in a dropped or
+    /// refused report is still the agent's latest, and the agent does not send it
+    /// again while it is unchanged.
+    fn fill_sticky(&mut self, report: &mut Report) {
+        report.fill_sticky(&mut self.sticky);
     }
 
     fn admit_result(&mut self, tick: Instant) -> bool {
@@ -356,11 +499,14 @@ fn capabilities_message() -> String {
     json!({"method": "capabilities", "params": {"sticky": STICKY}}).to_string()
 }
 
+/// A frame with its parameters left unparsed until the method says what they
+/// are: a report is read into a [`Report`], anything else into a `Value`.
 #[derive(Deserialize)]
-struct Rpc {
-    method: String,
-    #[serde(default)]
-    params: serde_json::Value,
+struct Rpc<'a> {
+    #[serde(borrow)]
+    method: Cow<'a, str>,
+    #[serde(borrow, default)]
+    params: Option<&'a RawValue>,
 }
 
 /// The node a request's bearer token belongs to, with the token, or the 401
@@ -590,7 +736,7 @@ fn close(app: &App, node_id: i64, ended: Option<&Agent>, session: &mut Session) 
     let Some(agent) = ended else { return };
     book_held(app, Some(node_id));
     if agent.last_seen > 0 {
-        if let Err(e) = app.db.touch_seen(node_id, agent.last_seen, &agent.metrics) {
+        if let Err(e) = app.db.touch_seen(node_id, agent.last_seen, &agent.metrics_json()) {
             warn!("node {node_id}: recording when it was last seen failed: {e:#}");
         }
     }
@@ -619,10 +765,23 @@ fn dispatch(
     session: &mut Session,
     arrival: Arrival,
 ) -> Result<Option<String>> {
-    let mut rpc: Rpc = serde_json::from_str(text)?;
-    if rpc.method == "report" {
-        session.fill_sticky(&mut rpc.params);
-    }
+    let rpc: Rpc = serde_json::from_str(text)?;
+    let params = rpc.params.map_or("null", RawValue::get);
+    let value = || serde_json::from_str::<serde_json::Value>(params);
+    // Parsed here and failed only in its own arm below, so that a malformed
+    // report is dropped for its spacing and still files the results before it.
+    let parsed = (rpc.method == "report").then(|| match Report::parse(params) {
+        Ok(mut report) => {
+            session.fill_sticky(&mut report);
+            Ok(report)
+        }
+        Err(e) => {
+            if let Some(mut sticky) = Report::sticky_of(params) {
+                session.fill_sticky(&mut sticky);
+            }
+            Err(e)
+        }
+    });
     // Results gathered in an earlier minute are filed on the next frame of any
     // kind: reports arrive every few seconds even where every probe runs once an
     // hour. A failure is logged rather than returned, which would discard the
@@ -632,21 +791,26 @@ fn dispatch(
             session.complain(node_id, format_args!("filing probe results failed: {e:#}"));
         }
     }
-    match rpc.method.as_str() {
+    match &*rpc.method {
         "hello" if !session.admit_hello(arrival.tick) => {
             debug!("node {node_id}: a hello within {HELLO_SPACING:?} of the last was held");
-            session.held_hello = Some(rpc.params);
+            session.held_hello = Some(value()?);
         }
         "hello" => {
             session.held_hello = None;
-            return blocking(|| save_facts(app, node_id, ip, &rpc.params));
+            let facts = value()?;
+            return blocking(|| save_facts(app, node_id, ip, &facts));
         }
         // Dropped quietly: two reports the network bunched are how an honest
         // agent trips this.
         "report" if !session.admit_report(arrival.tick) => {
             debug!("node {node_id}: a report within {REPORT_SPACING:?} of the last was dropped")
         }
-        "report" => report(app, node_id, rpc.params, arrival)?,
+        "report" => {
+            if let Some(parsed) = parsed {
+                report(app, node_id, parsed?, arrival)?;
+            }
+        }
         "ping.result" if !session.admit_result(arrival.tick) => session.complain(
             node_id,
             format_args!(
@@ -654,12 +818,13 @@ fn dispatch(
             ),
         ),
         "ping.result" => {
-            let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let params = value()?;
+            let task_id = params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
             // A missing reading is not a reading of -1: `close_bucket` counts
             // every negative latency as a lost packet, so defaulting here would
             // render a malformed frame as an outage. A report follows the same
             // rule for a counter it cannot read.
-            let latency = rpc.params.get("latency_ms").and_then(|v| v.as_i64());
+            let latency = params.get("latency_ms").and_then(|v| v.as_i64());
             if let (true, Some(latency)) = (task_id > 0, latency) {
                 session.results.push((task_id, arrival.at.timestamp(), latency));
             }
@@ -805,19 +970,12 @@ fn report_fields() -> impl Iterator<Item = &'static str> {
         .chain(crate::api::PUBLIC_METRICS.iter().copied().filter(|k| !INJECTED.contains(k)))
 }
 
-/// Those carrying a plain number. `boot_id` is a string and `load` an array of
-/// three; each is checked separately.
-fn numeric_fields() -> impl Iterator<Item = &'static str> {
-    report_fields().filter(|k| !matches!(*k, "boot_id" | "load"))
-}
-
 /// Reports, once per connection, when a report omits fields the hub depends on.
 /// A version number cannot serve here: an agent that renames a field carries a
 /// higher version, not a lower one. An empty `boot_id` counts as omitted, since
 /// no reading can be taken without one.
-fn check_contract(node_id: i64, metrics: &serde_json::Value) {
-    let missing: Vec<&str> =
-        report_fields().filter(|k| metrics.get(k).is_none_or(|v| v.is_null() || *v == "")).collect();
+fn check_contract(node_id: i64, metrics: &Report) {
+    let missing: Vec<&str> = report_fields().filter(|k| !metrics.carries(k)).collect();
     if !missing.is_empty() {
         // scripts/e2e.sh fails on "reports without"; the two change together.
         warn!("node {node_id} reports without {missing:?}: this agent and this hub are out of step, and what depends on those fields -- traffic, charts, the default theme's live view -- will not show them");
@@ -922,37 +1080,34 @@ pub fn book_held(app: &App, node: Option<i64>) {
     }
 }
 
-fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival) -> Result<()> {
+fn report(app: &App, node_id: i64, metrics: Report, arrival: Arrival) -> Result<()> {
     // Missing fields remain compatible with older agents, while malformed values
     // must not become a live frame that can crash a browser. Counter validation
     // is separate: a missing or null kernel reading must not alter its
     // baseline.
-    let number = |v: &serde_json::Value| v.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0);
-    anyhow::ensure!(metrics.is_object(), "report must be an object");
-    for key in numeric_fields() {
-        anyhow::ensure!(metrics.get(key).is_none_or(number), "invalid report field {key}");
+    let number = |n: &Number| n.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0);
+    for (key, value) in metrics.numbers() {
+        anyhow::ensure!(value.as_ref().is_none_or(number), "invalid report field {key}");
     }
-    if let Some(load) = metrics.get("load") {
-        anyhow::ensure!(
-            load.as_array().is_some_and(|v| v.len() == 3 && v.iter().all(number)),
-            "invalid load"
-        );
+    if let Some(load) = &metrics.load {
+        anyhow::ensure!(load.iter().all(number), "invalid load");
     }
     // No reading is not a reading of zero: booking zero would align the
     // baseline to it and book the next report's lifetime counter as one delta.
     // Anything that is not a non-negative i64 is likewise no reading -- a u64
     // beyond the signed range, a float, or a negative value -- and so is a pair
     // without an epoch, which cannot say whether it continues the last one.
-    let counter = |k: &str| metrics.get(k).and_then(|v| v.as_i64()).filter(|n| *n >= 0);
+    let counter = |n: &Option<Number>| n.as_ref().and_then(Number::as_i64).filter(|n| *n >= 0);
     let reading = metrics
-        .get("boot_id")
+        .boot_id
+        .as_ref()
         .and_then(|v| v.as_str())
         .filter(|e| !e.is_empty())
-        .zip(counter("net_rx_total").zip(counter("net_tx_total")))
+        .zip(counter(&metrics.net_rx_total).zip(counter(&metrics.net_tx_total)))
         .map(|(epoch, counters)| {
             // The agent reports 0 where /proc/uptime cannot be read, which is
             // no boot time: taken as one, every epoch change would book.
-            let uptime = metrics.get("uptime").and_then(|v| v.as_i64()).filter(|up| *up > 0);
+            let uptime = counter(&metrics.uptime).filter(|up| *up > 0);
             let booted = uptime.map(|up| arrival.at.timestamp() - up);
             Reading { epoch: epoch.to_owned(), counters, arrival, booted, booked: false }
         });
@@ -988,7 +1143,7 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
     // Measured within one span only. At a break the row keeps the agent's own
     // reading, and the mark restarts from the new span.
     let row = store.then(|| {
-        let mut row = metrics.clone();
+        let mut row = json!(&metrics);
         entry.minute.write_into(&mut row);
         if let (Some((epoch, (rx, tx))), Some(mark), Some(obj)) = (&span, &entry.mark, row.as_object_mut()) {
             if mark.epoch == *epoch {
@@ -1012,8 +1167,8 @@ fn report(app: &App, node_id: i64, metrics: serde_json::Value, arrival: Arrival)
     // first minute boundary must still leave a mark. The report itself moves
     // into the live view: copying every report would account for 44% of the
     // allocations on this path at 300 nodes reporting each second.
-    let seen = (row.is_some() || first).then(|| metrics.clone());
-    entry.metrics = metrics;
+    let seen = (row.is_some() || first).then(|| json!(&metrics));
+    entry.metrics = Some(metrics);
     drop(agents);
 
     if let Some(row) = &row {
@@ -1175,6 +1330,12 @@ mod tests {
         dispatch(app, id, "ip", text, session, at(secs))
     }
 
+    /// [`report`] given a report written as JSON, failing where `dispatch` would
+    /// on one that does not parse.
+    fn report_value(app: &App, id: i64, params: serde_json::Value, arrival: Arrival) -> Result<()> {
+        report(app, id, Report::parse(&params.to_string())?, arrival)
+    }
+
     fn report_json(boot: &str, rx: i64, tx: i64) -> String {
         json!({
             "jsonrpc": "2.0", "method": "report",
@@ -1226,10 +1387,20 @@ mod tests {
         let (id, _held) = connect(&app);
         let mut session = Session::default();
         send(&app, id, &mut session, 0, &report_json("boot", 1_000, 500)).unwrap();
-        let good = app.agents.read().unwrap()[&id].metrics.clone();
-        for bad in [json!({"load":null}), json!({"load":[1,"bad",3]}), json!({"cpu":"bad"}), json!([])] {
-            assert!(report(&app, id, bad, at(30)).is_err());
-            assert_eq!(app.agents.read().unwrap()[&id].metrics, good);
+        let good = app.agents.read().unwrap()[&id].metrics_json();
+        for bad in [
+            json!({"load":null}),
+            json!({"load":[1,"bad",3]}),
+            json!({"load":[1,2]}),
+            json!({"load":[1,-2,3]}),
+            json!({"cpu":"bad"}),
+            json!({"cpu":null}),
+            json!({"cpu":-1}),
+            json!([]),
+            json!([null, "eth0"]),
+        ] {
+            assert!(report_value(&app, id, bad.clone(), at(30)).is_err(), "{bad}");
+            assert_eq!(app.agents.read().unwrap()[&id].metrics_json(), good);
         }
         send(&app, id, &mut session, 60, &report_json("boot", 2_000, 600)).unwrap();
         assert_eq!(total_rx(&app, id), 1_000);
@@ -1287,7 +1458,7 @@ mod tests {
         let minute = std::cell::Cell::new(0);
         let send = |boot: &str, rx: serde_json::Value| {
             minute.set(minute.get() + 1);
-            report(
+            report_value(
                 &app,
                 id,
                 json!({"boot_id": boot, "net_rx_total": rx, "net_tx_total": 0}),
@@ -1327,7 +1498,7 @@ mod tests {
         let app = app();
         let (id, _held) = connect(&app);
         let report_at =
-            |minute: u64, params: serde_json::Value| report(&app, id, params, at(minute * 60)).unwrap();
+            |minute: u64, params: serde_json::Value| report_value(&app, id, params, at(minute * 60)).unwrap();
         report_at(0, json!({"boot_id": "b", "net_rx_total": 1_000, "net_tx_total": 0}));
         report_at(1, json!({"net_rx_total": 50_000, "net_tx_total": 0}));
         report_at(2, json!({"boot_id": "", "net_rx_total": 60_000, "net_tx_total": 0}));
@@ -1354,11 +1525,14 @@ mod tests {
             assert!(!fields.contains(&injected), "{injected} is the hub's own, not part of the contract");
         }
         assert!(fields.contains(&"boot_id") && fields.contains(&"net_rx_total"));
-        // The numeric list is the same list minus the two that are not plain
-        // numbers, so neither can drift from the other.
-        let numeric: Vec<&str> = numeric_fields().collect();
-        assert_eq!(numeric.len(), fields.len() - 2);
-        assert!(!numeric.contains(&"load") && !numeric.contains(&"boot_id"));
+        // `Report` reads the same list: a field of the contract missing from it
+        // would be skipped as unknown and never reach the live view.
+        let mut numeric = Report::default().numbers().map(|(key, _)| key).to_vec();
+        let mut expected: Vec<&str> =
+            fields.into_iter().filter(|k| !matches!(*k, "boot_id" | "load")).collect();
+        numeric.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(numeric, expected);
     }
 
     /// A minute of reports a second apart: each moves the live view, history
@@ -1374,7 +1548,11 @@ mod tests {
             send(&app, id, &mut session, second, &report_json("boot-a", 1_000 + second as i64 * 100, 0))
                 .unwrap();
         }
-        assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx_total"], 6_900, "the live view follows");
+        assert_eq!(
+            app.agents.read().unwrap()[&id].metrics_json()["net_rx_total"],
+            6_900,
+            "the live view follows"
+        );
         assert_eq!(total_rx(&app, id), 0, "within the minute nothing past the baseline is booked");
         assert_eq!(
             app.db.node(id).unwrap().unwrap().last_seen,
@@ -1475,7 +1653,7 @@ mod tests {
         }
         // The live view still shows the instantaneous reading, which is its
         // purpose.
-        assert_eq!(app.agents.read().unwrap()[&id].metrics["net_rx"], 0);
+        assert_eq!(app.agents.read().unwrap()[&id].metrics_json()["net_rx"], 0);
     }
 
     /// A reconnect arrives mid-minute, and that minute's row already holds the
@@ -1663,7 +1841,7 @@ mod tests {
         let hostname = || app.db.node(id).unwrap().unwrap().hostname;
         let cpu =
             |value: f64| json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": value}}).to_string();
-        let live_cpu = || app.agents.read().unwrap()[&id].metrics["cpu"].clone();
+        let live_cpu = || app.agents.read().unwrap()[&id].metrics_json()["cpu"].clone();
         dispatch(&app, id, "ip", &cpu(1.0), &mut session, at_ms(10_000)).unwrap();
         dispatch(&app, id, "ip", &cpu(2.0), &mut session, at_ms(10_300)).unwrap();
         assert_eq!(live_cpu(), 1.0, "a report 300 ms after the last is dropped");
@@ -1931,7 +2109,7 @@ mod tests {
         let (id, _held) = connect(&app);
         let mut session = Session::default();
         let report = |params: serde_json::Value| json!({"method": "report", "params": params}).to_string();
-        let live = || app.agents.read().unwrap()[&id].metrics.clone();
+        let live = || app.agents.read().unwrap()[&id].metrics_json();
         let whole = json!({"boot_id": "b1", "iface": "eth0", "mem_total": 1_000, "swap_total": 0,
                            "disk_total": 5_000, "cpu": 1.0, "net_rx_total": 10, "net_tx_total": 10});
         dispatch(&app, id, "ip", &report(whole), &mut session, at_ms(0)).unwrap();
@@ -1951,6 +2129,32 @@ mod tests {
         // Another connection fills from nothing it has not itself carried.
         dispatch(&app, id, "ip", &report(sparse), &mut Session::default(), at_ms(2_000)).unwrap();
         assert!(live().get("boot_id").is_none());
+    }
+
+    /// `STICKY` is what the hub offers the agent to leave out, and each field
+    /// offered has to be filled back in.
+    #[test]
+    fn every_field_offered_as_sticky_is_filled_back_in() {
+        let whole: Report = serde_json::from_value(json!({"boot_id": "b", "iface": "eth0", "mem_total": 1,
+                                                          "swap_total": 2, "disk_total": 3, "cpu": 4.0}))
+        .unwrap();
+        let mut held = Report::default();
+        whole.clone().fill_sticky(&mut held);
+        for key in STICKY {
+            let mut sparse = json!(&whole);
+            sparse.as_object_mut().unwrap().remove(key);
+            let mut sparse: Report = serde_json::from_value(sparse).unwrap();
+            sparse.fill_sticky(&mut held);
+            assert_eq!(sparse, whole, "{key}");
+        }
+        // A report refused over another field still records every sticky one.
+        let mut refused = json!(&whole);
+        refused["cpu"] = serde_json::Value::Null;
+        let refused = refused.to_string();
+        assert!(Report::parse(&refused).is_err());
+        let mut from_refused = Report::default();
+        Report::sticky_of(&refused).unwrap().fill_sticky(&mut from_refused);
+        assert_eq!(from_refused, held);
     }
 
     #[test]

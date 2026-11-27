@@ -218,9 +218,9 @@ fn node_view(
     // same machine two different capacities. Offline, the stored figure is the last
     // one reported. No floor is applied: a host whose swap has just been disabled
     // reports zero and means it. A node connected but not yet reporting holds
-    // `Null`, where `get` returns nothing and the stored figure stands.
+    // no report, and the stored figure stands.
     let live = |key: &str, stored: i64| {
-        current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
+        current.and_then(|a| a.metrics.as_ref()?.figure(key)?.as_i64()).unwrap_or(stored)
     };
     // The live entry while connected, the stored one afterwards. Zero means
     // connected but not yet reporting, which is not a timestamp, so it falls
@@ -247,7 +247,7 @@ fn node_view(
         // clock is, and one eight hours fast shows a node that dropped a minute
         // ago as offline for eight hours. Null for a node never seen.
         "last_seen_ago": (last_seen > 0).then(|| (now.timestamp() - last_seen).max(0)),
-        "metrics": current.map(|a| a.metrics.clone()).unwrap_or(Value::Null),
+        "metrics": current.map(crate::agent_ws::Agent::metrics_json).unwrap_or(Value::Null),
         "os": node.os,
         "kernel": node.kernel,
         "arch": node.arch,
@@ -2819,7 +2819,7 @@ mod tests {
     fn connect(app: &App, id: i64, metrics: Value) -> tokio::sync::mpsc::Receiver<()> {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut agent = crate::agent_ws::Agent::new(7, tx);
-        agent.metrics = metrics;
+        agent.metrics = (!metrics.is_null()).then(|| serde_json::from_value(metrics).unwrap());
         agent.last_seen = Utc::now().timestamp();
         app.agents.write().unwrap().insert(id, agent);
         rx
