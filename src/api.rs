@@ -2975,7 +2975,8 @@ mod tests {
     }
 
     /// A report carrying every figure the frame shows, `iface` and `load`
-    /// included, so that `metrics` is written in full.
+    /// included, so that `metrics` is written in full; `cpu` is a fraction so
+    /// that a float is written as well as integers.
     fn full_report() -> Value {
         let mut report = json!({"boot_id": "b", "iface": "eth0", "load": [0.1, 0.2, 0.3], "net_rx_total": 1,
                                 "net_tx_total": 1, "cpu": 12.5});
@@ -3914,11 +3915,14 @@ mod tests {
         let public = live_snapshot(&app, false);
         let admin = live_snapshot(&app, true);
         // Serialized from borrowed views, the frame must keep the bytes a `json!`
-        // object would write: keys sorted at every level, `metrics` and the
-        // panel's `iface` included, numbers written alike. A `Value` sorts its
-        // keys, so a frame that survives the round trip unchanged has them.
-        for frame in [public.as_str(), admin.as_str()] {
-            assert_eq!(serde_json::from_str::<Value>(frame).unwrap().to_string(), frame);
+        // object would write. The first assertion compares what it holds,
+        // audience flag and integer or float kind of each number included; the
+        // second its bytes: a `Value` sorts its keys at every level, so a frame
+        // that survives the round trip unchanged has them in that order.
+        for (frame, full) in [(public.as_str(), false), (admin.as_str(), true)] {
+            let parsed: Value = serde_json::from_str(frame).unwrap();
+            assert_eq!(parsed, json!({"nodes": visible_nodes(&app, full).unwrap(), "admin": full}));
+            assert_eq!(parsed.to_string(), frame);
         }
         // Caching must never let one audience's payload reach the other.
         assert!(!public.as_str().contains("198.51.100.9"), "the public frame must carry no address");
