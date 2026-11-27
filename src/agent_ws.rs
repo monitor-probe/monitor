@@ -292,6 +292,16 @@ impl Report {
         })
     }
 
+    /// The load averages, if the report carried them.
+    pub(crate) fn load(&self) -> Option<&[Number; 3]> {
+        self.load.as_ref()
+    }
+
+    /// The `--iface` the agent runs with, if the report carried it.
+    pub(crate) fn iface(&self) -> Option<&serde_json::Value> {
+        self.iface.as_ref()
+    }
+
     /// Whether the report carries `key` in a usable form, for [`check_contract`].
     /// An empty `boot_id` counts as left out.
     fn carries(&self, key: &str) -> bool {
