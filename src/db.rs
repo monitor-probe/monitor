@@ -1234,7 +1234,7 @@ impl Db {
 
     pub fn nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(&format!("SELECT {NODE_COLUMNS} FROM node ORDER BY sort, id"))?;
+        let mut stmt = conn.prepare_cached(&format!("SELECT {NODE_COLUMNS} FROM node ORDER BY sort, id"))?;
         let rows = stmt.query_map([], |r| Ok(row_to_node(r)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1242,9 +1242,8 @@ impl Db {
     pub fn node(&self, id: i64) -> Result<Option<Node>> {
         Ok(self
             .conn()
-            .query_row(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?1"), [id], |r| {
-                Ok(row_to_node(r))
-            })
+            .prepare_cached(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?1"))?
+            .query_row([id], |r| Ok(row_to_node(r)))
             .optional()?)
     }
 
@@ -3028,15 +3027,19 @@ mod tests {
         let db = db();
         let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "t").unwrap();
         let cols: Vec<&str> = NODE_COLUMNS.split(',').map(str::trim).collect();
-        let numeric =
-            ["sort", "price", "traffic_limit", "traffic_reset_day", "cpu_cores", "mem_total", "swap_total"];
-        let numeric = [&numeric[..], &["disk_total", "last_seen", "down_since"]].concat();
         let at = |c: &str| 100 + cols.iter().position(|x| *x == c).unwrap() as i64;
         {
             let conn = db.conn();
+            let numeric: Vec<String> = conn
+                .prepare("SELECT name FROM pragma_table_info('node') WHERE type IN ('INTEGER', 'REAL')")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
             for &c in cols.iter().filter(|c| !["id", "public", "notify"].contains(*c)) {
                 let sql = format!("UPDATE node SET {c} = ?1 WHERE id = ?2");
-                if numeric.contains(&c) {
+                if numeric.iter().any(|x| x == c) {
                     conn.execute(&sql, rusqlite::params![at(c), id]).unwrap();
                 } else {
                     conn.execute(&sql, rusqlite::params![c, id]).unwrap();
@@ -3070,6 +3073,7 @@ mod tests {
             (&n.ipv6_pin, "ipv6_pin"),
             (&n.token, "token"),
         ];
+        let mut checked: Vec<&str> = text.iter().map(|t| t.1).collect();
         for (got, want) in text {
             assert_eq!(got, want);
         }
@@ -3085,9 +3089,15 @@ mod tests {
             (n.last_seen, "last_seen"),
             (n.down_since, "down_since"),
         ];
+        checked.extend(numbers.iter().map(|t| t.1));
         for (got, want) in numbers {
             assert_eq!(got, at(want), "{want}");
         }
+        checked.extend(["id", "public", "notify", "expires_at"]);
+        checked.sort_unstable();
+        let mut all = cols.clone();
+        all.sort_unstable();
+        assert_eq!(checked, all, "every column of NODE_COLUMNS is checked");
         assert_eq!(
             (n.id, n.public, n.notify, n.expires_at.as_deref()),
             (id, false, true, Some("expires_at"))
