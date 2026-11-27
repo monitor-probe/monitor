@@ -292,6 +292,16 @@ impl Report {
         })
     }
 
+    /// The load averages, if the report carried them.
+    pub(crate) fn load(&self) -> Option<&[Number; 3]> {
+        self.load.as_ref()
+    }
+
+    /// The `--iface` the agent runs with, if the report carried it.
+    pub(crate) fn iface(&self) -> Option<&serde_json::Value> {
+        self.iface.as_ref()
+    }
+
     /// Whether the report carries `key` in a usable form, for [`check_contract`].
     /// An empty `boot_id` counts as left out.
     fn carries(&self, key: &str) -> bool {
@@ -946,7 +956,7 @@ fn country_code(body: &str) -> Option<String> {
     (cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_alphabetic())).then(|| cc.to_ascii_uppercase())
 }
 
-/// Figures `api::node_view` fills into `metrics` from the traffic row. They never
+/// Figures `api::MetricsView` writes into `metrics` from the traffic row. They never
 /// arrive from an agent and are therefore not part of the contract one must meet.
 pub(crate) const INJECTED: [&str; 4] = ["total_rx", "total_tx", "month_rx", "month_tx"];
 
