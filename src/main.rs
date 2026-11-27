@@ -1109,6 +1109,31 @@ mod tests {
 
     use axum::http::{StatusCode, Uri};
 
+    /// The reports' writes reach the file within a `db::BATCH` while nothing
+    /// else touches the database. Otherwise they would wait for the next panel
+    /// or chart request, and a hub killed meanwhile would lose all of them.
+    /// The paused clock does not advance while the tick's `spawn_blocking`
+    /// runs, so the commit has finished by the time the second sleep ends.
+    #[tokio::test(start_paused = true)]
+    async fn the_reports_writes_are_committed_every_batch() {
+        let dir = TempDir::new("batches");
+        let file = dir.0.join("monitor.db").to_string_lossy().into_owned();
+        let app = Arc::new(App::for_test(Db::open(&file).unwrap()));
+        let id = app.db.create_node(&db::Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        let rows = || {
+            rusqlite::Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap()
+                .query_row("SELECT count(*) FROM metric", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        tokio::spawn(commit_batches(app.clone()));
+        tokio::time::sleep(db::BATCH / 2).await;
+        app.db.insert_metric(id, 60, &serde_json::json!({"cpu": 1.0})).unwrap();
+        assert_eq!(rows(), 0, "the write waits in the open batch");
+        tokio::time::sleep(db::BATCH).await;
+        assert_eq!(rows(), 1, "the next tick committed it");
+    }
+
     #[test]
     fn only_a_binary_signed_with_the_key_is_relayed() {
         use ring::signature::{Ed25519KeyPair, KeyPair};
