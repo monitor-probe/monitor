@@ -956,7 +956,7 @@ fn country_code(body: &str) -> Option<String> {
     (cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_alphabetic())).then(|| cc.to_ascii_uppercase())
 }
 
-/// Figures `api::node_view` fills into `metrics` from the traffic row. They never
+/// Figures `api::MetricsView` writes into `metrics` from the traffic row. They never
 /// arrive from an agent and are therefore not part of the contract one must meet.
 pub(crate) const INJECTED: [&str; 4] = ["total_rx", "total_tx", "month_rx", "month_tx"];
 

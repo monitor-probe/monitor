@@ -305,20 +305,17 @@ impl Serialize for MetricsView<'_> {
         let mut map = s.serialize_map(None)?;
         // `PUBLIC_METRICS` is in sorted order, and `iface` goes where it sorts.
         let mut iface = self.full.then(|| self.report.iface()).flatten();
+        // The same figures as the top-level ones, from the same row, in the
+        // order of `INJECTED`; a key added there fails to compile here. Both
+        // official themes refuse a node's live view without them.
+        let traffic: [i64; agent_ws::INJECTED.len()] =
+            [self.traffic.total_rx, self.traffic.total_tx, self.traffic.month_rx, self.traffic.month_tx];
         for key in PUBLIC_METRICS {
             if let Some(value) = iface.filter(|_| "iface" < key) {
                 map.serialize_entry("iface", value)?;
                 iface = None;
             }
-            // The same figures as the top-level ones, from the same row. Both
-            // official themes refuse a node's live view without them.
-            let injected = match key {
-                "total_rx" => Some(self.traffic.total_rx),
-                "total_tx" => Some(self.traffic.total_tx),
-                "month_rx" => Some(self.traffic.month_rx),
-                "month_tx" => Some(self.traffic.month_tx),
-                _ => None,
-            };
+            let injected = agent_ws::INJECTED.iter().position(|k| *k == key).map(|i| traffic[i]);
             if let Some(value) = injected {
                 map.serialize_entry(key, &value)?;
             } else if key == "load" {
