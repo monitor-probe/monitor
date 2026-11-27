@@ -579,7 +579,8 @@ fn current<T>(app: &App, full: bool, read: impl FnOnce(&mut Frame) -> T) -> T {
         // `admin` is included so the panel's first fetch and its stream share one
         // cached frame. Serialized from a borrow: `json!` would copy every node's
         // tree into a new `Value` first, a fifth of building the frame. The fields
-        // are in the order that object's sorted keys gave them.
+        // are declared in sorted key order, as a `json!` object emits them, so the
+        // frame's bytes match what that would build.
         #[derive(serde::Serialize)]
         struct Snapshot<'a> {
             admin: bool,
