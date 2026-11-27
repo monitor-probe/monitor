@@ -11,7 +11,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Local, NaiveDate, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
@@ -135,25 +135,26 @@ pub async fn plain_errors(response: Response) -> Response {
 /// raw kernel counters, which are a wire-protocol detail disclosing a machine's
 /// entire lifetime traffic, plus the four traffic figures `node_view` fills in.
 /// The panel additionally sees `iface`.
+/// In sorted order, the order [`MetricsView`] writes them in.
 pub(crate) const PUBLIC_METRICS: [&str; 18] = [
-    "uptime",
     "cpu",
+    "disk_total",
+    "disk_used",
     "load",
     "mem_total",
     "mem_used",
-    "swap_total",
-    "swap_used",
-    "disk_total",
-    "disk_used",
-    "net_rx",
-    "net_tx",
-    "tcp",
-    "udp",
-    "procs",
-    "total_rx",
-    "total_tx",
     "month_rx",
     "month_tx",
+    "net_rx",
+    "net_tx",
+    "procs",
+    "swap_total",
+    "swap_used",
+    "tcp",
+    "total_rx",
+    "total_tx",
+    "udp",
+    "uptime",
 ];
 
 /// The addresses the panel shows for a node, each with where it comes from: at
@@ -201,14 +202,144 @@ fn addresses<'a>(
 }
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
-/// accumulated traffic in a single object.
-fn node_view(
-    node: &Node,
-    current: Option<&Agent>,
-    traffic: &Traffic,
+/// accumulated traffic in a single object, serialized straight from what it
+/// borrows into the frame. Building a `Value` per node first, then serializing
+/// and freeing it, would cost 212,761 instructions per report against 162,356
+/// (callgrind, 100 nodes reporting each second, 8 visitors).
+///
+/// Fields are declared in sorted key order, the order a `json!` object emits
+/// them, so the frame keeps its bytes. Those marked to skip when `None` are the
+/// panel's: `node_view` fills them only for the full view, and the public one
+/// leaves them out entirely.
+#[derive(Serialize)]
+struct NodeView<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addresses: Option<Vec<Address<'a>>>,
+    agent_version: &'a str,
+    arch: &'a str,
+    billing_cycle: &'a str,
+    country: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    country_auto: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    country_pin: Option<&'a str>,
+    cpu_cores: i64,
+    cpu_name: &'a str,
+    currency: &'a str,
+    day_rx: i64,
+    day_tx: i64,
+    disk_total: i64,
+    expires_at: Option<&'a str>,
+    expires_in: Option<i64>,
+    group: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<&'a str>,
+    id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interval: Option<Option<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv4: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv4_auto: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv4_pin: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv6: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv6_auto: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv6_pin: Option<&'a str>,
+    kernel: &'a str,
+    last_seen: i64,
+    last_seen_ago: Option<i64>,
+    mem_total: i64,
+    metrics: Option<MetricsView<'a>>,
+    month_rx: i64,
+    month_start: &'a str,
+    month_tx: i64,
+    month_used: i64,
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notify: Option<bool>,
+    online: bool,
+    os: &'a str,
+    price: f64,
+    public: bool,
+    public_remark: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remark: Option<&'a str>,
+    sort: i64,
+    swap_total: i64,
+    total_rx: i64,
+    total_tx: i64,
+    traffic_limit: i64,
+    traffic_mode: &'a str,
+    traffic_reset_day: u32,
+    virt: &'a str,
+}
+
+#[derive(Serialize)]
+struct Address<'a> {
+    address: &'a str,
+    source: &'a str,
+}
+
+/// A node's `metrics`: the latest report through the [`PUBLIC_METRICS`]
+/// allowlist, with the four traffic figures taken from the hub's own row, plus
+/// `iface` for the panel. An allowlist rather than a denylist, for the panel as
+/// well: the agent ships from its own repository, so a field added there would
+/// otherwise reach anonymous visitors the day it is released, and a node token
+/// in the wrong hands could fill the panel's frame with whatever it sends. No
+/// address, hostname or private note may ever reach a visitor.
+struct MetricsView<'a> {
+    report: &'a agent_ws::Report,
+    traffic: &'a Traffic,
+    full: bool,
+}
+
+impl Serialize for MetricsView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        // `PUBLIC_METRICS` is in sorted order, and `iface` goes where it sorts.
+        let mut iface = self.full.then(|| self.report.iface()).flatten();
+        // The same figures as the top-level ones, from the same row, in the
+        // order of `INJECTED`; a key added there fails to compile here. Both
+        // official themes refuse a node's live view without them.
+        let traffic: [i64; agent_ws::INJECTED.len()] =
+            [self.traffic.total_rx, self.traffic.total_tx, self.traffic.month_rx, self.traffic.month_tx];
+        for key in PUBLIC_METRICS {
+            if let Some(value) = iface.filter(|_| "iface" < key) {
+                map.serialize_entry("iface", value)?;
+                iface = None;
+            }
+            let injected = agent_ws::INJECTED.iter().position(|k| *k == key).map(|i| traffic[i]);
+            if let Some(value) = injected {
+                map.serialize_entry(key, &value)?;
+            } else if key == "load" {
+                if let Some(load) = self.report.load() {
+                    map.serialize_entry(key, load)?;
+                }
+            } else if let Some(value) = self.report.figure(key) {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        if let Some(value) = iface {
+            map.serialize_entry("iface", value)?;
+        }
+        map.end()
+    }
+}
+
+fn node_view<'a>(
+    node: &'a Node,
+    current: Option<&'a Agent>,
+    traffic: &'a Traffic,
     full: bool,
     now: DateTime<Local>,
-) -> Value {
+) -> NodeView<'a> {
     // The three capacities arrive in every `Metrics`. The stored figure follows the
     // reports a minute at a time and as the session ends, so it lags a disk mounted
     // while the agent runs -- the agent re-reads its mount table every sample so
@@ -226,126 +357,122 @@ fn node_view(
     // connected but not yet reporting, which is not a timestamp, so it falls
     // back to the stored value and "offline since" survives the gap.
     let last_seen = current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen);
-    let mut view = json!({
-        "id": node.id,
-        "name": node.name,
-        // A country rather than an address: it indicates which region a node sits
-        // in, which is what a status page conveys, without locating it. The
-        // address it was derived from remains behind the panel.
-        "country": if node.country_pin.is_empty() { &node.country } else { &node.country_pin },
-        // Named by the operator for the status page to divide the list by, so
-        // public like the node's name. Empty is ungrouped.
-        "group": node.group,
-        // Written by the operator for visitors, unlike `remark` below.
-        "public_remark": node.public_remark,
-        "sort": node.sort,
-        "public": node.public,
-        "online": current.is_some(),
-        "last_seen": last_seen,
-        // Counted on the hub's clock, for the same reason as `expires_in`: a page
-        // subtracting `last_seen` from its own clock is off by as much as that
-        // clock is, and one eight hours fast shows a node that dropped a minute
-        // ago as offline for eight hours. Null for a node never seen.
-        "last_seen_ago": (last_seen > 0).then(|| (now.timestamp() - last_seen).max(0)),
-        "metrics": current.map(crate::agent_ws::Agent::metrics_json).unwrap_or(Value::Null),
-        "os": node.os,
-        "kernel": node.kernel,
-        "arch": node.arch,
-        "virt": node.virt,
-        "cpu_name": node.cpu_name,
-        "cpu_cores": node.cpu_cores,
-        "mem_total": live("mem_total", node.mem_total),
-        "swap_total": live("swap_total", node.swap_total),
-        "disk_total": live("disk_total", node.disk_total),
-        "agent_version": node.agent_version,
-        "price": node.price,
-        "currency": node.currency,
-        "billing_cycle": node.billing_cycle,
-        "expires_at": node.expires_at,
-        // Counted on the hub's calendar, the one renewal follows. A page counting
-        // on the visitor's clock would, with the hub on UTC and the visitor on
-        // UTC+8, show every online node expired for eight hours each cycle
-        // before the hub rolls its date forward.
-        "expires_in": node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|d| (d - now.date_naive()).num_days()),
-        "traffic_limit": node.traffic_limit,
-        "traffic_mode": node.traffic_mode,
-        "traffic_reset_day": node.traffic_reset_day,
-        "total_rx": traffic.total_rx,
-        "total_tx": traffic.total_tx,
-        "month_rx": traffic.month_rx,
-        "month_tx": traffic.month_tx,
-        "month_used": traffic.month_used(&node.traffic_mode),
-        "month_start": traffic.month_start,
-        // Of the same nature as the month and lifetime figures beside it, which
-        // the public page already shows, so this one is public as well.
-        "day_rx": traffic.day_rx,
-        "day_tx": traffic.day_tx,
-    });
-    // An allowlist rather than a denylist, for the panel as well: the agent ships
-    // from its own repository, so a field added there would otherwise reach
-    // anonymous visitors the day it is released, and a node token in the wrong
-    // hands could fill the panel's frame with whatever it sends. No address,
-    // hostname or private note may ever reach a visitor.
-    if let Some(m) = view["metrics"].as_object_mut() {
-        m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()) || (full && k == "iface"));
-        // The same figures as the top-level ones, from the same row. Both official
-        // themes refuse a node's live view without them.
-        for (key, value) in agent_ws::INJECTED.into_iter().zip([
-            traffic.total_rx,
-            traffic.total_tx,
-            traffic.month_rx,
-            traffic.month_tx,
-        ]) {
-            m.insert(key.into(), json!(value));
-        }
-    }
     // Address and private notes never leave the panel. The token is not here at
     // all: the panel reads it from `node_token` as it shows the install command.
-    if full {
-        let held = (node.ipv4.as_str(), node.ipv6.as_str());
-        let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
-        let exits = [node.ip.as_str(), node.ip_other.as_str()];
-        let shown = addresses(exits, held, (pin4, pin6));
-        // What each family shows with its own pin cleared and the other's kept,
-        // for the edit form to offer as the fallback.
-        let auto = |pins, v6: bool| {
+    let private = |value: &'a str| full.then_some(value);
+    let held = (node.ipv4.as_str(), node.ipv6.as_str());
+    let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
+    let exits = [node.ip.as_str(), node.ip_other.as_str()];
+    // What each family shows with its own pin cleared and the other's kept,
+    // for the edit form to offer as the fallback.
+    let auto = |pins, v6: bool| {
+        full.then(|| {
             addresses(exits, held, pins)
                 .into_iter()
                 .find(|(a, _)| a.contains(':') == v6)
                 .map_or("", |(a, _)| a)
-        };
-        view["hostname"] = json!(node.hostname);
-        view["ip"] = json!(node.ip);
-        view["ipv4"] = json!(node.ipv4);
-        view["ipv6"] = json!(node.ipv6);
-        view["ipv4_pin"] = json!(node.ipv4_pin);
-        view["ipv6_pin"] = json!(node.ipv6_pin);
-        view["addresses"] =
-            shown.iter().map(|(address, source)| json!({"address": address, "source": source})).collect();
-        view["ipv4_auto"] = json!(auto(("", pin6), false));
-        view["ipv6_auto"] = json!(auto((pin4, ""), true));
-        view["interval"] = json!(current.and_then(Agent::interval));
-        view["country_pin"] = json!(node.country_pin);
-        view["country_auto"] = json!(node.country);
-        view["remark"] = json!(node.remark);
-        view["notify"] = json!(node.notify);
+        })
+    };
+    NodeView {
+        addresses: full.then(|| {
+            addresses(exits, held, (pin4, pin6))
+                .into_iter()
+                .map(|(address, source)| Address { address, source })
+                .collect()
+        }),
+        agent_version: &node.agent_version,
+        arch: &node.arch,
+        billing_cycle: &node.billing_cycle,
+        // A country rather than an address: it indicates which region a node sits
+        // in, which is what a status page conveys, without locating it. The
+        // address it was derived from remains behind the panel.
+        country: if node.country_pin.is_empty() { &node.country } else { &node.country_pin },
+        country_auto: private(&node.country),
+        country_pin: private(&node.country_pin),
+        cpu_cores: node.cpu_cores,
+        cpu_name: &node.cpu_name,
+        currency: &node.currency,
+        // Of the same nature as the month and lifetime figures beside it, which
+        // the public page already shows, so these are public as well.
+        day_rx: traffic.day_rx,
+        day_tx: traffic.day_tx,
+        disk_total: live("disk_total", node.disk_total),
+        expires_at: node.expires_at.as_deref(),
+        // Counted on the hub's calendar, the one renewal follows. A page counting
+        // on the visitor's clock would, with the hub on UTC and the visitor on
+        // UTC+8, show every online node expired for eight hours each cycle
+        // before the hub rolls its date forward.
+        expires_in: node
+            .expires_at
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok())
+            .map(|d| (d - now.date_naive()).num_days()),
+        // Named by the operator for the status page to divide the list by, so
+        // public like the node's name. Empty is ungrouped.
+        group: &node.group,
+        hostname: private(&node.hostname),
+        id: node.id,
+        interval: full.then(|| current.and_then(Agent::interval)),
+        ip: private(&node.ip),
+        ipv4: private(&node.ipv4),
+        ipv4_auto: auto(("", pin6), false),
+        ipv4_pin: private(&node.ipv4_pin),
+        ipv6: private(&node.ipv6),
+        ipv6_auto: auto((pin4, ""), true),
+        ipv6_pin: private(&node.ipv6_pin),
+        kernel: &node.kernel,
+        last_seen,
+        // Counted on the hub's clock, for the same reason as `expires_in`: a page
+        // subtracting `last_seen` from its own clock is off by as much as that
+        // clock is, and one eight hours fast shows a node that dropped a minute
+        // ago as offline for eight hours. Null for a node never seen.
+        last_seen_ago: (last_seen > 0).then(|| (now.timestamp() - last_seen).max(0)),
+        mem_total: live("mem_total", node.mem_total),
+        metrics: current.and_then(|a| a.metrics.as_ref()).map(|report| MetricsView { report, traffic, full }),
+        month_rx: traffic.month_rx,
+        month_start: &traffic.month_start,
+        month_tx: traffic.month_tx,
+        month_used: traffic.month_used(&node.traffic_mode),
+        name: &node.name,
+        notify: full.then_some(node.notify),
+        online: current.is_some(),
+        os: &node.os,
+        price: node.price,
+        public: node.public,
+        // Written by the operator for visitors, unlike `remark`.
+        public_remark: &node.public_remark,
+        remark: private(&node.remark),
+        sort: node.sort,
+        swap_total: live("swap_total", node.swap_total),
+        total_rx: traffic.total_rx,
+        total_tx: traffic.total_tx,
+        traffic_limit: node.traffic_limit,
+        traffic_mode: &node.traffic_mode,
+        traffic_reset_day: node.traffic_reset_day,
+        virt: &node.virt,
     }
-    view
 }
 
-fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
-    // One traffic query and one lock for the whole list, since this is what every
-    // visitor to the public page loads.
+/// Runs `f` on the views of every node the audience may see. One traffic query
+/// and one read of the agents for the whole list, since this is what every
+/// visitor to the public page loads; the views borrow from both, so the read is
+/// held until `f` returns.
+fn with_visible_nodes<T>(
+    app: &App,
+    full: bool,
+    f: impl FnOnce(&[NodeView<'_>]) -> T,
+) -> Result<T, anyhow::Error> {
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
     let now = Local::now();
-    Ok(nodes
+    let views: Vec<_> = nodes
         .iter()
         .filter(|n| full || n.public)
         .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, now))
-        .collect())
+        .collect();
+    Ok(f(&views))
 }
 
 pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
@@ -575,19 +702,18 @@ fn current<T>(app: &App, full: bool, read: impl FnOnce(&mut Frame) -> T) -> T {
     // resulting negative reads as young, pinning the panel to a stale frame until
     // real time catches up.
     if !(0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(frame.at)) {
-        let nodes = visible_nodes(app, full).unwrap_or_default();
         // `admin` is included so the panel's first fetch and its stream share one
-        // cached frame. Serialized from a borrow: `json!` would copy every node's
-        // tree into a new `Value` first, a fifth of building the frame. The fields
-        // are declared in sorted key order, as a `json!` object emits them, so the
-        // frame's bytes match what that would build.
+        // cached frame. The fields are declared in sorted key order, as a `json!`
+        // object emits them, so the frame's bytes match what that would build.
         #[derive(serde::Serialize)]
-        struct Snapshot<'a> {
+        struct Snapshot<'a, 'b> {
             admin: bool,
-            nodes: &'a [Value],
+            nodes: &'a [NodeView<'b>],
         }
-        // Into a String, which cannot fail.
-        let json = serde_json::to_string(&Snapshot { admin: full, nodes: &nodes }).unwrap_or_default().into();
+        // Into a String, which cannot fail. A database error lists no nodes.
+        let build = |nodes: &[NodeView<'_>]| serde_json::to_string(&Snapshot { admin: full, nodes });
+        let json =
+            with_visible_nodes(app, full, build).unwrap_or_else(|_| build(&[])).unwrap_or_default().into();
         *frame = Frame { at: now, json, gzip: None };
     }
     read(frame)
@@ -2400,6 +2526,13 @@ mod tests {
     use crate::auth::sha256;
     use crate::db::{Db, Span};
 
+    /// Every visible node as a `Value`, for assertions on single fields.
+    fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
+        with_visible_nodes(app, full, |views| {
+            views.iter().map(|v| serde_json::to_value(v).unwrap()).collect()
+        })
+    }
+
     /// What a browser on `https://monitor.example.com` sends with a panel write.
     fn panel_headers() -> HeaderMap {
         HeaderMap::from_iter([
@@ -3675,6 +3808,91 @@ mod tests {
         let mut signed_in = ask("gzip");
         signed_in.insert(header::COOKIE, format!("{}=live-token", crate::auth::COOKIE).parse().unwrap());
         assert!(nodes(State(app), signed_in).await.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    /// The keys each audience receives, listed: a field added to `NodeView`
+    /// fails here until it is placed on one side or the other.
+    #[test]
+    fn each_view_carries_exactly_its_listed_fields() {
+        let mut sorted = PUBLIC_METRICS;
+        sorted.sort_unstable();
+        assert_eq!(sorted, PUBLIC_METRICS, "MetricsView writes them in this order");
+
+        let app = app();
+        let id = node(&app, "n", true);
+        let mut report = json!({"boot_id": "b", "iface": "eth0", "load": [0.1, 0.2, 0.3], "net_rx_total": 1,
+                                "net_tx_total": 1});
+        for key in PUBLIC_METRICS.iter().filter(|k| !agent_ws::INJECTED.contains(k) && **k != "load") {
+            report[key] = json!(1);
+        }
+        let _held = connect(&app, id, report);
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let public = [
+            "agent_version",
+            "arch",
+            "billing_cycle",
+            "country",
+            "cpu_cores",
+            "cpu_name",
+            "currency",
+            "day_rx",
+            "day_tx",
+            "disk_total",
+            "expires_at",
+            "expires_in",
+            "group",
+            "id",
+            "kernel",
+            "last_seen",
+            "last_seen_ago",
+            "mem_total",
+            "metrics",
+            "month_rx",
+            "month_start",
+            "month_tx",
+            "month_used",
+            "name",
+            "online",
+            "os",
+            "price",
+            "public",
+            "public_remark",
+            "sort",
+            "swap_total",
+            "total_rx",
+            "total_tx",
+            "traffic_limit",
+            "traffic_mode",
+            "traffic_reset_day",
+            "virt",
+        ];
+        let panel = [
+            "addresses",
+            "country_auto",
+            "country_pin",
+            "hostname",
+            "interval",
+            "ip",
+            "ipv4",
+            "ipv4_auto",
+            "ipv4_pin",
+            "ipv6",
+            "ipv6_auto",
+            "ipv6_pin",
+            "notify",
+            "remark",
+        ];
+        let view = &visible_nodes(&app, false).unwrap()[0];
+        assert_eq!(keys(view), public);
+        assert_eq!(keys(&view["metrics"]), PUBLIC_METRICS);
+        let view = &visible_nodes(&app, true).unwrap()[0];
+        let mut full: Vec<&str> = public.iter().chain(&panel).copied().collect();
+        full.sort_unstable();
+        assert_eq!(keys(view), full);
+        let mut metrics = PUBLIC_METRICS.to_vec();
+        metrics.push("iface");
+        metrics.sort_unstable();
+        assert_eq!(keys(&view["metrics"]), metrics);
     }
 
     #[test]
