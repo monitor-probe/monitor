@@ -30,9 +30,9 @@ const SOURCES: Record<Source, string> = {
 // one into an ssh command is why they are shown. Where each came from is in the
 // tooltip, keeping the column to addresses alone.
 //
-// Drawn again only when the addresses change. The table re-renders on every
-// push, and redrawing a tooltip per address would raise the panel's script time
-// at a hundred nodes from 66 to 128 ms a second.
+// Drawn again only when the addresses change, not with the rest of its row:
+// redrawing a tooltip per address on every push would raise the panel's script
+// time at a hundred nodes from 66 to 128 ms a second.
 const Addresses = memo(
   function Addresses({ list }: { list: NonNullable<Node["addresses"]> }) {
     if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
@@ -88,6 +88,143 @@ function trafficTone(n: Node, warnAt: number) {
   if (n.month_used >= n.traffic_limit) return "text-over"
   return n.month_used * 100 >= n.traffic_limit * warnAt ? "text-near" : ""
 }
+
+type RowAction = "install" | "edit" | "billing" | "delete"
+type RowEvents = {
+  handle: (id: number) => Pick<React.ComponentProps<"button">, "onPointerDown" | "onKeyDown">
+  open: (action: RowAction, id: number) => void
+}
+type RowProps = {
+  id: number
+  name: string
+  country: string
+  countryPin: boolean
+  group: string
+  addresses: NonNullable<Node["addresses"]>
+  online: boolean
+  isPublic: boolean
+  /** How long an offline node has been silent, or "" where nothing is shown. */
+  silentFor: string
+  used: string
+  tone: string
+  limit: string
+  price: string
+  expires: string
+  rowClass: string
+  dragged: true | undefined
+  searching: boolean
+  refused: boolean
+  events: RowEvents
+}
+
+// One node's row, drawn from what it shows rather than from the node: every push
+// replaces every node, while the figures a row shows rarely change between two.
+// Redrawing all of them would cost the page 84 ms per push against 25 at 200
+// nodes in desktop Chromium, 379 against 77 with its CPU slowed fourfold. The handlers in `events` are created once and read the list's state
+// when they run, so a row left as it was holds no stale ones.
+const NodeRow = memo(
+  function NodeRow(p: RowProps) {
+    return (
+      <TableRow data-id={p.id} data-dragging={p.dragged} className={p.rowClass}>
+        {/* Wraps: under the cell's default nowrap, one long name would
+            widen the table until the actions left the screen. */}
+        <TableCell className="whitespace-normal">
+          <div className="flex items-center gap-2">
+            <DragHandle
+              {...p.events.handle(p.id)}
+              name={p.name}
+              disabled={p.searching}
+              title={p.searching ? "清空搜索和筛选后可拖动排序" : undefined}
+            />
+            <div className="min-w-24">
+              {/* Lines are balanced, so none ends on a character or two. */}
+              <div className="font-medium text-balance break-keep">
+                {nameText(p.name)}
+                {/* In the name's flow, a fixed gap after its last word.
+                    Beside the block it would sit at the cell's edge
+                    whenever the name or group wraps, since a wrapped
+                    block spans the whole width. The gap is a figure
+                    space, which does not break: the badge moves down
+                    with the last word rather than open a line alone. */}
+                {p.country && "\u2007"}
+                {p.country && (
+                  <Badge
+                    variant="outline"
+                    title={p.countryPin ? "手动指定" : undefined}
+                    className="align-middle font-normal text-muted-foreground"
+                  >
+                    {p.country}
+                  </Badge>
+                )}
+              </div>
+              {p.group && <div className="text-xs text-balance text-muted-foreground">{p.group}</div>}
+            </div>
+          </div>
+        </TableCell>
+        {/* Addresses live only here, never on the public page. */}
+        <TableCell>
+          <Addresses list={p.addresses} />
+        </TableCell>
+        <TableCell>
+          {/* Stacked and centred on one axis. The slot is as wide as
+              the three-character 不公开, so a lone pill sits where it
+              would above that one and every row lines up. */}
+          <div className="flex w-fit min-w-14 flex-col items-center gap-1">
+            <Badge variant={p.online ? "default" : "secondary"} className="font-normal">
+              {p.online ? "在线" : "离线"}
+            </Badge>
+            {!p.isPublic && <Badge variant="outline" className="font-normal">不公开</Badge>}
+            {/* Under the badge, not inside it: the column is a tenth of
+                the table and the three do not share one line. A slot of
+                the pills' width that the text spills out of evenly, so a
+                long duration does not widen the slot and move the
+                pills off the axis the other rows share. */}
+            {p.silentFor && (
+              <div className="flex w-14 justify-center">
+                <span className="tnum text-xs whitespace-nowrap text-muted-foreground">
+                  {p.silentFor}
+                </span>
+              </div>
+            )}
+          </div>
+        </TableCell>
+        {/* Counted by the node's own billing rule, as on the public
+            page. Two unbreakable halves, so a narrow table moves the
+            limit to a second line rather than splitting a figure. */}
+        <TableCell className="tnum text-sm whitespace-normal">
+          <span className={`whitespace-nowrap ${p.tone}`}>
+            {p.used}
+          </span>{" "}
+          <span className="whitespace-nowrap text-muted-foreground">
+            / {p.limit}
+          </span>
+        </TableCell>
+        <TableCell className="tnum text-sm">
+          {p.price}
+          <div className="text-xs text-muted-foreground xl:hidden">{p.expires}</div>
+        </TableCell>
+        <TableCell className="hidden text-sm xl:table-cell">{p.expires}</TableCell>
+        <TableCell className="text-right whitespace-nowrap">
+          <Button variant="ghost" size="icon" disabled={p.refused} onClick={() => p.events.open("install", p.id)} title="安装 Agent" aria-label="安装 Agent">
+            <Download />
+          </Button>
+          <Button variant="ghost" size="icon" onClick={() => p.events.open("edit", p.id)} title="编辑节点" aria-label="编辑节点">
+            <Pencil />
+          </Button>
+          <Button variant="ghost" size="icon" onClick={() => p.events.open("billing", p.id)} title="续费设置" aria-label="续费设置">
+            <CalendarClock />
+          </Button>
+          <Button variant="ghost" size="icon" onClick={() => p.events.open("delete", p.id)} title="删除节点" aria-label="删除节点">
+            <Trash2 className="text-destructive" />
+          </Button>
+        </TableCell>
+      </TableRow>
+    )
+  },
+  // Every prop but the address list is a string, number or flag, or is created once.
+  (a, b) => (Object.keys(a) as (keyof RowProps)[]).every((k) =>
+    k === "addresses" ? JSON.stringify(a.addresses) === JSON.stringify(b.addresses) : a[k] === b[k]),
+)
 
 export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
   const settings = useSettings(true).s
@@ -179,6 +316,24 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
       hintLocked()
     },
   }
+  // What the rows' handlers read when they run: the drag as of this render, and
+  // the node a button opens as the list now has it.
+  const live = useRef({ drag, searching, locked, nodes })
+  useEffect(() => { live.current = { drag, searching, locked, nodes } })
+  const [events] = useState<RowEvents>(() => {
+    const target = (id: number) => (live.current.searching ? live.current.locked : live.current.drag.handle(id))
+    const open = { install: setInstalling, edit: setEditing, billing: setBilling, delete: setDeleting }
+    return {
+      handle: (id) => ({
+        onPointerDown: (e) => target(id).onPointerDown(e),
+        onKeyDown: (e) => target(id).onKeyDown(e),
+      }),
+      open: (action, id) => {
+        const node = live.current.nodes.find((n) => n.id === id)
+        if (node) open[action](node)
+      },
+    }
+  })
   function hintLocked() {
     toast("筛选时不能拖动排序", {
       id: "drag-locked",
@@ -286,102 +441,33 @@ export function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refres
             </TableRow>
           </TableHeader>
           <TableBody>
-            {visible.map((n) => (
-              <TableRow key={n.id} {...drag.row(n.id)}>
-                {/* Wraps: under the cell's default nowrap, one long name would
-                    widen the table until the actions left the screen. */}
-                <TableCell className="whitespace-normal">
-                  <div className="flex items-center gap-2">
-                    <DragHandle
-                      {...(searching ? locked : drag.handle(n.id))}
-                      name={n.name}
-                      disabled={searching}
-                      title={searching ? "清空搜索和筛选后可拖动排序" : undefined}
-                    />
-                    <div className="min-w-24">
-                      {/* Lines are balanced, so none ends on a character or two. */}
-                      <div className="font-medium text-balance break-keep">
-                        {nameText(n.name)}
-                        {/* In the name's flow, a fixed gap after its last word.
-                            Beside the block it would sit at the cell's edge
-                            whenever the name or group wraps, since a wrapped
-                            block spans the whole width. The gap is a figure
-                            space, which does not break: the badge moves down
-                            with the last word rather than open a line alone. */}
-                        {n.country && "\u2007"}
-                        {n.country && (
-                          <Badge
-                            variant="outline"
-                            title={n.country_pin ? "手动指定" : undefined}
-                            className="align-middle font-normal text-muted-foreground"
-                          >
-                            {n.country}
-                          </Badge>
-                        )}
-                      </div>
-                      {n.group && <div className="text-xs text-balance text-muted-foreground">{n.group}</div>}
-                    </div>
-                  </div>
-                </TableCell>
-                {/* Addresses live only here, never on the public page. */}
-                <TableCell>
-                  <Addresses list={n.addresses ?? []} />
-                </TableCell>
-                <TableCell>
-                  {/* Stacked and centred on one axis. The slot is as wide as
-                      the three-character 不公开, so a lone pill sits where it
-                      would above that one and every row lines up. */}
-                  <div className="flex w-fit min-w-14 flex-col items-center gap-1">
-                    <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
-                      {n.online ? "在线" : "离线"}
-                    </Badge>
-                    {!n.public && <Badge variant="outline" className="font-normal">不公开</Badge>}
-                    {/* Under the badge, not inside it: the column is a tenth of
-                        the table and the three do not share one line. A slot of
-                        the pills' width that the text spills out of evenly, so a
-                        long duration does not widen the slot and move the
-                        pills off the axis the other rows share. */}
-                    {!n.online && n.last_seen_ago !== null && n.last_seen_ago >= 60 && (
-                      <div className="flex w-14 justify-center">
-                        <span className="tnum text-xs whitespace-nowrap text-muted-foreground">
-                          {uptime(n.last_seen_ago)}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                </TableCell>
-                {/* Counted by the node's own billing rule, as on the public
-                    page. Two unbreakable halves, so a narrow table moves the
-                    limit to a second line rather than splitting a figure. */}
-                <TableCell className="tnum text-sm whitespace-normal">
-                  <span className={`whitespace-nowrap ${trafficTone(n, warnAt)}`}>
-                    {bytes(n.month_used)}
-                  </span>{" "}
-                  <span className="whitespace-nowrap text-muted-foreground">
-                    / {n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
-                  </span>
-                </TableCell>
-                <TableCell className="tnum text-sm">
-                  {n.price > 0 ? money(n.price, n.currency) : "免费"}
-                  <div className="text-xs text-muted-foreground xl:hidden">{n.expires_at || FOREVER}</div>
-                </TableCell>
-                <TableCell className="hidden text-sm xl:table-cell">{n.expires_at || FOREVER}</TableCell>
-                <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" disabled={!!refusal} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
-                    <Download />
-                  </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
-                    <Pencil />
-                  </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setBilling(n)} title="续费设置" aria-label="续费设置">
-                    <CalendarClock />
-                  </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除节点" aria-label="删除节点">
-                    <Trash2 className="text-destructive" />
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
+            {visible.map((n) => {
+              const row = drag.row(n.id)
+              return (
+                <NodeRow
+                  key={n.id}
+                  id={n.id}
+                  name={n.name}
+                  country={n.country}
+                  countryPin={!!n.country_pin}
+                  group={n.group ?? ""}
+                  addresses={n.addresses ?? []}
+                  online={n.online}
+                  isPublic={n.public}
+                  silentFor={!n.online && n.last_seen_ago !== null && n.last_seen_ago >= 60 ? uptime(n.last_seen_ago) : ""}
+                  used={bytes(n.month_used)}
+                  tone={trafficTone(n, warnAt)}
+                  limit={n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
+                  price={n.price > 0 ? money(n.price, n.currency) : "免费"}
+                  expires={n.expires_at || FOREVER}
+                  rowClass={row.className}
+                  dragged={row["data-dragging"]}
+                  searching={searching}
+                  refused={!!refusal}
+                  events={events}
+                />
+              )
+            })}
           </TableBody>
         </Table>
         {/* Below the table rather than a row spanning it: below xl the span
