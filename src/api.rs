@@ -3278,6 +3278,22 @@ mod tests {
         }
     }
 
+    /// The panel splits `iface` as text; anything else reaching it would break
+    /// the page.
+    #[test]
+    fn only_a_text_iface_reaches_the_panel() {
+        let app = app();
+        let id = node(&app, "open", true);
+        for iface in [json!(7), json!({"name": "eth1"}), json!(["eth1"]), json!(false), json!(null)] {
+            let mut report = full_report();
+            report["iface"] = iface.clone();
+            let _held = connect(&app, id, report);
+            let admin = visible_nodes(&app, true).unwrap();
+            assert!(admin[0]["metrics"].get("iface").is_none(), "{iface}");
+            assert_eq!(admin[0]["metrics"]["cpu"], 12.5, "{iface}: the rest of the report still goes out");
+        }
+    }
+
     /// One address per family, marked with where it came from.
     #[test]
     fn a_node_shows_the_address_it_is_reached_by() {
