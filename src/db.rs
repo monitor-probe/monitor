@@ -11,7 +11,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::RuntimeFlavor;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// A string an agent reported, cut down to what may be shown. Control
 /// characters break the panel's rows, and the characters markup is made of are
@@ -43,6 +43,8 @@ pub struct Db {
     conn: Mutex<Connection>,
     /// Set when the reports' batch was rolled back; see [`Db::batch_lost`].
     lost: AtomicBool,
+    /// Whether the last commit of the reports' batch failed; see [`Db::settle`].
+    failing: AtomicBool,
 }
 
 const SCHEMA: &str = r#"
@@ -1069,7 +1071,12 @@ impl Db {
             file if file.is_empty() => None,
             file => Some(Mutex::new(read_only(&file)?)),
         };
-        Ok(Self { reader, conn: Mutex::new(conn), lost: AtomicBool::new(false) })
+        Ok(Self {
+            reader,
+            conn: Mutex::new(conn),
+            lost: AtomicBool::new(false),
+            failing: AtomicBool::new(false),
+        })
     }
 
     /// The writer, with the reports' batch committed first: a transaction of
@@ -1123,14 +1130,33 @@ impl Db {
     /// Commits the open batch, if any. One that fails to commit is rolled back
     /// rather than left open, where every later write would join a transaction
     /// that cannot commit.
+    ///
+    /// The first failure is logged as a warning, the ones after it at debug,
+    /// and the next commit that succeeds at info. A full disk, an I/O error or
+    /// a read-only remount fails every batch until it is cleared, and a
+    /// warning each [`BATCH`] would be 86 400 journal lines a day.
     fn settle(&self, conn: &Connection) {
         if conn.is_autocommit() {
             return;
         }
-        if let Err(e) = conn.execute_batch("COMMIT") {
-            warn!("committing the reports' writes failed: {e:#}");
-            let _ = conn.execute_batch("ROLLBACK");
-            self.lost.store(true, Ordering::SeqCst);
+        match conn.execute_batch("COMMIT") {
+            Ok(()) => {
+                if self.failing.swap(false, Ordering::SeqCst) {
+                    info!("committing the reports' writes succeeded again");
+                }
+            }
+            Err(e) => {
+                if self.failing.swap(true, Ordering::SeqCst) {
+                    debug!("committing the reports' writes failed: {e:#}");
+                } else {
+                    warn!(
+                        "committing the reports' writes failed: {e:#}; \
+                         until one succeeds, further failures are logged at debug"
+                    );
+                }
+                let _ = conn.execute_batch("ROLLBACK");
+                self.lost.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -3278,6 +3304,40 @@ mod tests {
         db.insert_metric(id, 120, &serde_json::json!({"cpu": 1.0})).unwrap();
         drop(db);
         assert_eq!(rows(&read_only(&scratch.0).unwrap()), 2, "closing commits the open batch");
+    }
+
+    /// A batch that fails to commit is rolled back, every time the failure
+    /// repeats, and the first batch after it clears commits as usual and ends
+    /// the failing state.
+    #[test]
+    fn a_batch_that_fails_to_commit_is_rolled_back_and_the_next_one_commits() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "token").unwrap();
+        let rows =
+            |c: &Connection| c.query_row("SELECT count(*) FROM metric", [], |r| r.get::<_, i64>(0)).unwrap();
+        for ts in [60, 120] {
+            db.insert_metric(id, ts, &serde_json::json!({"cpu": 1.0})).unwrap();
+            // A deferred foreign key is checked at COMMIT, so the commit itself
+            // fails, as it does on a full disk, rather than the statement.
+            db.current()
+                .execute_batch(&format!(
+                    "PRAGMA defer_foreign_keys = ON; UPDATE metric SET node_id = {} WHERE ts = {ts}",
+                    id + 1
+                ))
+                .unwrap();
+            db.commit_batch();
+            assert!(db.failing.load(Ordering::SeqCst), "the failure is recorded");
+            assert!(db.batch_lost(), "the batch is rolled back");
+            assert!(db.current().is_autocommit(), "and not left open");
+        }
+        assert_eq!(rows(&read_only(&scratch.0).unwrap()), 0);
+
+        db.insert_metric(id, 180, &serde_json::json!({"cpu": 1.0})).unwrap();
+        db.commit_batch();
+        assert!(!db.failing.load(Ordering::SeqCst), "a commit that succeeds ends the failing state");
+        assert!(!db.batch_lost());
+        assert_eq!(rows(&read_only(&scratch.0).unwrap()), 1);
     }
 
     /// Chart reads kept back to back leave no commit an idle reader to
