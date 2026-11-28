@@ -570,25 +570,36 @@ pub async fn watch(app: Shared) {
 /// moment it ends and be announced offline seconds before it is back. Counted
 /// in sweeps, a stall adds one sweep, so it delays a real offline alert by its
 /// length, as a hub restart does.
+///
+/// The sweep after a held-up one runs a whole `SWEEP` after it ends rather
+/// than at once. The held-up sweep takes its online list on release, so a node
+/// lost during the stall is first seen absent then; with the next sweep run at
+/// once and the one after it back on the original 30 s grid, the first 1-30 s
+/// after release would count 60 s toward its grace period.
 struct Pace {
     ticker: tokio::time::Interval,
+    /// When the last sweep was due to start.
+    due: tokio::time::Instant,
     sweeps: i64,
 }
 
 impl Pace {
     fn new() -> Self {
-        let mut ticker = tokio::time::interval(SWEEP);
-        // A sweep held up past its successors' slots runs once on release
-        // rather than once per slot missed.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        Self { ticker, sweeps: 0 }
+        let ticker = tokio::time::interval(SWEEP);
+        Self { ticker, due: tokio::time::Instant::now(), sweeps: 0 }
     }
 
     /// Waits for the next sweep and returns its time in seconds on the sweep
     /// clock. Sweeps lie exactly `SWEEP` apart on it, so a grace period of
     /// whole sweeps is never cut short by a rounded second.
     async fn next(&mut self) -> i64 {
-        self.ticker.tick().await;
+        // A sweep that ran past the next one's slot restarts the interval from
+        // its end, so no tick is ever missed and the interval's catch-up
+        // behaviour never applies.
+        if self.due.elapsed() >= SWEEP {
+            self.ticker.reset();
+        }
+        self.due = self.ticker.tick().await;
         let at = self.sweeps * SWEEP.as_secs() as i64;
         self.sweeps += 1;
         at
@@ -883,19 +894,20 @@ mod tests {
     }
 
     /// A stall, during which agents cannot reconnect, counts as one sweep toward
-    /// an absence, and the sweeps it held up run once on release.
+    /// an absence, and the sweep after it runs a whole `SWEEP` after release.
     #[tokio::test(start_paused = true)]
     async fn a_stall_counts_as_one_sweep() {
         let mut pace = Pace::new();
         assert_eq!(pace.next().await, 0);
         assert_eq!(pace.next().await, 30);
-        // Held up for 240 s, as by a vacuum holding the database.
-        tokio::time::advance(Duration::from_secs(240)).await;
-        let stalled = tokio::time::Instant::now();
+        // The sweep at 30 is held up for 250 s, as by a vacuum holding the
+        // database; 250 s ends off the 30 s grid.
+        tokio::time::advance(Duration::from_secs(250)).await;
+        let released = tokio::time::Instant::now();
         assert_eq!(pace.next().await, 60, "the stall is one sweep, not the time it took");
-        let next = pace.next().await;
-        assert!(stalled.elapsed() >= SWEEP, "one sweep on release, not one per slot missed");
-        assert_eq!(next, 90);
+        assert_eq!(released.elapsed(), SWEEP, "a whole sweep after release, not at once");
+        assert_eq!(pace.next().await, 90);
+        assert_eq!(released.elapsed(), 2 * SWEEP, "and SWEEP apart from then on");
     }
 
     /// A node already away when a stall begins is not announced the moment it
@@ -908,14 +920,46 @@ mod tests {
         node(&app, "a", true, now - 60);
         let mut watch = Watch::default();
         assert!(sweep(&app, &mut watch, now, 0).unwrap().is_empty());
-        // The next sweep runs 240 s later, one sweep on the sweep clock.
-        assert!(sweep(&app, &mut watch, now + 240, 30).unwrap().is_empty(), "the stall is not counted");
-        assert!(sweep(&app, &mut watch, now + 360, 150).unwrap().is_empty(), "inside the grace period");
+        // The sweep at 30 is held up for 250 s and the next runs SWEEP after
+        // release: the stall is one sweep on the sweep clock.
+        assert!(sweep(&app, &mut watch, now + 30, 30).unwrap().is_empty(), "the stall is not counted");
+        assert!(sweep(&app, &mut watch, now + 310, 60).unwrap().is_empty(), "the sweep after release");
+        assert!(sweep(&app, &mut watch, now + 400, 150).unwrap().is_empty(), "inside the grace period");
         assert_eq!(
-            sweep(&app, &mut watch, now + 390, 180).unwrap().len(),
+            sweep(&app, &mut watch, now + 430, 180).unwrap().len(),
             1,
             "announced after the grace period"
         );
+    }
+
+    /// A node lost during a stall, first seen absent by the sweep it held up,
+    /// is announced no sooner than a whole grace period after release.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_lost_during_a_stall_has_the_whole_grace_period_after_it() {
+        let app = app();
+        with_channel(&app);
+        let now = 1_000_000;
+        let a = node(&app, "a", true, now - 10);
+        connect(&app, a);
+        let mut watch = Watch::default();
+        let mut pace = Pace::new();
+        assert!(sweep(&app, &mut watch, now, pace.next().await).unwrap().is_empty());
+        let held = pace.next().await;
+        // Held up for 250 s; the agent gives up on the silent hub meanwhile.
+        tokio::time::advance(Duration::from_secs(250)).await;
+        app.agents.write().unwrap().clear();
+        let released = tokio::time::Instant::now();
+        assert!(sweep(&app, &mut watch, now, held).unwrap().is_empty(), "first seen absent");
+        let grace = Duration::from_secs(180);
+        while released.elapsed() <= grace {
+            let steady = pace.next().await;
+            let notes = sweep(&app, &mut watch, now, steady).unwrap();
+            if !notes.is_empty() {
+                assert_eq!(released.elapsed(), grace, "announced {:?} after release", released.elapsed());
+                return;
+            }
+        }
+        panic!("not announced once the grace period had passed");
     }
 
     /// The wall clock jumping forward neither shortens the grace period nor the
