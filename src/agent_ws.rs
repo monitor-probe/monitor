@@ -191,12 +191,13 @@ macro_rules! report {
         /// was sent: a counter beyond `i64`, a fraction or a negative value is
         /// no reading rather than a different one. A field left out is `None`;
         /// one sent as `null` fails the parse like any other malformed figure.
+        /// `iface` alone is read by [`text`].
         #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
         pub struct Report {
             #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
             boot_id: Option<serde_json::Value>,
-            #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
-            iface: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "text", skip_serializing_if = "Option::is_none")]
+            iface: Option<String>,
             #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
             load: Option<[Number; 3]>,
             $(
@@ -251,6 +252,17 @@ where
     T::deserialize(d).map(Some)
 }
 
+/// Keeps a string and reads any other value, `null` included, as left out.
+/// The panel splits `iface` as text, and a number or an object there would
+/// break the page. Refusing the value instead would cost the report's
+/// figures, and in [`Report::sticky_of`] the new `boot_id` sent beside it.
+fn text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
 impl Report {
     /// Reads a report's parameters. Only an object is a report: serde would also
     /// accept an array, taking its elements as the fields in declaration order.
@@ -269,8 +281,8 @@ impl Report {
         struct Sticky {
             #[serde(default, deserialize_with = "present")]
             boot_id: Option<serde_json::Value>,
-            #[serde(default, deserialize_with = "present")]
-            iface: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "text")]
+            iface: Option<String>,
             #[serde(default, deserialize_with = "present")]
             mem_total: Option<Number>,
             #[serde(default, deserialize_with = "present")]
@@ -298,8 +310,8 @@ impl Report {
     }
 
     /// The `--iface` the agent runs with, if the report carried it.
-    pub(crate) fn iface(&self) -> Option<&serde_json::Value> {
-        self.iface.as_ref()
+    pub(crate) fn iface(&self) -> Option<&str> {
+        self.iface.as_deref()
     }
 
     /// Whether the report carries `key` in a usable form, for [`check_contract`].
@@ -307,7 +319,7 @@ impl Report {
     fn carries(&self, key: &str) -> bool {
         match key {
             "boot_id" => self.boot_id.as_ref().is_some_and(|v| !v.is_null() && *v != ""),
-            "iface" => self.iface.as_ref().is_some_and(|v| !v.is_null()),
+            "iface" => self.iface.is_some(),
             "load" => self.load.is_some(),
             _ => self.figure(key).is_some(),
         }
@@ -839,7 +851,9 @@ fn dispatch(
                 session.results.push((task_id, arrival.at.timestamp(), latency));
             }
         }
-        other => debug!("node {node_id} sent unknown method {other}"),
+        // Quoted, so that a method name holding a line break cannot forge a
+        // log line.
+        other => debug!("node {node_id} sent unknown method {other:?}"),
     }
     Ok(None)
 }
@@ -2139,6 +2153,39 @@ mod tests {
         // Another connection fills from nothing it has not itself carried.
         dispatch(&app, id, "ip", &report(sparse), &mut Session::default(), at_ms(2_000)).unwrap();
         assert!(live().get("boot_id").is_none());
+    }
+
+    #[test]
+    fn an_iface_other_than_text_is_taken_as_left_out() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let mut session = Session::default();
+        let report = |params: serde_json::Value| json!({"method": "report", "params": params}).to_string();
+        let live = || app.agents.read().unwrap()[&id].metrics_json();
+        let first =
+            json!({"boot_id": "b0", "iface": "eth0", "cpu": 1.0, "net_rx_total": 10, "net_tx_total": 10});
+        dispatch(&app, id, "ip", &report(first), &mut session, at_ms(0)).unwrap();
+        let odd = [json!(7), json!({"name": "eth1"}), json!(["eth1"]), json!(true), json!(null)];
+        for (i, iface) in (1u64..).zip(odd) {
+            let epoch = format!("b{i}");
+            let next = json!({"boot_id": epoch, "iface": iface, "cpu": 2.0, "net_rx_total": 20,
+                              "net_tx_total": 20});
+            dispatch(&app, id, "ip", &report(next), &mut session, at_ms(1_000 * i)).unwrap();
+            let m = live();
+            assert_eq!(
+                (m["cpu"].clone(), m["boot_id"].clone(), m["iface"].clone()),
+                (json!(2.0), json!(epoch), json!("eth0")),
+                "{iface}: the report is kept, and the interface list held from before"
+            );
+        }
+
+        // A report refused over another field still records its new epoch.
+        let refused = json!({"boot_id": "b9", "iface": {"name": "eth1"}, "cpu": null});
+        assert!(dispatch(&app, id, "ip", &report(refused), &mut session, at_ms(9_000)).is_err());
+        let sparse = json!({"cpu": 3.0, "net_rx_total": 30, "net_tx_total": 30});
+        dispatch(&app, id, "ip", &report(sparse), &mut session, at_ms(10_000)).unwrap();
+        let m = live();
+        assert_eq!((m["boot_id"].clone(), m["iface"].clone()), (json!("b9"), json!("eth0")));
     }
 
     /// `STICKY` is what the hub offers the agent to leave out, and each field
