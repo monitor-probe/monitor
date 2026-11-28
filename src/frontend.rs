@@ -1158,6 +1158,8 @@ mod tests {
             "image/svg+xml"
         );
         assert_eq!(site_icon(&url("webp", b"RIFF\0\0\0\0WEBPVP8 ")).unwrap().0, "image/webp");
+        assert_eq!(site_icon(&url("png", b"\xff\xd8\xff\xe0\0\x10JFIF")).unwrap().0, "image/jpeg");
+        assert_eq!(site_icon(&url("png", b"GIF89a\x01\0\x01\0")).unwrap().0, "image/gif");
 
         assert!(site_icon(&url("png", b"<html><script>")).is_err());
         assert!(site_icon("data:text/html;base64,PHN2Zz4=").is_err());
@@ -1191,6 +1193,82 @@ mod tests {
         // Only the icon that changed moves.
         let touch = |html: &str| html.split("apple-touch-icon.png").nth(1).unwrap().to_owned();
         assert_eq!(touch(&after), touch(&before));
+    }
+
+    /// A theme on disk answers the shell, its client routes and its own files,
+    /// with the shell's icons stamped as anywhere else; a hashed asset it lacks
+    /// comes from the built-in theme. A directory that cannot serve -- no
+    /// `dist/index.html`, or a theme or `dist` leading out of where it sits --
+    /// is neither listed nor served, so selecting it shows the built-in theme.
+    #[test]
+    fn an_external_theme_is_served_from_disk_and_defers_what_it_lacks() {
+        let tmp = crate::TempDir::new("external-theme");
+        let base = tmp.0.join("themes");
+        let put = |path: &str, data: &[u8]| {
+            let path = tmp.0.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, data).unwrap();
+        };
+        let manifest = |short: &str| {
+            format!(
+                r#"{{"name":"{short}","short":"{short}","description":"","version":"1","author":"a","url":""}}"#
+            )
+        };
+        put("themes/aurora/theme.json", manifest("aurora").as_bytes());
+        put(
+            "themes/aurora/dist/index.html",
+            br#"<html>aurora<link rel="icon" href="/favicon.svg" /></html>"#,
+        );
+        put("themes/aurora/dist/assets/app-1.js", br#"icon("/favicon.svg")"#);
+        put("themes/broken/theme.json", manifest("broken").as_bytes());
+        put("themes/broken/dist/assets/app-1.js", b"broken");
+        put("outside/escape/theme.json", manifest("escape").as_bytes());
+        put("outside/escape/dist/index.html", b"<html>escape</html>");
+        put("themes/inner/theme.json", manifest("inner").as_bytes());
+        put("outside/dist/index.html", b"<html>inner</html>");
+        std::os::unix::fs::symlink(tmp.0.join("outside/escape"), base.join("escape")).unwrap();
+        std::os::unix::fs::symlink(tmp.0.join("outside/dist"), base.join("inner/dist")).unwrap();
+
+        let mut app = App::for_test(crate::db::Db::open(":memory:").unwrap());
+        app.themes = base;
+        let app = std::sync::Arc::new(app);
+        let get = |path: &str| {
+            let response = block_on(serve(State(app.clone()), HeaderMap::new(), path.parse().unwrap()));
+            let status = response.status();
+            let body = block_on(axum::body::to_bytes(response.into_body(), usize::MAX)).unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned(), body.to_vec())
+        };
+        let built_in = get("/").1;
+        // A release build serves the built-in assets from the packed table.
+        let fallback = packed::THEME
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .chain(DefaultThemeAssets::iter().map(String::from))
+            .find(|name| is_asset(name))
+            .map(|name| format!("/{name}"))
+            .expect("the built-in theme ships assets");
+        let file = get(&fallback).2;
+
+        app.db.set("theme", "aurora").unwrap();
+        for route in ["/", "/node/7"] {
+            let (status, shell, _) = get(route);
+            assert_eq!(status, StatusCode::OK);
+            assert!(shell.starts_with("<html>aurora"), "{route}: {shell}");
+            assert!(shell.contains(r#"href="/favicon.svg?v="#), "{route}: {shell}");
+        }
+        // Only the shell is rewritten.
+        assert_eq!(get("/assets/app-1.js").1, r#"icon("/favicon.svg")"#);
+        assert!(get(&fallback).2 == file, "{fallback} is not the built-in theme's copy");
+        assert_eq!(get("/assets/index-STALE.js").0, StatusCode::NOT_FOUND);
+
+        let listed: Vec<_> = themes(&app).unwrap().into_iter().map(|t| t.short).collect();
+        assert_eq!(listed, ["default", "aurora"]);
+        for unusable in ["broken", "escape", "inner"] {
+            app.db.set("theme", unusable).unwrap();
+            assert_eq!(get("/").1, built_in, "{unusable}");
+            assert_eq!(get("/assets/app-1.js").0, StatusCode::NOT_FOUND, "{unusable}");
+            assert!(themes(&app).unwrap()[0].selected, "{unusable}");
+        }
     }
 
     /// The two guards on a theme name, applied together by the settings page:
